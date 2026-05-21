@@ -39,6 +39,7 @@ ApolloImprovedCustomApi_FILES = \
     $(SRC_DIR)/ApolloSettings.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloSavedCategories.xm \
+    $(SRC_DIR)/ApolloUserFlair.xm \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
     $(SRC_DIR)/ApolloTranslation.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
