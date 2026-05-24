@@ -7,6 +7,7 @@ on:
         description: 'Direct URL to a decrypted Apollo IPA or prepared Apollo base IPA'
         required: true
         type: string
+        default: 'https://downloads.apolloreborn.app/apollobase.ipa'
       prerelease:
         description: 'Mark GitHub release as prerelease'
         required: false
