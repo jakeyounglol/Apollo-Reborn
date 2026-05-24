@@ -1,5 +1,9 @@
 {
   "repo": "Apollo-Reborn/Apollo-Reborn",
+  "distribution": {
+    "sourceBaseURL": "https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main",
+    "manifestOutput": "release-manifest.json"
+  },
   "source": {
     "iconURL": "https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/img/settings.jpg",
     "headerURL": "https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/img/lg-icons.jpg",
