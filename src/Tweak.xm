@@ -370,10 +370,8 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:");
-    ApolloDeletedCommentsObserveRequest(request, @"dataTaskWithRequest:");
-    if (ApolloDeletedCommentsShouldTransformRequest(request)) {
-        ApolloDeletedCommentsInstallResponseTransformerForDelegate(self.delegate);
-    }
+    ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:");
+    ApolloDeletedCommentsInstallDelegateTransformerIfNeeded((NSURLSession *)self, request);
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -479,7 +477,7 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 // Imgur Delete and album creation
 - (NSURLSessionDataTask*)dataTaskWithRequest:(NSURLRequest*)request completionHandler:(void (^)(NSData*, NSURLResponse*, NSError*))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
-    ApolloDeletedCommentsObserveRequest(request, @"dataTaskWithRequest:completionHandler:");
+    ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -565,25 +563,13 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
         };
         return %orig(modifiedRequest, newCompletionHandler);
     }
-    if (ApolloDeletedCommentsShouldTransformRequest(request)) {
-        void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (error || data.length == 0) {
-                completionHandler(data, response, error);
-                return;
-            }
-            ApolloDeletedCommentsPatchResponseAsync(data, request, ^(NSData *patchedData) {
-                completionHandler(patchedData.length > 0 ? patchedData : data, response, error);
-            });
-        };
-        return %orig(request, wrappedCompletionHandler);
-    }
-    return %orig;
+    return %orig(request, ApolloDeletedCommentsMaybeWrapCompletion(request, completionHandler));
 }
 
 // "Unproxy" Imgur requests
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     NSURLRequest *observeRequest = url ? [NSURLRequest requestWithURL:url] : nil;
-    ApolloDeletedCommentsObserveRequest(observeRequest, @"dataTaskWithURL:completionHandler:");
+    ApolloDeletedCommentsHandleRequestObservation(observeRequest, @"dataTaskWithURL:completionHandler:");
 
     if ([url.host isEqualToString:@"apollogur.download"]) {
         NSString *imageID = [url.lastPathComponent stringByDeletingPathExtension];
@@ -665,20 +651,7 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             return %orig(modifiedURL, completionHandler);
         }
     }
-    if (ApolloDeletedCommentsShouldTransformRequest(observeRequest)) {
-        NSURLRequest *request = [NSURLRequest requestWithURL:url];
-        void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (error || data.length == 0) {
-                completionHandler(data, response, error);
-                return;
-            }
-            ApolloDeletedCommentsPatchResponseAsync(data, request, ^(NSData *patchedData) {
-                completionHandler(patchedData.length > 0 ? patchedData : data, response, error);
-            });
-        };
-        return %orig(url, wrappedCompletionHandler);
-    }
-    return %orig;
+    return %orig(url, ApolloDeletedCommentsMaybeWrapCompletion(observeRequest, completionHandler));
 }
 
 %new

@@ -13,8 +13,6 @@ extern NSString *sTrendingSubredditsLimit;
 
 extern BOOL sBlockAnnouncements;
 extern BOOL sShowDeletedComments;
-extern NSString *sDeletedCommentsLastObservedLinkFullName;
-extern NSDate *sDeletedCommentsLastObservedLinkDate;
 extern BOOL sShowRecentlyReadThumbnails;
 extern NSInteger sPreferredGIFFallbackFormat;
 

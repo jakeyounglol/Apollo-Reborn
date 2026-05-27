@@ -6,12 +6,17 @@ extern "C" {
 
 extern NSString *const ApolloDeletedCommentsObservedThreadNotification;
 
-NSString *ApolloDeletedCommentsLinkFullNameFromRedditURL(NSURL *url);
-BOOL ApolloDeletedCommentsIsCommentsListingTask(NSURLSessionTask *task);
-BOOL ApolloDeletedCommentsShouldTransformRequest(NSURLRequest *request);
-void ApolloDeletedCommentsObserveRequest(NSURLRequest *request, NSString *source);
-void ApolloDeletedCommentsPatchResponseAsync(NSData *data, NSURLRequest *request, void (^completion)(NSData *patchedData));
-void ApolloDeletedCommentsInstallResponseTransformerForDelegate(id delegate);
+typedef void (^ApolloDeletedCommentsURLSessionCompletion)(NSData *data, NSURLResponse *response, NSError *error);
+
+void ApolloDeletedCommentsHandleRequestObservation(NSURLRequest *request, NSString *source);
+ApolloDeletedCommentsURLSessionCompletion ApolloDeletedCommentsMaybeWrapCompletion(NSURLRequest *request, ApolloDeletedCommentsURLSessionCompletion completion);
+void ApolloDeletedCommentsInstallDelegateTransformerIfNeeded(NSURLSession *session, NSURLRequest *request);
+
+#ifdef APOLLO_DELETED_COMMENTS_TESTING
+NSString *ApolloDeletedCommentsTestLinkFullNameFromRedditURL(NSURL *url);
+BOOL ApolloDeletedCommentsTestBodyLooksDeleted(NSString *body, NSString *bodyHTML);
+NSUInteger ApolloDeletedCommentsTestPatchRedditJSONRoot(id root, NSDictionary<NSString *, NSDictionary *> *archivedComments);
+#endif
 
 #ifdef __cplusplus
 }
