@@ -666,8 +666,8 @@ static NSAttributedString *ApolloDeletedCommentsRenameRecoveredSpoilerLabel(id t
     if (![text isEqualToString:@"SPOILER"]) return attributedText;
     if (!ApolloDeletedCommentsTextNodeBelongsToRecoveredComment(textNode)) return attributedText;
 
-    NSDictionary *attributes = [attributedText attributesAtIndex:0 effectiveRange:NULL] ?: @{};
-    NSMutableAttributedString *renamed = [[NSMutableAttributedString alloc] initWithString:@" SHOW " attributes:attributes];
+    NSMutableAttributedString *renamed = [attributedText mutableCopy];
+    [renamed replaceCharactersInRange:NSMakeRange(0, renamed.length) withString:@" SHOW "];
     return renamed;
 }
 
