@@ -114,7 +114,7 @@ Resulting `Info.plist` entry:
 
 Available patches:
 
-- **`--liquid-glass`** - enables the iOS 26 Liquid Glass UI and installs a pack of Liquid Glass icons that can be switched between in the tweak's in-app icon picker.
+- **`--liquid-glass`** - enables the iOS 26 Liquid Glass UI and installs a pack of Liquid Glass icons that can be switched between in the tweak's in-app icon picker. Requires the Git LFS asset to be pulled first (`git lfs install && git lfs pull`); see the [Build](#build) note. `patch.sh` will refuse to run with an un-pulled pointer.
 - **`--url-schemes <list>`** - adds comma-separated URL schemes to `CFBundleURLTypes` (see [Custom Redirect URI](#custom-redirect-uri)).
 - **`--remove-code-signature`** - strips the existing code signature.
 
@@ -151,8 +151,12 @@ For the in-house four-variant IPA release flow, AltStore Classic/SideStore/Feath
 **Instructions:**
 1. `git clone https://github.com/Apollo-Reborn/Apollo-Reborn`
 2. `cd Apollo-Reborn`
-3. `git submodule update --init --recursive`
-4. `make package` or `make package THEOS_PACKAGE_SCHEME=rootless` for rootless variant
+3. `git lfs install && git lfs pull` (see the note below)
+4. `git submodule update --init --recursive`
+5. `make package` or `make package THEOS_PACKAGE_SCHEME=rootless` for rootless variant
+
+> [!IMPORTANT]
+> The prebuilt Liquid Glass asset catalog (`liquid-glass/prebuilt/Assets.car`) is stored with [Git LFS](https://git-lfs.com). A plain `git clone` without git-lfs installed leaves a tiny text pointer in its place instead of the real ~80 MB file, which makes `patch.sh --liquid-glass` produce a broken IPA that crashes on launch. Run `git lfs install` (one-time per machine) followed by `git lfs pull` to fetch the real asset. Verify with `git lfs ls-files` — a `*` next to the file means it's present.
 
 ## Contributors ✨
 
