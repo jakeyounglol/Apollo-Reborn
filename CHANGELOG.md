@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixes
+
+- Fix the bundled **"Open in Apollo" Safari extension**, which stopped opening links on sideloaded builds. Its default "Automatic" mode redirected through `openinapollo.com`, whose auto-open relies on an iOS Smart App Banner bound to the App Store build — a sideloaded Apollo isn't that app, so it never opened. The extension now redirects straight to `apollo://`, handles `/s/` share links, and no longer references a missing background script. (Applied to the standard and Liquid Glass IPA variants at build time.)
+
+### Features
+
+- Ship an Apollo-Reborn **userscript** (`userscript/open-in-apollo.user.js`) as an app-independent way to auto-open Reddit links in Apollo — handy for the no-extensions IPA variant and jailbreak installs. Install via the free **Userscripts** app. See the README "Opening links in Apollo" section, which also documents the cross-browser **Share sheet → Open in Apollo** path for Chrome/Firefox/etc.
+
 ## [v2.14.0] - 2026-05-20
 
 ### Features

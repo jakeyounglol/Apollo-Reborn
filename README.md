@@ -61,9 +61,26 @@ The legacy Apollo push backends went dark in June 2023 and are otherwise blocked
 
 - Long-tapping share links open in the in-app browser
 
-## Safari integration
+## Opening links in Apollo
 
-I recommend using the [Open-In-Apollo](https://github.com/AnthonyGress/Open-In-Apollo) userscript to automatically open Reddit links in Apollo.
+There are three ways to open Reddit links in Apollo, depending on your browser and which IPA variant you installed.
+
+### Safari — built-in extension (zero setup)
+
+Apollo's bundled **"Open in Apollo"** Safari extension now works again on sideloaded builds (it previously got stranded on an `openinapollo.com` interstitial). Enable it under **Settings > Safari > Extensions > Open in Apollo**, allow it on `reddit.com`, and Reddit links will open straight in Apollo. Available on the **standard** and **Liquid Glass** IPA variants (the extension is removed from the *no-extensions* variants).
+
+### Safari — userscript (works with any variant)
+
+If you installed a **no-extensions** variant, or you're on a jailbreak/`.deb` install, use the app-independent userscript instead:
+
+1. Install the free [**Userscripts**](https://apps.apple.com/app/userscripts/id1463298887) app (a Safari extension) and enable it for `reddit.com` in **Settings > Safari > Extensions**.
+2. Open [`userscript/open-in-apollo.user.js`](userscript/open-in-apollo.user.js) in Safari, tap the **aA** menu → **Userscripts**, and install it.
+
+It auto-redirects Reddit pages to Apollo and rewrites Reddit links on Google/Bing/DuckDuckGo results. (Search-result rewriting is inspired by [AnthonyGress's userscript](https://github.com/AnthonyGress/Open-In-Apollo), which also works.)
+
+### Any other browser (Chrome, Firefox, Edge, Brave) — Share sheet
+
+On iOS only Safari can run extensions or userscripts, so Chrome/Firefox/etc. can't auto-detect Reddit links. Instead, on any browser tap **Share → Open in Apollo**: Apollo ships an "Open in Apollo" share action that hands the current page to the app. (This action is part of the app's extensions, so it's present on the standard/Liquid Glass variants but not the *no-extensions* ones.)
 
 ## Looking for IPA?
 
