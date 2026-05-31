@@ -135,10 +135,15 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     if (string.length <= ApolloSubredditAboutTextMaxLength) return string;
 
     NSString *truncated = [string substringToIndex:ApolloSubredditAboutTextMaxLength];
+    // Snap the cut to a word boundary, else a grapheme boundary, so we never
+    // split a surrogate pair / composed character and leave a stray glyph.
     NSRange lastSpace = [truncated rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]
                                                    options:NSBackwardsSearch];
     if (lastSpace.location != NSNotFound && lastSpace.location > ApolloSubredditAboutTextMaxLength / 2) {
         truncated = [truncated substringToIndex:lastSpace.location];
+    } else {
+        NSRange safe = [string rangeOfComposedCharacterSequenceAtIndex:ApolloSubredditAboutTextMaxLength];
+        truncated = [string substringToIndex:safe.location];
     }
     truncated = [truncated stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     return [truncated stringByAppendingString:@"\u2026"];
