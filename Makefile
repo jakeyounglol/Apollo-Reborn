@@ -63,6 +63,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloLinkPreviewFetcher.m \
     $(SRC_DIR)/ApolloInlineImages.xm \
     $(SRC_DIR)/ApolloInlineLinkPreviews.xm \
+    $(SRC_DIR)/ApolloFeedTextPostThumbnails.xm \
     $(SRC_DIR)/ApolloTweetBuddy.xm \
 	$(SRC_DIR)/ApolloVisionOSFix.xm \
     $(SRC_DIR)/CustomAPIViewController.m \
