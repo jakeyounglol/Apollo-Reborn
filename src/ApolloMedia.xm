@@ -45,8 +45,22 @@ static BOOL ApolloMediaRouteControlIsInMediaViewer(UIView *view) {
     return NO;
 }
 
-static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *reason) {
-    if (![routeView isKindOfClass:[UIView class]] || !ApolloMediaRouteControlIsInMediaViewer(routeView)) return;
+// Reads a UIView-typed Swift/ObjC ivar by name. Swift stored properties on
+// classes don't expose @objc getters, so go through the runtime ivar list.
+static UIView *ApolloMediaReadViewIvar(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    Ivar ivar = class_getInstanceVariable([obj class], name);
+    if (!ivar) return nil;
+    id value = nil;
+    @try { value = object_getIvar(obj, ivar); } @catch (__unused NSException *e) {}
+    return [value isKindOfClass:[UIView class]] ? value : nil;
+}
+
+// The actual clip/aspect-fit/min-size fixes, applied without any container
+// gate. Callers that need the MediaViewer gate go through
+// ApolloMediaRepairRouteControlLayout below.
+static void ApolloMediaApplyRouteControlLayoutFixes(UIView *routeView, NSString *reason) {
+    if (![routeView isKindOfClass:[UIView class]]) return;
     routeView.clipsToBounds = NO;
     routeView.contentMode = UIViewContentModeScaleAspectFit;
     routeView.layer.masksToBounds = NO;
@@ -82,6 +96,11 @@ static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *rea
     }
 }
 
+static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *reason) {
+    if (![routeView isKindOfClass:[UIView class]] || !ApolloMediaRouteControlIsInMediaViewer(routeView)) return;
+    ApolloMediaApplyRouteControlLayoutFixes(routeView, reason);
+}
+
 %hook AVRoutePickerView
 
 - (void)layoutSubviews {
@@ -96,6 +115,35 @@ static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *rea
 - (void)layoutSubviews {
     %orig;
     ApolloMediaRepairRouteControlLayout((UIView *)self, @"MPVolumeView layoutSubviews");
+}
+
+%end
+
+// Apollo's in-app player controls bar (a rounded UIVisualEffectView) clips
+// the AirPlay icon at the bottom-left corner. Stop the bar (and its
+// contentView) from clipping, and repair the airPlayButton's own layout so
+// the glyph renders at full size. fauxVolumeView is an MPVolumeView already
+// covered by the hook above; we re-apply here to be safe since this view is
+// unambiguously the in-app player.
+%hook _TtC6Apollo17VideoControlsView
+
+- (void)layoutSubviews {
+    %orig;
+    UIVisualEffectView *bar = (UIVisualEffectView *)self;
+    bar.clipsToBounds = NO;
+    bar.layer.masksToBounds = NO;
+    UIView *contentView = [bar respondsToSelector:@selector(contentView)] ? bar.contentView : nil;
+    contentView.clipsToBounds = NO;
+    contentView.layer.masksToBounds = NO;
+
+    UIView *airPlayButton = ApolloMediaReadViewIvar(self, "airPlayButton");
+    if (airPlayButton) {
+        ApolloMediaApplyRouteControlLayoutFixes(airPlayButton, @"VideoControlsView airPlayButton");
+    }
+    UIView *fauxVolumeView = ApolloMediaReadViewIvar(self, "fauxVolumeView");
+    if (fauxVolumeView) {
+        ApolloMediaApplyRouteControlLayoutFixes(fauxVolumeView, @"VideoControlsView fauxVolumeView");
+    }
 }
 
 %end

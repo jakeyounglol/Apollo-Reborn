@@ -1972,6 +1972,54 @@ static void ApolloInstallPlayOverlayOnView(UIView *v, ASDisplayNode *node) {
     objc_setAssociatedObject(node, &kApolloPlayOverlayViewKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// The play overlay is first added in onDidLoad while the node still has
+// zero bounds, then relies on KVO to recenter once Texture assigns the
+// real frame. Two things break that for inline video thumbnails:
+//   1. When the async DASH/poster resolve triggers a relayout-from-above,
+//      Texture can recycle the node's backing view and silently drop our
+//      manually-added overlay subview (the association still points at the
+//      now-detached container).
+//   2. If the very first layout pass already gave the node real bounds,
+//      the KVO "new bounds" notification may have fired before the overlay
+//      was attached.
+// Re-assert the overlay a few times after load so it survives view
+// recycling and late sizing. Idempotent when the overlay is already
+// correctly attached.
+static void ApolloScheduleVideoPlayOverlayReassert(ASNetworkImageNode *imageNode, NSUInteger attempt) {
+    static const NSTimeInterval delays[] = {0.10, 0.25, 0.50, 1.0, 1.75, 2.5};
+    static const NSUInteger maxAttempts = sizeof(delays) / sizeof(delays[0]);
+    if (!imageNode || attempt >= maxAttempts) return;
+
+    __weak ASNetworkImageNode *weak = imageNode;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ASNetworkImageNode *node = weak;
+        if (!node) return;
+        BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && [node isNodeLoaded];
+        UIView *view = loaded ? [node view] : nil;
+        if (view) {
+            UIView *overlay = objc_getAssociatedObject(node, &kApolloPlayOverlayViewKey);
+            BOOL stale = overlay && overlay.superview != view;
+            if (stale) {
+                // Association points at a recycled/detached view — drop it
+                // and reinstall onto the live view.
+                [overlay removeFromSuperview];
+                objc_setAssociatedObject(node, &kApolloPlayOverlayViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                overlay = nil;
+            }
+            if (!overlay) {
+                ApolloInstallPlayOverlayOnView(view, node);
+            } else {
+                [view bringSubviewToFront:overlay];
+                if ([overlay isKindOfClass:[ApolloPlayOverlayContainer class]]) {
+                    [(ApolloPlayOverlayContainer *)overlay recenter];
+                }
+            }
+        }
+        ApolloScheduleVideoPlayOverlayReassert(node, attempt + 1);
+    });
+}
+
 // Pause inline GIF playback without clearing animatedImage via KVC — that path
 // races with Texture teardown during AutoplayGIFs preference changes and caused
 // SIGSEGV in _locked_setAnimatedImage on stale nodes.
@@ -2357,6 +2405,23 @@ static ASNetworkImageNode *ApolloMakeInlineVideoThumbnailNode(NSURL *videoURL,
             } else {
                 NSURL *dashURL = mm ? ApolloDashURLFromMediaMetadata(mm, videoURL) : nil;
                 NSString *assetID = ApolloMediaMetadataIDFromVideoURL(videoURL);
+                // Fallback when mediaMetadata isn't reachable up the supernode
+                // chain (a timing race on first layout that leaves hostMD=nil):
+                // Reddit hosted-video permalinks expose a stable DASH manifest
+                // at v.redd.it/<assetID>/DASHPlaylist.mpd. Deriving it directly
+                // from the asset id lets the poster — and the play-button
+                // overlay, which only becomes visible once the node has real
+                // bounds — resolve without metadata.
+                if (!dashURL && assetID.length) {
+                    NSString *host = [[videoURL host] lowercaseString] ?: @"";
+                    NSString *path = [[videoURL path] lowercaseString] ?: @"";
+                    BOOL isRedditPlayer = ([host isEqualToString:@"reddit.com"] || [host hasSuffix:@".reddit.com"])
+                        && [path hasPrefix:@"/link/"] && [path containsString:@"/video/"] && [path hasSuffix:@"/player"];
+                    if (isRedditPlayer) {
+                        dashURL = [NSURL URLWithString:[NSString stringWithFormat:
+                            @"https://v.redd.it/%@/DASHPlaylist.mpd", assetID]];
+                    }
+                }
                 if (dashURL && assetID.length) {
                     ApolloFetchDashPoster(assetID, dashURL, ^(UIImage *poster) {
                         ASNetworkImageNode *strong = weakImage;
@@ -2379,6 +2444,7 @@ static ASNetworkImageNode *ApolloMakeInlineVideoThumbnailNode(NSURL *videoURL,
         }
 
         if (v) ApolloInstallPlayOverlayOnView(v, img);
+        ApolloScheduleVideoPlayOverlayReassert(img, 0);
         if (v && ![objc_getAssociatedObject(img, &kApolloLongPressInstalledKey) boolValue]) {
             NSURL *u = objc_getAssociatedObject(img, &kApolloImageURLKey);
             objc_setAssociatedObject(v, &kApolloImageURLKey, u, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
