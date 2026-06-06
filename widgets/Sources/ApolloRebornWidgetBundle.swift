@@ -9,6 +9,21 @@ struct ApolloRebornWidgetBundle: WidgetBundle {
         SinglePostWidget()
         FeedWidget()
         PhotoWidget()
+        ShortcutsWidget()
+    }
+}
+
+struct ShortcutsWidget: Widget {
+    let kind = "ShortcutsWidget"
+    var body: some WidgetConfiguration {
+        IntentConfiguration(kind: kind,
+                            intent: ShortcutsConfigurationIntent.self,
+                            provider: ShortcutsProvider()) { entry in
+            ShortcutsWidgetView(entry: entry)
+        }
+        .configurationDisplayName("Shortcuts")
+        .description("Quick links to your favorite subreddits.")
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
 

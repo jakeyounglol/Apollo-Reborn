@@ -117,6 +117,24 @@ struct RedditAppOnlyClient {
         return Self.parseListing(data)
     }
 
+    /// A subreddit's icon URL (community_icon preferred, else icon_img), or nil.
+    func subredditIcon(_ subreddit: String) async throws -> String? {
+        let bearer = try await token()
+        let sub = RedditPost.normalizeSubreddit(subreddit)
+        var req = URLRequest(url: URL(string: "https://oauth.reddit.com/r/\(sub)/about?raw_json=1")!)
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("bearer \(bearer)", forHTTPHeaderField: "Authorization")
+
+        let (data, resp) = try await rwSession.data(for: req)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let d = root["data"] as? [String: Any] else { return nil }
+        for key in ["community_icon", "icon_img"] {
+            if let u = d[key] as? String, u.hasPrefix("http") { return u }
+        }
+        return nil
+    }
+
     /// Parse a Reddit listing into posts, skipping stickied/meta entries.
     static func parseListing(_ data: Data) -> [RedditPost] {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
