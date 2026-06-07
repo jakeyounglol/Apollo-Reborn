@@ -144,11 +144,10 @@ struct FeedProvider: IntentTimelineProvider {
     func getTimeline(for configuration: Intent, in context: Context,
                      completion: @escaping (Timeline<WidgetEntry>) -> Void) {
         let sub = resolvedSubreddit(configuration.subreddit, default: "popular")
-        let forcedLatest = RefreshRequest.wantsLatest(kind: "FeedWidget")
-        let sort: WidgetSort = forcedLatest ? .new : widgetSort(configuration.sort, default: .hot)
+        let sort = widgetSort(configuration.sort, default: .hot)
         let label = feedSourceLabel(sub)
         let key = "feed.\(sub)\(sortSuffix(sort))"
-        rwLog.log("Feed r/\(sub, privacy: .public) sortRaw=\(configuration.sort.rawValue) forcedLatest=\(forcedLatest) → \(sort.path, privacy: .public)")
+        rwLog.log("Feed r/\(sub, privacy: .public) sortRaw=\(configuration.sort.rawValue) → \(sort.path, privacy: .public)")
         runPostTimeline(
             code: configuration.setupCode, cacheKey: key,
             fetch: { try await $0.topPosts(subreddit: sub, sort: sort, limit: 12) },
