@@ -62,12 +62,20 @@ enum DisplayMode: Int, Codable, Hashable {
     case clean, standard, detailed
 }
 
-/// Caption toggles for the Photo widget. Defaults match its original minimal
-/// look (title only), so existing behaviour is preserved when unset.
-struct PhotoOptions: Hashable {
-    var showTitle: Bool = true
-    var showSubreddit: Bool = false
-    var showStats: Bool = false
+/// How much caption a content widget overlays on its post (shared by Post and
+/// Photo so both have an identical "Caption" picker).
+///   hidden   – no overlay text (clean image)
+///   title    – title only
+///   standard – title + score + comments
+///   detailed – + age/author (and the body preview, for text posts)
+/// `DisplayMode` (above) is the internal density the stats line renders.
+enum Caption: Int, Codable, Hashable {
+    case hidden, title, standard, detailed
+
+    var showsTitle: Bool { self != .hidden }
+    var showsStats: Bool { self == .standard || self == .detailed }
+    var showsPreview: Bool { self == .detailed }
+    var density: DisplayMode { self == .detailed ? .detailed : .standard }
 }
 
 /// Date-overlay style for the Calendar widget. Raw values are stable so they
@@ -84,14 +92,13 @@ enum CalendarStyle: Int, Codable, Hashable {
 
 /// Listing sort, mapped to the Reddit API path + time window.
 enum WidgetSort {
-    case hot, new, top, topWeek, rising
+    case hot, new, top, topWeek
 
     var path: String {
         switch self {
         case .hot: return "hot"
         case .new: return "new"
         case .top, .topWeek: return "top"
-        case .rising: return "rising"
         }
     }
     /// `t` window (only meaningful for the `top` sorts).

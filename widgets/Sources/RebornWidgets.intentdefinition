@@ -51,43 +51,6 @@
 		</dict>
 		<dict>
 			<key>INEnumDisplayName</key>
-			<string>Display</string>
-			<key>INEnumGeneratesHeader</key>
-			<true/>
-			<key>INEnumName</key>
-			<string>RebornDisplay</string>
-			<key>INEnumType</key>
-			<string>Regular</string>
-			<key>INEnumValues</key>
-			<array>
-				<dict>
-					<key>INEnumValueDisplayName</key>
-					<string>Clean</string>
-					<key>INEnumValueIndex</key>
-					<integer>1</integer>
-					<key>INEnumValueName</key>
-					<string>clean</string>
-				</dict>
-				<dict>
-					<key>INEnumValueDisplayName</key>
-					<string>Standard</string>
-					<key>INEnumValueIndex</key>
-					<integer>2</integer>
-					<key>INEnumValueName</key>
-					<string>standard</string>
-				</dict>
-				<dict>
-					<key>INEnumValueDisplayName</key>
-					<string>Detailed</string>
-					<key>INEnumValueIndex</key>
-					<integer>3</integer>
-					<key>INEnumValueName</key>
-					<string>detailed</string>
-				</dict>
-			</array>
-		</dict>
-		<dict>
-			<key>INEnumDisplayName</key>
 			<string>Shortcut Source</string>
 			<key>INEnumGeneratesHeader</key>
 			<true/>
@@ -181,6 +144,51 @@
 					<integer>5</integer>
 					<key>INEnumValueName</key>
 					<string>stamp</string>
+				</dict>
+			</array>
+		</dict>
+		<dict>
+			<key>INEnumDisplayName</key>
+			<string>Caption</string>
+			<key>INEnumGeneratesHeader</key>
+			<true/>
+			<key>INEnumName</key>
+			<string>RebornCaption</string>
+			<key>INEnumType</key>
+			<string>Regular</string>
+			<key>INEnumValues</key>
+			<array>
+				<dict>
+					<key>INEnumValueDisplayName</key>
+					<string>None</string>
+					<key>INEnumValueIndex</key>
+					<integer>1</integer>
+					<key>INEnumValueName</key>
+					<string>hidden</string>
+				</dict>
+				<dict>
+					<key>INEnumValueDisplayName</key>
+					<string>Title</string>
+					<key>INEnumValueIndex</key>
+					<integer>2</integer>
+					<key>INEnumValueName</key>
+					<string>title</string>
+				</dict>
+				<dict>
+					<key>INEnumValueDisplayName</key>
+					<string>Title + Stats</string>
+					<key>INEnumValueIndex</key>
+					<integer>3</integer>
+					<key>INEnumValueName</key>
+					<string>standard</string>
+				</dict>
+				<dict>
+					<key>INEnumValueDisplayName</key>
+					<string>Detailed</string>
+					<key>INEnumValueIndex</key>
+					<integer>4</integer>
+					<key>INEnumValueName</key>
+					<string>detailed</string>
 				</dict>
 			</array>
 		</dict>
@@ -392,6 +400,29 @@
 					<key>INIntentParameterType</key>
 					<string>RebornSort</string>
 				</dict>
+				<dict>
+					<key>INIntentParameterConfigurable</key>
+					<true/>
+					<key>INIntentParameterDisplayName</key>
+					<string>Compact (hide thumbnails)</string>
+					<key>INIntentParameterDisplayPriority</key>
+					<integer>4</integer>
+					<key>INIntentParameterMetadata</key>
+					<dict>
+						<key>INIntentParameterMetadataDefaultValue</key>
+						<false/>
+					</dict>
+					<key>INIntentParameterName</key>
+					<string>compact</string>
+					<key>INIntentParameterPromptDialogs</key>
+					<array/>
+					<key>INIntentParameterSupportsResolution</key>
+					<false/>
+					<key>INIntentParameterTag</key>
+					<integer>4</integer>
+					<key>INIntentParameterType</key>
+					<string>Boolean</string>
+				</dict>
 			</array>
 			<key>INIntentResponse</key>
 			<dict>
@@ -495,67 +526,21 @@
 					<key>INIntentParameterConfigurable</key>
 					<true/>
 					<key>INIntentParameterDisplayName</key>
-					<string>Allow NSFW</string>
+					<string>Caption</string>
 					<key>INIntentParameterDisplayPriority</key>
 					<integer>4</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<false/>
-					</dict>
-					<key>INIntentParameterName</key>
-					<string>allowNSFW</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>4</integer>
-					<key>INIntentParameterType</key>
-					<string>Boolean</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
-					<string>Display</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>5</integer>
 					<key>INIntentParameterEnumType</key>
-					<string>RebornDisplay</string>
+					<string>RebornCaption</string>
 					<key>INIntentParameterName</key>
-					<string>display</string>
+					<string>caption</string>
 					<key>INIntentParameterPromptDialogs</key>
 					<array/>
 					<key>INIntentParameterSupportsResolution</key>
 					<false/>
 					<key>INIntentParameterTag</key>
-					<integer>5</integer>
+					<integer>4</integer>
 					<key>INIntentParameterType</key>
-					<string>RebornDisplay</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
-					<string>Show Preview Text</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>6</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<false/>
-					</dict>
-					<key>INIntentParameterName</key>
-					<string>showPreview</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>6</integer>
-					<key>INIntentParameterType</key>
-					<string>Boolean</string>
+					<string>RebornCaption</string>
 				</dict>
 			</array>
 			<key>INIntentResponse</key>
@@ -741,26 +726,6 @@
 					<key>INIntentParameterConfigurable</key>
 					<true/>
 					<key>INIntentParameterDisplayName</key>
-					<string>Sort</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>3</integer>
-					<key>INIntentParameterEnumType</key>
-					<string>RebornSort</string>
-					<key>INIntentParameterName</key>
-					<string>sort</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>3</integer>
-					<key>INIntentParameterType</key>
-					<string>RebornSort</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
 					<string>Date Style</string>
 					<key>INIntentParameterDisplayPriority</key>
 					<integer>4</integer>
@@ -903,16 +868,13 @@
 					<key>INIntentParameterConfigurable</key>
 					<true/>
 					<key>INIntentParameterDisplayName</key>
-					<string>Show Title</string>
+					<string>Caption</string>
 					<key>INIntentParameterDisplayPriority</key>
 					<integer>4</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<true/>
-					</dict>
+					<key>INIntentParameterEnumType</key>
+					<string>RebornCaption</string>
 					<key>INIntentParameterName</key>
-					<string>showTitle</string>
+					<string>caption</string>
 					<key>INIntentParameterPromptDialogs</key>
 					<array/>
 					<key>INIntentParameterSupportsResolution</key>
@@ -920,76 +882,7 @@
 					<key>INIntentParameterTag</key>
 					<integer>4</integer>
 					<key>INIntentParameterType</key>
-					<string>Boolean</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
-					<string>Show Subreddit</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>5</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<false/>
-					</dict>
-					<key>INIntentParameterName</key>
-					<string>showSubreddit</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>5</integer>
-					<key>INIntentParameterType</key>
-					<string>Boolean</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
-					<string>Show Stats</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>6</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<false/>
-					</dict>
-					<key>INIntentParameterName</key>
-					<string>showStats</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>6</integer>
-					<key>INIntentParameterType</key>
-					<string>Boolean</string>
-				</dict>
-				<dict>
-					<key>INIntentParameterConfigurable</key>
-					<true/>
-					<key>INIntentParameterDisplayName</key>
-					<string>Allow NSFW</string>
-					<key>INIntentParameterDisplayPriority</key>
-					<integer>7</integer>
-					<key>INIntentParameterMetadata</key>
-					<dict>
-						<key>INIntentParameterMetadataDefaultValue</key>
-						<false/>
-					</dict>
-					<key>INIntentParameterName</key>
-					<string>allowNSFW</string>
-					<key>INIntentParameterPromptDialogs</key>
-					<array/>
-					<key>INIntentParameterSupportsResolution</key>
-					<false/>
-					<key>INIntentParameterTag</key>
-					<integer>7</integer>
-					<key>INIntentParameterType</key>
-					<string>Boolean</string>
+					<string>RebornCaption</string>
 				</dict>
 			</array>
 			<key>INIntentResponse</key>

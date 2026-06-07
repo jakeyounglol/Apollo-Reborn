@@ -24,21 +24,21 @@ struct WidgetShell<Content: View, Background: View>: View {
         case .posts:
             MessageView(icon: "tray", title: "Nothing here", detail: "No posts to show right now.")
         case .loading:
-            MessageView(icon: "arrow.clockwise", title: "Loading…", detail: "Fetching posts.")
+            MessageView(icon: "arrow.clockwise", title: "Apollo", detail: "Loading…")
         case .needsSetup:
-            MessageView(icon: "key.horizontal.fill", title: "Setup needed",
-                        detail: "In Apollo: Settings → Apollo Reborn → Copy Widget Setup Code, then Edit any one widget and paste it once — all widgets share it.")
+            MessageView(icon: "key.horizontal.fill", title: "Set up Apollo widgets",
+                        detail: "Tap Edit and paste your Apollo setup code (Settings → Apollo Reborn → Copy Widget Setup Code). You only need to do this once.")
         case .error(let msg):
-            MessageView(icon: "exclamationmark.triangle.fill", title: "Error", detail: msg)
+            MessageView(icon: "arrow.clockwise", title: "Apollo", detail: msg)
         }
     }
 
+    // Non-content states use the same on-brand blue gradient as real content, so
+    // a not-yet-set-up or offline widget looks intentional — not a crash.
     @ViewBuilder private var backgroundColor: some View {
         switch entry.state {
         case .posts(let r) where !r.isEmpty: background()
-        case .loading: Color.orange
-        case .needsSetup: Color.red
-        case .error, .posts: Color.purple
+        default: BlueGradient()
         }
     }
 }

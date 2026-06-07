@@ -21,19 +21,18 @@ struct WidgetEntry: TimelineEntry {
     /// Cache key of the widget that produced this entry, so interactive buttons
     /// know which widget's rotation to advance. Nil for non-content states.
     var rotationKey: String? = nil
-    /// Post widget rendering config (ignored by the other widgets).
-    var display: DisplayMode = .standard
-    var showPreview: Bool = false
+    /// How much caption Post/Photo overlay (ignored by the other widgets).
+    var caption: Caption = .standard
     /// Feed header label (e.g. "Popular", "r/aww"). The Feed mixes subreddits
     /// for sources like r/popular, so the header must show the configured
     /// source, not the first post's subreddit.
     var sourceLabel: String? = nil
+    /// Feed density: hide thumbnails / tighter rows (ignored by other widgets).
+    var feedCompact: Bool = false
     /// Calendar widget rendering config (ignored by the other widgets). The
     /// displayed date is `date`; each Calendar entry is one locked day.
     var calendarStyle: CalendarStyle = .card
     var calendarShowTitle: Bool = false
-    /// Photo widget caption config (ignored by the other widgets).
-    var photo: PhotoOptions = PhotoOptions()
 
     static let loading = WidgetEntry(date: Date(), state: .loading)
 
@@ -110,24 +109,19 @@ func stamped(_ timeline: Timeline<WidgetEntry>, sourceLabel: String) -> Timeline
     return Timeline(entries: entries, policy: timeline.policy)
 }
 
-/// Stamp the Photo widget's caption options onto every entry of a built
-/// timeline, keeping the shared timeline builders config-agnostic.
-func stamped(_ timeline: Timeline<WidgetEntry>, photo: PhotoOptions) -> Timeline<WidgetEntry> {
+/// Stamp the chosen caption level onto every entry of a built timeline (Post and
+/// Photo), keeping the shared timeline builders config-agnostic.
+func stamped(_ timeline: Timeline<WidgetEntry>, caption: Caption) -> Timeline<WidgetEntry> {
     let entries = timeline.entries.map { e -> WidgetEntry in
-        var e = e; e.photo = photo; return e
+        var e = e; e.caption = caption; return e
     }
     return Timeline(entries: entries, policy: timeline.policy)
 }
 
-/// Stamp the Post widget's render config onto every entry of a built timeline,
-/// so the view can switch metadata density / preview text. Keeps the shared
-/// timeline builders config-agnostic — only the Post provider opts in.
-func stamped(_ timeline: Timeline<WidgetEntry>, display: DisplayMode, showPreview: Bool) -> Timeline<WidgetEntry> {
+/// Stamp Feed density onto every entry of a built timeline.
+func stamped(_ timeline: Timeline<WidgetEntry>, compact: Bool) -> Timeline<WidgetEntry> {
     let entries = timeline.entries.map { e -> WidgetEntry in
-        var e = e
-        e.display = display
-        e.showPreview = showPreview
-        return e
+        var e = e; e.feedCompact = compact; return e
     }
     return Timeline(entries: entries, policy: timeline.policy)
 }

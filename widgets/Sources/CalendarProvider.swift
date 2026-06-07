@@ -138,6 +138,10 @@ struct CalendarProvider: IntentTimelineProvider {
     /// reloads us on time. Kept small to stay within the image-download budget.
     private let windowDays = 4
 
+    /// A "photo of the day" is conceptually the best image, so the Calendar
+    /// always uses Top: This Week — no sort option to keep it simple.
+    static let calendarSort: WidgetSort = .topWeek
+
     func placeholder(in context: Context) -> WidgetEntry {
         var e = WidgetEntry.sample([WidgetSample.feed[4]])
         e.calendarStyle = .card
@@ -154,7 +158,7 @@ struct CalendarProvider: IntentTimelineProvider {
             completion(e); return
         }
         let sub = resolvedSubreddit(configuration.subreddit, default: "EarthPorn")
-        let cfg = configKey(sub: sub, sort: widgetSort(configuration.sort, default: .top))
+        let cfg = configKey(sub: sub, sort: Self.calendarSort)
         let today = DailyPhoto.dayString(Date())
         if let locked = lockedPostForSnapshot(cfg: cfg, day: today, sub: sub) {
             var e = WidgetEntry(date: Date(), state: .posts([RenderPost(post: locked, imageData: nil)]))
@@ -170,9 +174,7 @@ struct CalendarProvider: IntentTimelineProvider {
     func getTimeline(for configuration: Intent, in context: Context,
                      completion: @escaping (Timeline<WidgetEntry>) -> Void) {
         let sub = resolvedSubreddit(configuration.subreddit, default: "EarthPorn")
-        // Calendar wants the BEST images → Top by default (Top: This Week reads
-        // well for a daily photo). The user can still override the sort.
-        let sort = widgetSort(configuration.sort, default: .topWeek)
+        let sort = Self.calendarSort
         let style = calendarStyle(configuration.dateStyle)
         let showTitle = configuration.showTitle?.boolValue ?? false
         let cfg = configKey(sub: sub, sort: sort)

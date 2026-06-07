@@ -98,11 +98,6 @@ struct RedditAppOnlyClient {
 
     // MARK: Data
 
-    /// Convenience used by the Showerthoughts widget.
-    func topShowerthoughts(limit: Int = 25) async throws -> [RedditPost] {
-        try await topPosts(subreddit: "showerthoughts", sort: .top, limit: limit)
-    }
-
     func topPosts(subreddit: String, sort: WidgetSort, limit: Int = 25,
                   allowNSFW: Bool = false) async throws -> [RedditPost] {
         let bearer = try await token()

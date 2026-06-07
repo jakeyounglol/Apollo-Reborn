@@ -48,27 +48,35 @@ struct SinglePostWidgetView: View {
     }
 
     private func imageContent(_ post: RedditPost) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let caption = entry.caption
+        return VStack(alignment: .leading, spacing: 3) {
             Spacer(minLength: 0)
-            Text(post.title)
-                .font(.system(size: family == .systemSmall ? 14 : 17, weight: .semibold))
-                .foregroundStyle(.white)
-                .minimumScaleFactor(0.7)
-                .lineLimit(family == .systemSmall ? 3 : 4)
-                .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
-            StatsLine(post: post,
-                      display: entry.display,
-                      showSubreddit: family != .systemSmall,
-                      showComments: family != .systemSmall)
-                .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            if caption.showsTitle {
+                Text(post.title)
+                    .font(.system(size: family == .systemSmall ? 14 : 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .minimumScaleFactor(0.7)
+                    .lineLimit(family == .systemSmall ? 3 : 4)
+                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            }
+            if caption.showsStats {
+                StatsLine(post: post,
+                          display: caption.density,
+                          showSubreddit: family != .systemSmall,
+                          showComments: family != .systemSmall)
+                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .padding(.top, 30)
         .background(alignment: .bottom) {
-            LinearGradient(colors: [.clear, .black.opacity(0.55), .black.opacity(0.85)],
-                           startPoint: .center, endPoint: .bottom)
-                .padding(-24)
-                .allowsHitTesting(false)
+            // Only scrim when there's overlay text, so "None" is a clean image.
+            if caption != .hidden {
+                LinearGradient(colors: [.clear, .black.opacity(0.55), .black.opacity(0.85)],
+                               startPoint: .center, endPoint: .bottom)
+                    .padding(-24)
+                    .allowsHitTesting(false)
+            }
         }
         .overlay(alignment: .topTrailing) {
             NextOverlayButton(rotationKey: entry.rotationKey)
@@ -78,7 +86,10 @@ struct SinglePostWidgetView: View {
     }
 
     private func textContent(_ post: RedditPost) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        // Text posts always show their title (a text widget with no text would
+        // be blank); caption controls stats density + the body preview.
+        let caption = entry.caption
+        return VStack(alignment: .leading, spacing: 5) {
             WidgetHeader(label: "r/\(post.subreddit)",
                          trailing: AnyView(NextButton(rotationKey: entry.rotationKey)))
             Spacer(minLength: 2)
@@ -87,8 +98,7 @@ struct SinglePostWidgetView: View {
                 .foregroundStyle(.white)
                 .minimumScaleFactor(0.7)
                 .lineLimit(family == .systemLarge ? 6 : (family == .systemSmall ? 5 : 4))
-            // Body preview only when the user enabled "Show Preview Text".
-            if entry.showPreview, !post.selftext.isEmpty {
+            if caption.showsPreview, !post.selftext.isEmpty {
                 Text(post.selftext)
                     .font(.system(size: family == .systemLarge ? 15 : 13))
                     .foregroundStyle(.white.opacity(0.92))
@@ -96,8 +106,10 @@ struct SinglePostWidgetView: View {
                     .lineLimit(family == .systemLarge ? 6 : 3)
             }
             Spacer(minLength: 2)
-            // Subreddit is already in the header, so omit it here.
-            StatsLine(post: post, display: entry.display, showSubreddit: false)
+            if caption.showsStats {
+                // Subreddit is already in the header, so omit it here.
+                StatsLine(post: post, display: caption.density, showSubreddit: false)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .opensInApollo(post)
@@ -114,16 +126,15 @@ struct PhotoWidgetView: View {
             mediaBackground(entry, fallback: BlueGradient())
         } content: { renders in
             let post = renders[0].post
-            let opts = entry.photo
-            // Subreddit/stats want a caption row; title shows when enabled.
-            // Small widgets only show the title (a stats line is too cramped),
-            // but still honor the user turning the title off.
-            let showCaption = opts.showSubreddit || opts.showStats
-            let hasOverlayText = opts.showTitle || (showCaption && family != .systemSmall)
+            let caption = entry.caption
+            // Stats row is too cramped on the small family — show it only on
+            // medium/large. Title shows whenever caption isn't "None".
+            let showStats = caption.showsStats && family != .systemSmall
+            let hasOverlayText = caption.showsTitle || showStats
 
             VStack(alignment: .leading, spacing: 3) {
                 Spacer(minLength: 0)
-                if opts.showTitle {
+                if caption.showsTitle {
                     Text(post.title)
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
@@ -131,11 +142,8 @@ struct PhotoWidgetView: View {
                         .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if showCaption, family != .systemSmall {
-                    StatsLine(post: post,
-                              display: opts.showStats ? .standard : .clean,
-                              showSubreddit: opts.showSubreddit,
-                              showComments: opts.showStats)
+                if showStats {
+                    StatsLine(post: post, display: caption.density)
                         .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
                 }
             }
@@ -170,8 +178,10 @@ struct FeedWidgetView: View {
     /// black void on a Pro Max.
     private func rowCount(height: CGFloat, available: Int) -> Int {
         guard available > 0 else { return 0 }
-        if family == .systemMedium { return min(2, available) }
-        let n = Int((height - 14) / 58)         // ≈ header + n·(row+divider)
+        // Compact rows are shorter, so more of them fit.
+        let rowHeight: CGFloat = entry.feedCompact ? 40 : 58
+        if family == .systemMedium { return min(entry.feedCompact ? 3 : 2, available) }
+        let n = Int((height - 14) / rowHeight)  // ≈ header + n·(row+divider)
         return max(2, min(n, available))
     }
 

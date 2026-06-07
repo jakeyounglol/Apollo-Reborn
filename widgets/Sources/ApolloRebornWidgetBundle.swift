@@ -65,8 +65,10 @@ struct ShowerthoughtsWidget: Widget {
         }
         .configurationDisplayName("Showerthoughts")
         .description("Top posts from r/showerthoughts.")
+        // accessoryCircular dropped — a circular lock-screen slot can only show
+        // an icon, no thought text, so it added nothing.
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge,
-                            .accessoryRectangular, .accessoryInline, .accessoryCircular])
+                            .accessoryRectangular, .accessoryInline])
     }
 }
 
@@ -94,8 +96,9 @@ struct SinglePostWidget: Widget {
         }
         .configurationDisplayName("Post")
         .description("The top post from a subreddit you choose.")
-        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge,
-                            .accessoryRectangular, .accessoryInline])
+        // Home-screen only. Lock-screen content comes from the zero-config
+        // Showerthoughts widget, so the lock screen stays option-free.
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
 
