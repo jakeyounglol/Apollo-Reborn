@@ -7,15 +7,16 @@ struct ShowerthoughtsProvider: IntentTimelineProvider {
     typealias Entry = WidgetEntry
     typealias Intent = ShowerthoughtsConfigurationIntent
 
-    func placeholder(in context: Context) -> WidgetEntry { .loading }
+    func placeholder(in context: Context) -> WidgetEntry { .sample([WidgetSample.showerthought]) }
 
     func getSnapshot(for configuration: Intent, in context: Context,
                      completion: @escaping (WidgetEntry) -> Void) {
+        if context.isPreview { completion(.sample([WidgetSample.showerthought])); return }
         let cached = PostCache.load("showerthoughts")
         if let first = cached.first {
             completion(WidgetEntry(date: Date(), state: .posts([RenderPost(post: first, imageData: nil)])))
         } else {
-            completion(.loading)
+            completion(.sample([WidgetSample.showerthought]))
         }
     }
 

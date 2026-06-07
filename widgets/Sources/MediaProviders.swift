@@ -34,13 +34,14 @@ struct JokesProvider: IntentTimelineProvider {
     typealias Entry = WidgetEntry
     typealias Intent = JokesConfigurationIntent
 
-    func placeholder(in context: Context) -> WidgetEntry { .loading }
+    func placeholder(in context: Context) -> WidgetEntry { .sample([WidgetSample.joke]) }
 
     func getSnapshot(for configuration: Intent, in context: Context,
                      completion: @escaping (WidgetEntry) -> Void) {
+        if context.isPreview { completion(.sample([WidgetSample.joke])); return }
         if let first = PostCache.load("jokes").first {
             completion(WidgetEntry(date: Date(), state: .posts([RenderPost(post: first, imageData: nil)])))
-        } else { completion(.loading) }
+        } else { completion(.sample([WidgetSample.joke])) }
     }
 
     func getTimeline(for configuration: Intent, in context: Context,
@@ -59,17 +60,28 @@ struct SinglePostProvider: IntentTimelineProvider {
     typealias Entry = WidgetEntry
     typealias Intent = PostConfigurationIntent
 
-    func placeholder(in context: Context) -> WidgetEntry { .loading }
+    func placeholder(in context: Context) -> WidgetEntry { .sample([WidgetSample.post]) }
 
     func getSnapshot(for configuration: Intent, in context: Context,
                      completion: @escaping (WidgetEntry) -> Void) {
+        let display = displayMode(configuration.display)
+        let showPreview = configuration.showPreview?.boolValue ?? false
+        if context.isPreview {
+            completion(WidgetEntry(date: Date(),
+                                   state: .posts([RenderPost(post: WidgetSample.post, imageData: nil)]),
+                                   display: display, showPreview: showPreview))
+            return
+        }
         let sub = resolvedSubreddit(configuration.subreddit, default: "popular")
         let nsfw = configuration.allowNSFW?.boolValue ?? false
         if let first = PostCache.load("single.\(sub)\(nsfw ? ".x" : "")").first {
             completion(WidgetEntry(date: Date(), state: .posts([RenderPost(post: first, imageData: nil)]),
-                                   display: displayMode(configuration.display),
-                                   showPreview: configuration.showPreview?.boolValue ?? false))
-        } else { completion(.loading) }
+                                   display: display, showPreview: showPreview))
+        } else {
+            completion(WidgetEntry(date: Date(),
+                                   state: .posts([RenderPost(post: WidgetSample.post, imageData: nil)]),
+                                   display: display, showPreview: showPreview))
+        }
     }
 
     func getTimeline(for configuration: Intent, in context: Context,
@@ -99,29 +111,36 @@ struct FeedProvider: IntentTimelineProvider {
     typealias Entry = WidgetEntry
     typealias Intent = SubredditConfigurationIntent
 
-    func placeholder(in context: Context) -> WidgetEntry { .loading }
+    func placeholder(in context: Context) -> WidgetEntry { .sample(WidgetSample.feed, sourceLabel: "Popular") }
 
     func getSnapshot(for configuration: Intent, in context: Context,
                      completion: @escaping (WidgetEntry) -> Void) {
         let sub = resolvedSubreddit(configuration.subreddit, default: "popular")
+        let label = feedSourceLabel(sub)
+        if context.isPreview { completion(.sample(WidgetSample.feed, sourceLabel: label)); return }
         let cached = PostCache.load("feed.\(sub)")
         if !cached.isEmpty {
-            completion(WidgetEntry(date: Date(), state: .posts(cached.map { RenderPost(post: $0, imageData: nil) })))
-        } else { completion(.loading) }
+            completion(WidgetEntry(date: Date(),
+                                   state: .posts(cached.map { RenderPost(post: $0, imageData: nil) }),
+                                   sourceLabel: label))
+        } else { completion(.sample(WidgetSample.feed, sourceLabel: label)) }
     }
 
     func getTimeline(for configuration: Intent, in context: Context,
                      completion: @escaping (Timeline<WidgetEntry>) -> Void) {
         let sub = resolvedSubreddit(configuration.subreddit, default: "popular")
-        let sort = widgetSort(configuration.sort, default: .hot)
+        let sort: WidgetSort = RefreshRequest.wantsLatest(kind: "FeedWidget")
+            ? .new
+            : widgetSort(configuration.sort, default: .hot)
+        let label = feedSourceLabel(sub)
         runPostTimeline(
             code: configuration.setupCode, cacheKey: "feed.\(sub)",
-            fetch: { try await $0.topPosts(subreddit: sub, sort: sort, limit: 8) },
+            fetch: { try await $0.topPosts(subreddit: sub, sort: sort, limit: 12) },
             assemble: { posts in
-                // Download small thumbnails (concurrently) for the rows the large family shows.
-                let renders = await downloadImages(Array(posts.prefix(6)),
+                // Download small thumbnails (concurrently) for the rows shown.
+                let renders = await downloadImages(Array(posts.prefix(8)),
                                                    keyPath: { $0.thumbnailURL }, maxPixel: 160)
-                return listTimeline(renders, key: "feed.\(sub)")
+                return stamped(listTimeline(renders, key: "feed.\(sub)"), sourceLabel: label)
             },
             completion: completion)
     }
@@ -133,14 +152,15 @@ struct PhotoProvider: IntentTimelineProvider {
     typealias Entry = WidgetEntry
     typealias Intent = SubredditConfigurationIntent
 
-    func placeholder(in context: Context) -> WidgetEntry { .loading }
+    func placeholder(in context: Context) -> WidgetEntry { .sample([WidgetSample.feed[4]]) }
 
     func getSnapshot(for configuration: Intent, in context: Context,
                      completion: @escaping (WidgetEntry) -> Void) {
+        if context.isPreview { completion(.sample([WidgetSample.feed[4]])); return }
         let sub = resolvedSubreddit(configuration.subreddit, default: "EarthPorn")
         if let first = PostCache.load("photo.\(sub)").first {
             completion(WidgetEntry(date: Date(), state: .posts([RenderPost(post: first, imageData: nil)])))
-        } else { completion(.loading) }
+        } else { completion(.sample([WidgetSample.feed[4]])) }
     }
 
     func getTimeline(for configuration: Intent, in context: Context,

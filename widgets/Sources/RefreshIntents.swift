@@ -21,6 +21,22 @@ enum Rotation {
     }
 }
 
+/// Short-lived request made by an interactive widget button. WidgetKit does not
+/// pass button context into `getTimeline`, so providers read this flag on reload.
+enum RefreshRequest {
+    private static let defaults = UserDefaults.standard
+    private static func key(_ kind: String) -> String { "rw.refreshLatest.\(kind)" }
+    private static let lifetime: TimeInterval = 2 * 60
+
+    static func requestLatest(kind: String) {
+        defaults.set(Date().timeIntervalSince1970 + lifetime, forKey: key(kind))
+    }
+
+    static func wantsLatest(kind: String) -> Bool {
+        defaults.double(forKey: key(kind)) > Date().timeIntervalSince1970
+    }
+}
+
 /// Interactive "show me another" button — confirmed to fire under Feather
 /// (AppIntents perform() works at runtime even though AppIntents *config*
 /// doesn't survive re-signing). The widget's cache key is passed in so the
@@ -53,6 +69,7 @@ struct ReloadKindIntent: AppIntent {
     init(kind: String) { self.kind = kind }
 
     func perform() async throws -> some IntentResult {
+        RefreshRequest.requestLatest(kind: kind)
         WidgetCenter.shared.reloadTimelines(ofKind: kind)
         return .result()
     }

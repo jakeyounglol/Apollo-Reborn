@@ -137,6 +137,8 @@ struct StatsLine: View {
     var display: DisplayMode = .standard
     var showSubreddit: Bool = true
     var showComments: Bool = true
+    var foreground: Color = .white.opacity(0.9)
+    var font: Font = .caption2
     var body: some View {
         HStack(spacing: 6) {
             if showSubreddit, !post.subreddit.isEmpty {
@@ -157,8 +159,8 @@ struct StatsLine: View {
                 }
             }
         }
-        .font(.caption2)
-        .foregroundStyle(.white.opacity(0.9))
+        .font(font)
+        .foregroundStyle(foreground)
         .labelStyle(.titleAndIcon)
         .lineLimit(1)
         .minimumScaleFactor(0.85)

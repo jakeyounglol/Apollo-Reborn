@@ -144,63 +144,100 @@ struct PhotoWidgetView: View {
 /// its post in Apollo.
 struct FeedWidgetView: View {
     @Environment(\.widgetFamily) private var family
+    @Environment(\.colorScheme) private var colorScheme
     let entry: WidgetEntry
 
-    private var rowCount: Int {
-        switch family {
-        case .systemLarge: return 6
-        case .systemMedium: return 3
-        default: return 2
-        }
+    /// How many rows to show. A medium is short, so it always shows 2 (the rows
+    /// compress/expand to fit). A large varies hugely by device, so we fit by
+    /// measured height — fixed counts either clip on small phones or leave a
+    /// black void on a Pro Max.
+    private func rowCount(height: CGFloat, available: Int) -> Int {
+        guard available > 0 else { return 0 }
+        if family == .systemMedium { return min(2, available) }
+        let n = Int((height - 14) / 58)         // ≈ header + n·(row+divider)
+        return max(2, min(n, available))
     }
 
     var body: some View {
+        let palette = FeedPalette(scheme: colorScheme)
         WidgetShell(entry: entry) {
-            Color(red: 0.11, green: 0.12, blue: 0.14)
+            palette.background
         } content: { renders in
-            let sub = renders.first?.post.subreddit ?? ""
-            VStack(alignment: .leading, spacing: 7) {
-                WidgetHeader(label: "r/\(sub)",
-                             tint: Color(red: 0.40, green: 0.62, blue: 1.0),
-                             trailing: AnyView(ReloadButton(kind: "FeedWidget")))
-                let rows = Array(renders.prefix(rowCount))
-                ForEach(Array(rows.enumerated()), id: \.element.post.id) { idx, render in
-                    rowLink(render)
-                    if idx != rows.count - 1 {
-                        Divider().overlay(.white.opacity(0.10))
+            GeometryReader { geo in
+                let label = entry.sourceLabel ?? "r/\(renders.first?.post.subreddit ?? "")"
+                let rows = Array(renders.prefix(rowCount(height: geo.size.height,
+                                                         available: renders.count)))
+                VStack(alignment: .leading, spacing: 0) {
+                    WidgetHeader(label: label,
+                                 tint: palette.accent,
+                                 trailing: AnyView(ReloadButton(kind: "FeedWidget")))
+                        .padding(.bottom, 6)
+                    ForEach(Array(rows.enumerated()), id: \.element.post.id) { idx, render in
+                        // Rows share leftover space equally so the list fills the
+                        // widget instead of leaving a black void at the bottom.
+                        rowLink(render, palette: palette).frame(maxHeight: .infinity)
+                        if idx != rows.count - 1 {
+                            Divider().overlay(palette.separator).padding(.vertical, 5)
+                        }
                     }
                 }
-                Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
         }
     }
 
-    @ViewBuilder private func rowLink(_ render: RenderPost) -> some View {
+    @ViewBuilder private func rowLink(_ render: RenderPost, palette: FeedPalette) -> some View {
         if let url = render.post.apolloURL {
-            Link(destination: url) { row(render) }
+            Link(destination: url) { row(render, palette: palette) }
         } else {
-            row(render)
+            row(render, palette: palette)
         }
     }
 
-    private func row(_ render: RenderPost) -> some View {
+    private func row(_ render: RenderPost, palette: FeedPalette) -> some View {
         HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(render.post.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(2).minimumScaleFactor(0.85)
-                StatsLine(post: render.post)
+                    .font(.system(size: family == .systemMedium ? 13 : 14, weight: .semibold))
+                    .foregroundStyle(palette.title)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                StatsLine(post: render.post,
+                          foreground: palette.metadata,
+                          font: .system(size: 12, weight: .regular))
             }
-            Spacer(minLength: 0)
-            // Apollo puts the thumbnail on the trailing edge.
+            // Keep the thumbnail off the trailing edge so it clears the widget's
+            // rounded corner instead of being clipped diagonally.
+            Spacer(minLength: 8)
             if let img = imageFromData(render.imageData) {
                 img.resizable().aspectRatio(contentMode: .fill)
-                    .frame(width: 44, height: 44)
+                    .frame(width: 42, height: 42)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
+        }
+    }
+}
+
+private struct FeedPalette {
+    let background: Color
+    let title: Color
+    let metadata: Color
+    let separator: Color
+    let accent: Color
+
+    init(scheme: ColorScheme) {
+        if scheme == .dark {
+            background = Color(red: 0.11, green: 0.12, blue: 0.14)
+            title = Color.white.opacity(0.94)
+            metadata = Color(red: 0.70, green: 0.73, blue: 0.78)
+            separator = Color.white.opacity(0.12)
+            accent = Color(red: 0.40, green: 0.62, blue: 1.0)
+        } else {
+            background = Color(red: 0.98, green: 0.985, blue: 0.995)
+            title = Color(red: 0.11, green: 0.12, blue: 0.14)
+            metadata = Color(red: 0.43, green: 0.47, blue: 0.54)
+            separator = Color.black.opacity(0.10)
+            accent = Color(red: 0.16, green: 0.42, blue: 0.88)
         }
     }
 }

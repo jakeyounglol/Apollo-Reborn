@@ -24,8 +24,84 @@ struct WidgetEntry: TimelineEntry {
     /// Post widget rendering config (ignored by the other widgets).
     var display: DisplayMode = .standard
     var showPreview: Bool = false
+    /// Feed header label (e.g. "Popular", "r/aww"). The Feed mixes subreddits
+    /// for sources like r/popular, so the header must show the configured
+    /// source, not the first post's subreddit.
+    var sourceLabel: String? = nil
 
     static let loading = WidgetEntry(date: Date(), state: .loading)
+
+    /// Build a content entry from plain posts (used for gallery previews).
+    static func sample(_ posts: [RedditPost], sourceLabel: String? = nil) -> WidgetEntry {
+        WidgetEntry(date: Date(),
+                    state: .posts(posts.map { RenderPost(post: $0, imageData: nil) }),
+                    sourceLabel: sourceLabel)
+    }
+}
+
+/// Realistic placeholder content for the widget gallery / loading state, so the
+/// preview looks like a real widget instead of an orange "Loading…" card before
+/// the user pastes a setup code.
+enum WidgetSample {
+    private static func ago(_ h: Double) -> Double { Date().timeIntervalSince1970 - h * 3600 }
+
+    static let feed: [RedditPost] = [
+        RedditPost(id: "s1", title: "TIL a group of flamingos is called a “flamboyance.”",
+                   author: "curiousmind", subreddit: "todayilearned", score: 48200, numComments: 1240,
+                   permalink: "/r/todayilearned/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(3)),
+        RedditPost(id: "s2", title: "My rescue cat finally let me hold her paw today.",
+                   author: "catperson", subreddit: "aww", score: 31900, numComments: 410,
+                   permalink: "/r/aww/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(5)),
+        RedditPost(id: "s3", title: "What small habit improved your life more than expected?",
+                   author: "asker", subreddit: "AskReddit", score: 12400, numComments: 8800,
+                   permalink: "/r/AskReddit/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(2)),
+        RedditPost(id: "s4", title: "After 6 months of work, I finally shipped my game!",
+                   author: "gamedev", subreddit: "gaming", score: 22100, numComments: 990,
+                   permalink: "/r/gaming/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(7)),
+        RedditPost(id: "s5", title: "The sky after tonight’s storm was unreal.",
+                   author: "skywatcher", subreddit: "pics", score: 54200, numComments: 760,
+                   permalink: "/r/pics/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(9)),
+        RedditPost(id: "s6", title: "Spent the weekend restoring this old bike.",
+                   author: "tinkerer", subreddit: "DIY", score: 18700, numComments: 320,
+                   permalink: "/r/DIY/", selftext: "", thumbnailURL: nil, imageURL: nil,
+                   isImagePost: false, created: ago(11)),
+    ]
+
+    static let showerthought = RedditPost(
+        id: "st", title: "Your future self is watching you right now through memories.",
+        author: "deepthinker", subreddit: "Showerthoughts", score: 28400, numComments: 540,
+        permalink: "/r/Showerthoughts/", selftext: "", thumbnailURL: nil, imageURL: nil,
+        isImagePost: false, created: ago(4))
+
+    static let joke = RedditPost(
+        id: "jk", title: "I told my computer I needed a break…",
+        author: "punmaster", subreddit: "Jokes", score: 15600, numComments: 230,
+        permalink: "/r/Jokes/", selftext: "…and now it won’t stop sending me KitKat ads.",
+        thumbnailURL: nil, imageURL: nil, isImagePost: false, created: ago(6))
+
+    static var post: RedditPost { feed[0] }
+}
+
+/// Human-readable label for a Feed/Post source. r/popular, r/all and the home
+/// feed are multi-subreddit, so they get a plain capitalized name; everything
+/// else is shown as "r/<sub>".
+func feedSourceLabel(_ sub: String) -> String {
+    let lower = sub.lowercased()
+    if ["popular", "all", "home"].contains(lower) { return lower.capitalized }
+    return "r/\(sub)"
+}
+
+/// Stamp a Feed source label onto every entry of a built timeline.
+func stamped(_ timeline: Timeline<WidgetEntry>, sourceLabel: String) -> Timeline<WidgetEntry> {
+    let entries = timeline.entries.map { e -> WidgetEntry in
+        var e = e; e.sourceLabel = sourceLabel; return e
+    }
+    return Timeline(entries: entries, policy: timeline.policy)
 }
 
 /// Stamp the Post widget's render config onto every entry of a built timeline,
