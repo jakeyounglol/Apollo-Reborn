@@ -9,7 +9,7 @@ struct CalendarWidgetView: View {
 
     var body: some View {
         WidgetShell(entry: entry) {
-            calendarBackground(entry, fallback: BlueGradient())
+            imageBackground(entry, fallback: BlueGradient())
         } content: { renders in
             let post = renders[0].post
             ZStack {
@@ -39,111 +39,71 @@ struct CalendarWidgetView: View {
     }
     private func weekday(_ d: Date, short: Bool) -> String { text(d, short ? "EEE" : "EEEE") }
     private func dayNum(_ d: Date) -> String { text(d, "d") }
+    private func dayPadded(_ d: Date) -> String { text(d, "dd") }
     private func month(_ d: Date, short: Bool) -> String { text(d, short ? "MMM" : "MMMM") }
     private func year(_ d: Date) -> String { text(d, "yyyy") }
+    private func isoDate(_ d: Date) -> String { "\(year(d)).\(text(d, "MM")).\(text(d, "dd"))" }
 
-    // MARK: overlays
+    // MARK: overlays — each is a distinct system-font treatment
 
     @ViewBuilder private func overlay(date: Date, style: CalendarStyle) -> some View {
         switch style {
-        case .minimal: minimalStyle(date)
-        case .card:    cardStyle(date)
-        case .poster:  posterStyle(date)
-        case .pill:    pillStyle(date)
-        case .stamp:   stampStyle(date)
+        case .rounded:   roundedStyle(date)
+        case .serif:     serifStyle(date)
+        case .mono:      monoStyle(date)
+        case .condensed: condensedStyle(date)
+        case .stamp:     stampStyle(date)
         }
     }
 
-    private var shadow: some ViewModifier { TextShadow() }
-
-    /// Big day number with small weekday/month, anchored bottom-left.
-    private func minimalStyle(_ d: Date) -> some View {
-        VStack(alignment: .leading, spacing: -2) {
-            Text(weekday(d, short: false).uppercased())
-                .font(.system(size: s(14), weight: .semibold)).tracking(2)
+    /// SF Pro Rounded — friendly, oversized day number, bottom-left.
+    private func roundedStyle(_ d: Date) -> some View {
+        VStack(alignment: .leading, spacing: s(-4)) {
+            Text(weekday(d, short: false))
+                .font(.system(size: s(15), weight: .semibold, design: .rounded))
             Text(dayNum(d))
-                .font(.system(size: s(74), weight: .heavy)).monospacedDigit()
+                .font(.system(size: s(80), weight: .heavy, design: .rounded))
+                .lineLimit(1).minimumScaleFactor(0.5)
             Text("\(month(d, short: false)) \(year(d))")
-                .font(.system(size: s(15), weight: .medium))
+                .font(.system(size: s(14), weight: .medium, design: .rounded))
+                .opacity(0.9)
         }
         .foregroundStyle(.white)
         .modifier(TextShadow())
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-        .padding(s(14))
+        .padding(s(15))
         .background(alignment: .bottom) { bottomScrim }
     }
 
-    /// Translucent calendar-tile (red header strip / day / month), bottom-left.
-    private func cardStyle(_ d: Date) -> some View {
-        VStack(spacing: 0) {
-            Text(weekday(d, short: true).uppercased())
-                .font(.system(size: s(13), weight: .heavy)).tracking(1)
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, s(4))
-                .background(Color(red: 0.92, green: 0.26, blue: 0.21))
-            VStack(spacing: -2) {
-                Text(dayNum(d))
-                    .font(.system(size: s(40), weight: .bold)).monospacedDigit()
-                    .foregroundStyle(.primary)
-                Text(month(d, short: true).uppercased())
-                    .font(.system(size: s(12), weight: .semibold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, s(14)).padding(.vertical, s(7))
-        }
-        .frame(width: s(96))
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: s(16), style: .continuous))
-        .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-        .padding(s(13))
-    }
-
-    /// Centered large stacked typography across the image.
-    private func posterStyle(_ d: Date) -> some View {
-        VStack(spacing: small ? 0 : 2) {
+    /// New York serif — editorial masthead, centered with a hairline rule.
+    private func serifStyle(_ d: Date) -> some View {
+        VStack(spacing: s(4)) {
             Text(weekday(d, short: false).uppercased())
-                .font(.system(size: s(16), weight: .bold)).tracking(4)
+                .font(.system(size: s(13), weight: .semibold, design: .serif)).tracking(s(4))
             Text(dayNum(d))
-                .font(.system(size: s(92), weight: .black)).monospacedDigit()
+                .font(.system(size: s(88), weight: .bold, design: .serif))
                 .lineLimit(1).minimumScaleFactor(0.5)
-            Text("\(month(d, short: false).uppercased()) · \(year(d))")
-                .font(.system(size: s(15), weight: .semibold)).tracking(2)
+            Rectangle().fill(.white.opacity(0.85)).frame(width: s(42), height: 1)
+            Text("\(month(d, short: false)) \(year(d))")
+                .font(.system(size: s(14), weight: .regular, design: .serif)).italic()
         }
         .foregroundStyle(.white)
         .modifier(TextShadow())
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background { Color.black.opacity(0.28) }
+        .background { Color.black.opacity(0.22) }
     }
 
-    /// Compact capsule, top-left.
-    private func pillStyle(_ d: Date) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "calendar").font(.system(size: s(12), weight: .bold))
-            Text("\(weekday(d, short: true)) · \(month(d, short: true)) \(dayNum(d))")
-                .font(.system(size: s(14), weight: .semibold))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, s(12)).padding(.vertical, s(7))
-        .background(.ultraThinMaterial, in: Capsule())
-        .environment(\.colorScheme, .dark)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(s(12))
-    }
-
-    /// Magazine-style ruled date, top-left, serif.
-    private func stampStyle(_ d: Date) -> some View {
-        VStack(alignment: .leading, spacing: s(3)) {
-            Text(month(d, short: true).uppercased())
-                .font(.system(size: s(15), weight: .bold, design: .serif)).tracking(3)
-            Rectangle().fill(.white).frame(width: s(34), height: 2)
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(dayNum(d))
-                    .font(.system(size: s(44), weight: .black, design: .serif)).monospacedDigit()
-                Text(weekday(d, short: true).lowercased())
-                    .font(.system(size: s(14), weight: .regular, design: .serif))
-            }
+    /// Monospaced — digital readout, top-left, ISO date line.
+    private func monoStyle(_ d: Date) -> some View {
+        VStack(alignment: .leading, spacing: s(2)) {
+            Text(weekday(d, short: true).uppercased())
+                .font(.system(size: s(12), weight: .medium, design: .monospaced)).tracking(s(3))
+                .opacity(0.85)
+            Text(dayPadded(d))
+                .font(.system(size: s(60), weight: .bold, design: .monospaced))
+            Text(isoDate(d))
+                .font(.system(size: s(12), weight: .medium, design: .monospaced)).tracking(s(1))
+                .opacity(0.85)
         }
         .foregroundStyle(.white)
         .modifier(TextShadow())
@@ -152,12 +112,48 @@ struct CalendarWidgetView: View {
         .background(alignment: .top) { topScrim }
     }
 
+    /// Condensed heavy — sports-poster numerals, bottom, edge-to-edge.
+    private func condensedStyle(_ d: Date) -> some View {
+        VStack(alignment: .leading, spacing: s(-8)) {
+            Text(weekday(d, short: false).uppercased())
+                .font(.system(size: s(20), weight: .heavy)).fontWidth(.condensed).tracking(s(1))
+            Text(dayNum(d))
+                .font(.system(size: s(106), weight: .black)).fontWidth(.condensed)
+                .lineLimit(1).minimumScaleFactor(0.5)
+            Text(month(d, short: false).uppercased())
+                .font(.system(size: s(22), weight: .bold)).fontWidth(.condensed).tracking(s(1))
+        }
+        .foregroundStyle(.white)
+        .modifier(TextShadow())
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .padding(s(15))
+        .background(alignment: .bottom) { bottomScrim }
+    }
+
+    /// Outlined, rotated date-stamp — centered, passport-stamp feel.
+    private func stampStyle(_ d: Date) -> some View {
+        VStack(spacing: s(1)) {
+            Text(month(d, short: true).uppercased())
+                .font(.system(size: s(14), weight: .heavy, design: .monospaced)).tracking(s(2))
+            Text(dayPadded(d))
+                .font(.system(size: s(42), weight: .black, design: .monospaced))
+            Text(year(d))
+                .font(.system(size: s(12), weight: .semibold, design: .monospaced)).tracking(s(2))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, s(14)).padding(.vertical, s(8))
+        .overlay(RoundedRectangle(cornerRadius: s(8)).strokeBorder(.white, lineWidth: s(2)))
+        .rotationEffect(.degrees(-6))
+        .modifier(TextShadow())
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     // MARK: title
 
     /// Optional post title, placed at the opposite edge from each style's date
     /// anchor so the two never collide.
     @ViewBuilder private func titleOverlay(_ title: String, style: CalendarStyle) -> some View {
-        let bottomAnchored = (style == .minimal || style == .card)
+        let bottomAnchored = (style == .rounded || style == .condensed)
         Text(title)
             .font(.system(size: s(12), weight: .semibold))
             .foregroundStyle(.white.opacity(0.95))
@@ -191,15 +187,5 @@ struct CalendarWidgetView: View {
 private struct TextShadow: ViewModifier {
     func body(content: Content) -> some View {
         content.shadow(color: .black.opacity(0.45), radius: 3, y: 1)
-    }
-}
-
-/// Full-bleed image background or gradient fallback (mirrors MediaViews, but the
-/// Calendar widget always fills with the locked photo).
-@ViewBuilder private func calendarBackground(_ entry: WidgetEntry, fallback: some View) -> some View {
-    if case .posts(let r) = entry.state, let data = r.first?.imageData, let img = imageFromData(data) {
-        img.resizable().scaledToFill()
-    } else {
-        fallback
     }
 }

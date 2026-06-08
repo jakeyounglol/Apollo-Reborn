@@ -31,7 +31,7 @@ struct WidgetEntry: TimelineEntry {
     var feedCompact: Bool = false
     /// Calendar widget rendering config (ignored by the other widgets). The
     /// displayed date is `date`; each Calendar entry is one locked day.
-    var calendarStyle: CalendarStyle = .card
+    var calendarStyle: CalendarStyle = .rounded
     var calendarShowTitle: Bool = false
 
     static let loading = WidgetEntry(date: Date(), state: .loading)

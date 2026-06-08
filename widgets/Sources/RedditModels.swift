@@ -78,16 +78,16 @@ enum Caption: Int, Codable, Hashable {
     var density: DisplayMode { self == .detailed ? .detailed : .standard }
 }
 
-/// Date-overlay style for the Calendar widget. Raw values are stable so they
-/// can ride along in a `WidgetEntry`; the SiriKit `RebornDateStyle` enum maps
-/// onto these in `CalendarProvider`.
-///   minimal – big day number, small weekday/month
-///   card    – translucent calendar-tile block (weekday / day / month)
-///   poster  – large stacked typography across the image
-///   pill    – compact top-left date capsule
-///   stamp   – magazine-style ruled date in the corner
+/// Date-overlay style for the Calendar widget — each is a distinct typographic
+/// treatment (a different SF system font design). Raw values ride along in a
+/// `WidgetEntry`; the SiriKit `RebornDateStyle` maps onto these in `CalendarProvider`.
+///   rounded   – SF Pro Rounded, friendly, big day number
+///   serif     – New York serif, editorial / masthead
+///   mono      – monospaced, digital date readout
+///   condensed – condensed-width heavy, sports-poster
+///   stamp     – outlined, rotated date-stamp
 enum CalendarStyle: Int, Codable, Hashable {
-    case minimal, card, poster, pill, stamp
+    case rounded, serif, mono, condensed, stamp
 }
 
 /// Listing sort, mapped to the Reddit API path + time window.

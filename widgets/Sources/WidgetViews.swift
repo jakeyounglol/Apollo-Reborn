@@ -22,14 +22,16 @@ struct WidgetShell<Content: View, Background: View>: View {
         case .posts(let renders) where !renders.isEmpty:
             content(renders)
         case .posts:
-            MessageView(icon: "tray", title: "Nothing here", detail: "No posts to show right now.")
+            // Reached Reddit, but nothing eligible came back.
+            MessageView(icon: "tray", title: "Nothing here",
+                        detail: "No posts to show right now. Try a different subreddit or sort.")
         case .loading:
-            MessageView(icon: "arrow.clockwise", title: "Apollo", detail: "Loading…")
+            MessageView(icon: "ellipsis", title: "Apollo", detail: "Loading…")
         case .needsSetup:
-            MessageView(icon: "key.horizontal.fill", title: "Set up Apollo widgets",
-                        detail: "Tap Edit and paste your Apollo setup code (Settings → Apollo Reborn → Copy Widget Setup Code). You only need to do this once.")
+            SetupView()
         case .error(let msg):
-            MessageView(icon: "arrow.clockwise", title: "Apollo", detail: msg)
+            // Transient (offline / rate-limited) — phrased as "will retry".
+            MessageView(icon: "wifi.exclamationmark", title: "Can't reach Reddit", detail: msg)
         }
     }
 
@@ -67,6 +69,40 @@ struct MessageView: View {
     }
 }
 
+/// First-run / setup state, fronted by the Apollo mascot so it feels like an
+/// intentional welcome rather than an error.
+struct SetupView: View {
+    @Environment(\.widgetFamily) private var family
+    private var small: Bool { family == .systemSmall }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: small ? 7 : 9) {
+            Image("ApolloAvatar")
+                .resizable().scaledToFill()
+                .frame(width: small ? 38 : 46, height: small ? 38 : 46)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 1))
+                .shadow(color: .black.opacity(0.2), radius: 3, y: 1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Set up Apollo widgets")
+                    .font(.system(size: small ? 14 : 16, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .minimumScaleFactor(0.7)
+                    .lineLimit(2)
+                Text(small
+                     ? "Tap Edit and paste your Apollo setup code."
+                     : "Tap Edit and paste your setup code from Apollo → Settings → Apollo Reborn. Just once — every widget shares it.")
+                    .font(.system(size: small ? 11 : 12))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .minimumScaleFactor(0.8)
+                    .lineLimit(small ? 3 : 5)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 // MARK: - Reusable bits
 
 /// Small header: a bold tinted title (Apollo uses an emoji, e.g. "Showerthoughts
@@ -79,7 +115,7 @@ struct WidgetHeader: View {
     var body: some View {
         HStack(spacing: 5) {
             if let icon { Image(systemName: icon).font(.caption2) }
-            Text(label).font(.system(size: 13, weight: .heavy))
+            Text(label).font(.system(size: 13, weight: .heavy, design: .rounded))
             Spacer(minLength: 4)
             if let trailing { trailing }
         }
@@ -164,14 +200,20 @@ struct StatsLine: View {
         .labelStyle(.titleAndIcon)
         .lineLimit(1)
         .minimumScaleFactor(0.85)
+        .monospacedDigit()   // stops scores/comments from jittering on rotation
     }
 }
 
 extension Int {
-    /// 1500 → "1.5k", 23000 → "23k".
+    /// Apollo-style counts: 950 → "950", 1500 → "1.5k", 12400 → "12.4k",
+    /// 23000 → "23k", 1_500_000 → "1.5m". Trailing ".0" is dropped.
     var abbreviated: String {
-        if self >= 10_000 { return "\(self / 1000)k" }
-        if self >= 1_000 { return String(format: "%.1fk", Double(self) / 1000) }
+        func trim(_ v: Double, _ suffix: String) -> String {
+            let s = String(format: "%.1f", v)
+            return (s.hasSuffix(".0") ? String(s.dropLast(2)) : s) + suffix
+        }
+        if self >= 1_000_000 { return trim(Double(self) / 1_000_000, "m") }
+        if self >= 1_000 { return trim(Double(self) / 1_000, "k") }
         return "\(self)"
     }
 }
@@ -216,6 +258,30 @@ extension View {
 func imageFromData(_ data: Data?) -> Image? {
     guard let data, let ui = UIImage(data: data) else { return nil }
     return Image(uiImage: ui)
+}
+
+/// First render of a `.posts` entry (for reading its background image).
+func firstRender(_ entry: WidgetEntry) -> RenderPost? {
+    if case .posts(let r) = entry.state { return r.first }
+    return nil
+}
+
+/// Shared full-bleed photo background for the image widgets (Photo, Post,
+/// Calendar): the downsampled image filled to the frame with a subtle vignette
+/// for depth, or a gradient fallback when there's no image.
+@ViewBuilder func imageBackground(_ entry: WidgetEntry, fallback: some View) -> some View {
+    if let data = firstRender(entry)?.imageData, let img = imageFromData(data) {
+        img.resizable().scaledToFill()
+            .overlay {
+                // Gentle corner vignette so edges don't blow out and the photo
+                // reads as art-directed rather than a flat crop.
+                RadialGradient(colors: [.clear, .black.opacity(0.22)],
+                               center: .center, startRadius: 40, endRadius: 320)
+                    .allowsHitTesting(false)
+            }
+    } else {
+        fallback
+    }
 }
 
 func firstPost(_ entry: WidgetEntry) -> RedditPost? {

@@ -120,12 +120,12 @@ private func fnv1aHash(_ s: String) -> UInt64 {
 
 private func calendarStyle(_ s: RebornDateStyle) -> CalendarStyle {
     switch s {
-    case .minimal: return .minimal
-    case .card: return .card
-    case .poster: return .poster
-    case .pill: return .pill
+    case .rounded: return .rounded
+    case .serif: return .serif
+    case .mono: return .mono
+    case .condensed: return .condensed
     case .stamp: return .stamp
-    @unknown default: return .card
+    @unknown default: return .rounded
     }
 }
 
@@ -144,7 +144,7 @@ struct CalendarProvider: IntentTimelineProvider {
 
     func placeholder(in context: Context) -> WidgetEntry {
         var e = WidgetEntry.sample([WidgetSample.feed[4]])
-        e.calendarStyle = .card
+        e.calendarStyle = .rounded
         return e
     }
 

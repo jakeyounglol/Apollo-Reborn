@@ -107,35 +107,35 @@
 			<array>
 				<dict>
 					<key>INEnumValueDisplayName</key>
-					<string>Minimal</string>
+					<string>Rounded</string>
 					<key>INEnumValueIndex</key>
 					<integer>1</integer>
 					<key>INEnumValueName</key>
-					<string>minimal</string>
+					<string>rounded</string>
 				</dict>
 				<dict>
 					<key>INEnumValueDisplayName</key>
-					<string>Card</string>
+					<string>Serif</string>
 					<key>INEnumValueIndex</key>
 					<integer>2</integer>
 					<key>INEnumValueName</key>
-					<string>card</string>
+					<string>serif</string>
 				</dict>
 				<dict>
 					<key>INEnumValueDisplayName</key>
-					<string>Poster</string>
+					<string>Mono</string>
 					<key>INEnumValueIndex</key>
 					<integer>3</integer>
 					<key>INEnumValueName</key>
-					<string>poster</string>
+					<string>mono</string>
 				</dict>
 				<dict>
 					<key>INEnumValueDisplayName</key>
-					<string>Pill</string>
+					<string>Condensed</string>
 					<key>INEnumValueIndex</key>
 					<integer>4</integer>
 					<key>INEnumValueName</key>
-					<string>pill</string>
+					<string>condensed</string>
 				</dict>
 				<dict>
 					<key>INEnumValueDisplayName</key>

@@ -1,23 +1,6 @@
 import SwiftUI
 import WidgetKit
 
-/// First render of a .posts entry (for reading the background image).
-private func firstRender(_ entry: WidgetEntry) -> RenderPost? {
-    if case .posts(let r) = entry.state { return r.first }
-    return nil
-}
-
-/// Full-bleed image background (iOS 17 containerBackground pattern) or a
-/// gradient fallback. A short note is shown when an image was expected but
-/// couldn't be loaded, to aid diagnosis.
-@ViewBuilder private func mediaBackground(_ entry: WidgetEntry, fallback: some View) -> some View {
-    if let data = firstRender(entry)?.imageData, let img = imageFromData(data) {
-        img.resizable().scaledToFill()
-    } else {
-        fallback
-    }
-}
-
 /// Single Post: top post of a subreddit, full-bleed image with a title scrim.
 struct SinglePostWidgetView: View {
     @Environment(\.widgetFamily) private var family
@@ -33,7 +16,7 @@ struct SinglePostWidgetView: View {
 
     private var homeBody: some View {
         WidgetShell(entry: entry) {
-            mediaBackground(entry, fallback: BlueGradient())
+            imageBackground(entry, fallback: BlueGradient())
         } content: { renders in
             let render = renders[0]
             // Adaptive: image posts get the photo-card treatment; text posts
@@ -123,7 +106,7 @@ struct PhotoWidgetView: View {
 
     var body: some View {
         WidgetShell(entry: entry) {
-            mediaBackground(entry, fallback: BlueGradient())
+            imageBackground(entry, fallback: BlueGradient())
         } content: { renders in
             let post = renders[0].post
             let caption = entry.caption
