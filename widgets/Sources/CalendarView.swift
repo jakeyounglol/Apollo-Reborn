@@ -5,11 +5,15 @@ import WidgetKit
 /// one of several styles. Tapping opens the source post in Apollo.
 struct CalendarWidgetView: View {
     @Environment(\.widgetFamily) private var family
+    // True in StandBy Night Mode (dark room) and Always-On. Dim the photo so the
+    // date reads as a calm nightstand display instead of a red-tinted picture.
+    @Environment(\.isLuminanceReduced) private var dimmed
     let entry: WidgetEntry
 
     var body: some View {
         WidgetShell(entry: entry) {
             imageBackground(entry, fallback: BlueGradient())
+                .overlay(dimmed ? Color.black.opacity(0.55) : Color.clear)
         } content: { renders in
             let post = renders[0].post
             ZStack {

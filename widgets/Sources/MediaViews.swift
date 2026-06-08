@@ -102,11 +102,14 @@ struct SinglePostWidgetView: View {
 /// Photo: full-bleed top image of a subreddit, minimal chrome.
 struct PhotoWidgetView: View {
     @Environment(\.widgetFamily) private var family
+    // Dim the photo in StandBy Night Mode so the caption stays legible.
+    @Environment(\.isLuminanceReduced) private var dimmed
     let entry: WidgetEntry
 
     var body: some View {
         WidgetShell(entry: entry) {
             imageBackground(entry, fallback: BlueGradient())
+                .overlay(dimmed ? Color.black.opacity(0.45) : Color.clear)
         } content: { renders in
             let post = renders[0].post
             let caption = entry.caption
