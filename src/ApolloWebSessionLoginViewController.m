@@ -58,7 +58,7 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Reddit Session Expired"
-                         message:@"Your Web JSON session is no longer valid (Reddit returned its sign-in wall). Sign in again to keep browsing without the OAuth API."
+                         message:@"Your Reddit web session is no longer valid (Reddit returned its sign-in wall). Sign in again to keep using Apollo without API keys."
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Sign In Again"
                                               style:UIAlertActionStyleDefault
@@ -74,7 +74,7 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Web Session Login";
+    self.title = @"Reddit Web Login";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.loginURL = [NSURL URLWithString:@"https://www.reddit.com/login"];
 
@@ -375,7 +375,7 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Signed In"
                          message:[NSString stringWithFormat:
-                             @"Signed in as %@ via Web JSON. Apollo needs to restart to finish signing in (load the account, enable voting and commenting).", who]
+                             @"Signed in as %@. Apollo needs to restart to finish signing in (load the account, enable voting and commenting).", who]
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Restart Apollo"
                                               style:UIAlertActionStyleDefault

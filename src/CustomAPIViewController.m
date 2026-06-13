@@ -978,8 +978,8 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
         case 9:
             return [self switchCellWithIdentifier:@"Cell_API_WebJSON"
-                                            label:@"Web JSON Mode (Experimental)"
-                                           detail:@"Drive Reddit through www.reddit.com JSON with a web session cookie instead of the OAuth API — reads, votes/comments/saves, and (best-effort) signed-in state without API keys."
+                                            label:@"API-Key-Free Mode (Experimental)"
+                                           detail:@"Use Apollo by signing in to reddit.com instead of using API keys (OAuth). Supports browsing, voting, commenting, and saving."
                                                on:sWebJSONEnabled
                                            action:@selector(webJSONSwitchToggled:)];
         case 10: {
