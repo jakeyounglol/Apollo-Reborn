@@ -667,9 +667,9 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case SectionBackupRestore: return 4;
-        // 7 text fields + Can't sign in? + API key setup guide + Web JSON switch
+        // 7 text fields + Can't sign in? + API key setup guide + Web JSON switch + Copy Widget Setup Code
         // (+ Web Session Login row, only while Web JSON mode is on)
-        case SectionAPIKeys: return sWebJSONEnabled ? 11 : 10;
+        case SectionAPIKeys: return sWebJSONEnabled ? 12 : 11;
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
         case SectionMedia: return 12 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
@@ -902,7 +902,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (UITableViewCell *)apiKeyCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
     UITableViewCell *cell = nil;
-    switch (row) {
+    // Web Session Login (row 10) only exists while Web JSON mode is on; when it's
+    // off the rows below it slide up one slot, so map back to the canonical index.
+    NSInteger effectiveRow = (!sWebJSONEnabled && row >= 10) ? row + 1 : row;
+    switch (effectiveRow) {
         case 0:
             cell = [self textFieldCellWithIdentifier:@"Cell_API_Reddit"
                                                label:@"Reddit API Key"
@@ -999,6 +1002,16 @@ typedef NS_ENUM(NSInteger, Tag) {
             } else {
                 cell.detailTextLabel.text = @"Not signed in — tap to harvest a cookie";
             }
+            return cell;
+        }
+        case 11: {
+            UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_WidgetSetupCode"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_WidgetSetupCode"];
+                cell.accessoryType = UITableViewCellAccessoryNone;
+            }
+            cell.textLabel.text = @"Copy Widget Setup Code";
+            cell.textLabel.textColor = [self apollo_themeAccentColor];
             return cell;
         }
         default:
@@ -1570,12 +1583,15 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self promptClearCustomSubredditBannersFromSourceView:cell];
         }
     } else if (indexPath.section == SectionAPIKeys) {
-        if (indexPath.row == 7) {
+        NSInteger row = (!sWebJSONEnabled && indexPath.row >= 10) ? indexPath.row + 1 : indexPath.row;
+        if (row == 7) {
             [self pushTroubleshootingViewController];
-        } else if (indexPath.row == 8) {
+        } else if (row == 8) {
             [self pushInstructionsViewController];
-        } else if (indexPath.row == 10) {
+        } else if (row == 10) {
             [self presentWebSessionLoginViewController];
+        } else if (row == 11) {
+            [self copyWidgetSetupCode];
         }
     } else if (indexPath.section == SectionAbout) {
         if (indexPath.row == 0) {
@@ -1615,6 +1631,37 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
+- (void)copyWidgetSetupCode {
+    NSString *clientID = sRedditClientId ?: @"";
+    if (clientID.length == 0) {
+        [self showAlertWithTitle:@"No API Key"
+                         message:@"Enter your Reddit API Key above first, then copy the widget setup code."];
+        return;
+    }
+
+    // base64( JSON { v, clientID, userAgent } ) — decoded by the widget's
+    // SetupCode parser. userAgent is included so the widget's Reddit requests
+    // carry the same identity as the configured (spoofed) app.
+    NSMutableDictionary *payload = [@{ @"v": @1, @"clientID": clientID } mutableCopy];
+    if (sUserAgent.length > 0) payload[@"userAgent"] = sUserAgent;
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL];
+    if (!json) {
+        [self showAlertWithTitle:@"Error" message:@"Couldn't build the setup code."];
+        return;
+    }
+    NSString *code = [json base64EncodedStringWithOptions:0];
+    NSDictionary *item = @{ @"public.utf8-plain-text": code };
+    NSDictionary *options = @{
+        UIPasteboardOptionLocalOnly: @YES,
+        UIPasteboardOptionExpirationDate: [NSDate dateWithTimeIntervalSinceNow:10 * 60],
+    };
+    [[UIPasteboard generalPasteboard] setItems:@[item] options:options];
+
+    [self showAlertWithTitle:@"Copied"
+                     message:@"Setup code copied. On your Home Screen, add the Apollo “Showerthoughts” widget, long-press it → Edit Widget, and paste this code into Setup Code."];
+}
+
 - (void)testNotificationBackendConnection {
     if (!ApolloIsNotificationBackendConfigured()) {
         [self showAlertWithTitle:@"Backend URL Required" message:@"Enter a self-hosted apollo-backend URL above before testing."];
@@ -1644,7 +1691,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == SectionBackupRestore) return YES;
-    if (indexPath.section == SectionAPIKeys && (indexPath.row == 7 || indexPath.row == 8 || indexPath.row == 10)) return YES;
+    if (indexPath.section == SectionAPIKeys) {
+        NSInteger row = (!sWebJSONEnabled && indexPath.row >= 10) ? indexPath.row + 1 : indexPath.row;
+        if (row == 7 || row == 8 || row == 10 || row == 11) return YES;
+    }
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
         return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9);
