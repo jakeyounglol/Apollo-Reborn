@@ -20,6 +20,7 @@
 // feature, generalized to many sections.)
 
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -30,6 +31,98 @@
 // ones under the project's -Werror without per-symbol annotations.
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
+
+#pragma mark - Weekly visitors / contributions (hidden-WKWebView harvest)
+
+// Reddit removed weekly visitors + contributions from the OAuth API (GraphQL-only,
+// 404 to our token) but the desktop reddit.com community page carries them as
+// attributes on <shreddit-subreddit-header>: weekly-active-users (= weekly visitors)
+// and weekly-contributions. We load that page logged-out in a hidden WKWebView
+// (desktop UA, past the JS bot-challenge — same trick as Community Highlights) and
+// read the attributes. Heavy → cached; callers fall back to the Created date.
+static NSCache<NSString *, NSArray<NSNumber *> *> *ApolloSBWebStatsCache(void) {
+    static NSCache *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [[NSCache alloc] init]; cache.countLimit = 80; });
+    return cache;
+}
+
+@interface ApolloSBStatsWebFetch : NSObject <WKNavigationDelegate>
+@property (nonatomic, strong) WKWebView *web;
+@property (nonatomic, copy) NSString *sub;
+@property (nonatomic, copy) void (^done)(NSNumber *visitors, NSNumber *contributions);
+@property (nonatomic) int polls;
+@end
+@implementation ApolloSBStatsWebFetch
+- (void)startForSub:(NSString *)sub completion:(void (^)(NSNumber *, NSNumber *))done {
+    self.sub = sub; self.done = done; self.polls = 0;
+    UIWindow *win = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) { if (w.isKeyWindow) win = w; }
+    }
+    if (!win) win = UIApplication.sharedApplication.windows.firstObject;
+    if (!win) { [self finishV:nil c:nil]; return; }
+    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:[[WKWebViewConfiguration alloc] init]];
+    self.web.navigationDelegate = self;
+    self.web.alpha = 0.011; self.web.userInteractionEnabled = NO;
+    self.web.customUserAgent = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+    [win insertSubview:self.web atIndex:0];
+    [self.web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://www.reddit.com/r/%@/", sub]]]];
+    ApolloLog(@"[Sidebar][webstats] loading r/%@", sub);
+    [self pollAfter:3.0];
+}
+- (void)pollAfter:(double)d {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws poll]; });
+}
+- (void)poll {
+    if (!self.web) return;
+    self.polls++;
+    NSString *js = @"(function(){var h=document.querySelector('shreddit-subreddit-header');"
+        "if(!h)return '{}';return JSON.stringify({v:h.getAttribute('weekly-active-users'),c:h.getAttribute('weekly-contributions')});})()";
+    __weak typeof(self) ws = self;
+    [self.web evaluateJavaScript:js completionHandler:^(id res, NSError *e) {
+        NSString *s = [res isKindOfClass:[NSString class]] ? res : @"{}";
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        NSNumber *v = [j[@"v"] isKindOfClass:[NSString class]] && [j[@"v"] length] ? @([j[@"v"] longLongValue]) : nil;
+        NSNumber *c = [j[@"c"] isKindOfClass:[NSString class]] && [j[@"c"] length] ? @([j[@"c"] longLongValue]) : nil;
+        if (v || c) { ApolloLog(@"[Sidebar][webstats] r/%@ visitors=%@ contributions=%@ (poll#%d)", ws.sub, v, c, ws.polls); [ws finishV:v c:c]; }
+        else if (ws.polls >= 8) { ApolloLog(@"[Sidebar][webstats] r/%@ timed out", ws.sub); [ws finishV:nil c:nil]; }
+        else [ws pollAfter:2.0];
+    }];
+}
+- (void)finishV:(NSNumber *)v c:(NSNumber *)c {
+    if (self.web) { self.web.navigationDelegate = nil; [self.web removeFromSuperview]; self.web = nil; }
+    void (^d)(NSNumber *, NSNumber *) = self.done; self.done = nil;
+    if (d) d(v, c);
+}
+- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {}
+@end
+
+// Retains in-flight fetchers (one per sub) so they aren't deallocated mid-load.
+static NSMutableDictionary<NSString *, ApolloSBStatsWebFetch *> *ApolloSBStatsFetchers(void) {
+    static NSMutableDictionary *d; static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// completion(@[visitors, contributions]) on the main queue — synchronous on a warm
+// cache, else after the web harvest. visitors/contributions may be nil on failure.
+static void ApolloSBFetchWebStats(NSString *sub, void (^completion)(NSNumber *visitors, NSNumber *contributions)) {
+    NSString *key = sub.lowercaseString ?: @"";
+    NSArray<NSNumber *> *cached = [ApolloSBWebStatsCache() objectForKey:key];
+    if (cached) { completion(cached.count > 0 && cached[0] != (id)NSNull.null ? cached[0] : nil,
+                             cached.count > 1 && cached[1] != (id)NSNull.null ? cached[1] : nil); return; }
+    if (ApolloSBStatsFetchers()[key]) return; // already in flight
+    ApolloSBStatsWebFetch *f = [[ApolloSBStatsWebFetch alloc] init];
+    ApolloSBStatsFetchers()[key] = f;
+    [f startForSub:sub completion:^(NSNumber *v, NSNumber *c) {
+        // Cache success (both nil = failure: don't cache, so a later visit retries).
+        if (v || c) [ApolloSBWebStatsCache() setObject:@[v ?: (id)NSNull.null, c ?: (id)NSNull.null] forKey:key];
+        [ApolloSBStatsFetchers() removeObjectForKey:key];
+        completion(v, c);
+    }];
+}
 
 #pragma mark - Texture interfaces (runtime-bound)
 
@@ -963,6 +1056,22 @@ static void ApolloSBRevealSidebar(UIViewController *vc) {
                      animations:^{ v.alpha = 1.0; } completion:nil];
 }
 
+// Swaps the already-installed stats section's node in place (used when the async
+// web stats land after the sidebar has rendered with the Created-date fallback).
+static void ApolloSBReplaceStatsSection(ASDisplayNode *scrollNode, ASDisplayNode *newNode) {
+    if (!scrollNode || !newNode) return;
+    NSMutableArray *sections = objc_getAssociatedObject(scrollNode, &kApolloSBSectionsKey);
+    for (ApolloSBSection *s in sections) {
+        if (s.order != ApolloSBOrderStats) continue;
+        ASDisplayNode *old = s.node;
+        s.node = newNode;
+        [scrollNode addSubnode:newNode];
+        if (old) [old removeFromSupernode];
+        [scrollNode setNeedsLayout];
+        return;
+    }
+}
+
 // Builds all sidebar sections. Called only once Apollo's nodes are ready (see
 // ApolloSBTryBuild). vc/root/subredditName/tapTargets come from the VC hook.
 static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *root, NSString *subredditName, NSMutableArray *tapTargets) {
@@ -1033,10 +1142,39 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
             createdStr = [fmt stringFromDate:created];
         }
     }
-    NSMutableArray *cols = [NSMutableArray array];
-    [cols addObject:ApolloSBMakeStatColumn(subsLabel, subsCount > 0 ? ApolloSBFormatCount(subsCount) : @"—")];
-    if (createdStr.length) [cols addObject:ApolloSBMakeStatColumn(@"Created", createdStr)];
-    ApolloSBAddSection(vc, scrollNode, ApolloSBBuildStatsSection(cols), ApolloSBOrderStats, nil, UIEdgeInsetsMake(18, 16, 6, 16));
+    // Stats: Subscribers + weekly Visitors + Contributions. Visitors/Contributions
+    // come from the desktop reddit.com page (scraped async — see ApolloSBFetchWebStats);
+    // until they land we show Subscribers + Created, then swap in the 3-stat row.
+    NSString *subsLabelC = subsLabel; long long subsCountC = subsCount;
+    ASDisplayNode *(^build3)(NSNumber *, NSNumber *) = ^ASDisplayNode *(NSNumber *v, NSNumber *c) {
+        return ApolloSBBuildStatsSection(@[
+            ApolloSBMakeStatColumn(subsLabelC, subsCountC > 0 ? ApolloSBFormatCount(subsCountC) : @"—"),
+            ApolloSBMakeStatColumn(@"Visitors", v ? ApolloSBFormatCount(v.longLongValue) : @"—"),
+            ApolloSBMakeStatColumn(@"Contributions", c ? ApolloSBFormatCount(c.longLongValue) : @"—"),
+        ]);
+    };
+
+    __block ASDisplayNode *warmStatsNode = nil;  // set if the cache resolves synchronously
+    __block BOOL statsInstalled = NO;
+    __weak ASDisplayNode *weakScrollForStats = scrollNode;
+    ApolloSBFetchWebStats(subredditName, ^(NSNumber *visitors, NSNumber *contributions) {
+        if (!visitors && !contributions) return;            // failure → keep the Created fallback
+        ASDisplayNode *node3 = build3(visitors, contributions);
+        if (statsInstalled) { ApolloSBReplaceStatsSection(weakScrollForStats, node3); } // async swap
+        else { warmStatsNode = node3; }                     // warm cache → install below
+    });
+
+    ASDisplayNode *statsNode;
+    if (warmStatsNode) {
+        statsNode = warmStatsNode;
+    } else {
+        NSMutableArray *cols = [NSMutableArray array];
+        [cols addObject:ApolloSBMakeStatColumn(subsLabel, subsCount > 0 ? ApolloSBFormatCount(subsCount) : @"—")];
+        if (createdStr.length) [cols addObject:ApolloSBMakeStatColumn(@"Created", createdStr)];
+        statsNode = ApolloSBBuildStatsSection(cols);
+    }
+    ApolloSBAddSection(vc, scrollNode, statsNode, ApolloSBOrderStats, nil, UIEdgeInsetsMake(18, 16, 6, 16));
+    statsInstalled = YES;
 
     // ---- Flair ("Search by Flair") ----
     for (NSString *wid in items) {
