@@ -2985,9 +2985,25 @@ static NSArray *ApolloBuildLeavesForTextNode(ASTextNode *textNode,
         for (NSInteger n = (NSInteger)pIdx.count - 1; n >= 0; n--) {
             NSUInteger ri = [pIdx[n] unsignedIntegerValue];
             NSRange r = [ranges[ri] rangeValue];
-            if ([isBareURL[ri] boolValue] || [isDefaultGifLabel[ri] boolValue]) {
-                [remaining deleteCharactersInRange:NSMakeRange(r.location - pStart, r.length)];
+            if (![isBareURL[ri] boolValue] && ![isDefaultGifLabel[ri] boolValue]) continue;
+            NSUInteger loc = r.location - pStart;
+            NSUInteger len = r.length;
+            // If the removed label sits between two spaces (mid-sentence, e.g.
+            // "lol [gif](url) so funny"), also consume one flanking space so we
+            // don't leave a doubled interior space. ApolloTrimAttributedString
+            // only trims the string's leading/trailing whitespace, not interior
+            // runs. Checked against the current `remaining` state, which is safe
+            // because we delete highest-location ranges first, leaving the chars
+            // at and before `loc` untouched for lower-location ranges.
+            NSString *s = remaining.string;
+            if (loc >= 1 && loc + len < s.length) {
+                NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+                if ([ws characterIsMember:[s characterAtIndex:loc - 1]] &&
+                    [ws characterIsMember:[s characterAtIndex:loc + len]]) {
+                    len += 1; // drop the trailing space of the pair
+                }
             }
+            [remaining deleteCharactersInRange:NSMakeRange(loc, len)];
         }
 
         NSAttributedString *trimmed = ApolloTrimAttributedString(remaining);
