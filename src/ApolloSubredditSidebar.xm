@@ -209,6 +209,25 @@ static void ApolloSBAddTitle(NSMutableSet<NSString *> *set, NSString *title) {
     if (n) [set addObject:n];
 }
 
+// Returns the first Discord invite URL found in `text` (discord.gg/… or
+// discord(app).com/invite/…), normalized to an https URL, or nil. Used to surface
+// a "Join our Discord" banner when a sub only links Discord from its bio markdown.
+static NSString *ApolloSBFindDiscordInvite(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
+    static NSRegularExpression *re = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+              @"(?:https?://)?(?:www\\.)?(?:discord\\.gg|discord(?:app)?\\.com/invite)/[A-Za-z0-9_-]+"
+              options:NSRegularExpressionCaseInsensitive error:nil];
+    });
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (!m) return nil;
+    NSString *url = [text substringWithRange:m.range];
+    if (![url.lowercaseString hasPrefix:@"http"]) url = [@"https://" stringByAppendingString:url];
+    return url;
+}
+
 // Strip subreddit-emoji :tokens: from flair / label text for display.
 static NSString *ApolloSBStripEmojiTokens(NSString *raw) {
     if (raw.length == 0) return raw;
@@ -914,6 +933,7 @@ typedef NS_ENUM(NSInteger, ApolloSBOrder) {
     ApolloSBOrderStats   = 0,
     ApolloSBOrderTOC     = 20,  // "Jump to a Section" sits above the bio
     ApolloSBOrderFlair   = 100,
+    ApolloSBOrderDiscord = 145, // synthesized "Join our Discord" banner, just above Community Bookmarks
     ApolloSBOrderMenu    = 150,
     ApolloSBOrderContent = 200,
 };
@@ -968,6 +988,12 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
     // ---- Collapsible bio: clip the description markdown to ~2 lines + "Show more". ----
     NSString *mdSource = markdownNode ? ApolloSBReadSwiftStringIvar(markdownNode, "source") : nil;
     if (mdSource.length == 0 && markdownNode) mdSource = ApolloSBReadSwiftStringIvar(markdownNode, "sourceHTML");
+
+    // If the sub links Discord from its bio markdown, surface a "Join our Discord"
+    // banner — unless an image widget already renders one (e.g. r/apple). Detected here
+    // from the bio; discordImageShown is set in the image-widget loop below.
+    NSString *discordURL = ApolloSBFindDiscordInvite(mdSource);
+    BOOL discordImageShown = NO;
     if (markdownNode && mdSource.length > 250) {
         markdownNode.clipsToBounds = YES;
         markdownNode.style.maxHeight = ApolloSBPoints(kApolloSBBioCollapsedHeight);
@@ -1068,7 +1094,19 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
             ASDisplayNode *section = ApolloSBBuildImageSection(w, vc, tapTargets);
             ApolloSBAddSection(vc, scrollNode, section, seqOrder++, shortName ?: @"Image", UIEdgeInsetsMake(20, 16, 0, 16));
             ApolloSBAddTitle(widgetTitles, shortName);
+            // A mod-provided Discord image banner makes our synthesized one redundant.
+            NSArray *idata = [w[@"data"] isKindOfClass:[NSArray class]] ? w[@"data"] : nil;
+            NSDictionary *img = [idata.firstObject isKindOfClass:[NSDictionary class]] ? idata.firstObject : nil;
+            if (ApolloSBFindDiscordInvite(ApolloSBString(img[@"linkUrl"]))) discordImageShown = YES;
         }
+    }
+
+    // ---- Synthesized "Join our Discord" banner (Discord linked from the bio, no
+    // image banner). Full-width Discord-blurple cell that opens the invite. ----
+    if (discordURL.length && !discordImageShown) {
+        UIColor *blurple = [UIColor colorWithRed:0x58/255.0 green:0x65/255.0 blue:0xF2/255.0 alpha:1.0];
+        ASButtonNode *discordBtn = ApolloSBMakeLinkPill(@"Join our Discord", discordURL, blurple, UIColor.whiteColor, vc, tapTargets);
+        ApolloSBAddSection(vc, scrollNode, discordBtn, ApolloSBOrderDiscord, nil, UIEdgeInsetsMake(20, 16, 0, 16));
     }
 
     // Hand the rendered widget titles to the bio-dedup hook, then re-trim any bio
