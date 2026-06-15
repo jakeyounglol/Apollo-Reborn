@@ -27,6 +27,15 @@ extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
 extern BOOL sShowSubredditHeaders;
+// When ON, a horizontally-scrolling "Community Highlights" carousel of the
+// subreddit's pinned/stickied posts is shown at the top of the feed (mirrors
+// new-Reddit / the official app). See ApolloSubredditHighlights.xm.
+extern BOOL sCommunityHighlights;
+// When ON (and sCommunityHighlights ON), a hidden WKWebView loads the subreddit's
+// new-Reddit page to harvest the FULL highlights set (up to 6), beyond the 2 the
+// REST API exposes. Heavier (loads the web page per sub); opt-in. See
+// ApolloSubredditHighlights.xm (ApolloHLWebFetch).
+extern BOOL sCommunityHighlightsWeb;
 extern BOOL sAutoHideTabBarShowOnIdle;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).

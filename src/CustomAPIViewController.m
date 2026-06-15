@@ -683,7 +683,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionAPIKeys: return 11; // 7 text fields + OAuth switch + Can't sign in? + API key setup guide + Copy Widget Setup Code
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
         case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
-        case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
+        case SectionSubreddits: return sSubredditListEnhancements ? 10 : 9;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
@@ -1235,30 +1235,40 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders]
                                            action:@selector(subredditHeadersSwitchToggled:)];
         case 3:
+            return [self switchCellWithIdentifier:@"Cell_Sub_Highlights"
+                                            label:@"Community Highlights"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights]
+                                           action:@selector(communityHighlightsSwitchToggled:)];
+        case 4:
+            return [self switchCellWithIdentifier:@"Cell_Sub_HighlightsWeb"
+                                            label:@"Load All Highlights (Web)"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb]
+                                           action:@selector(communityHighlightsWebSwitchToggled:)];
+        case 5:
             return [self textFieldCellWithIdentifier:@"Cell_Sub_TrendLimit"
                                                label:@"Trending Subreddits Limit"
                                          placeholder:@"(unlimited)"
                                                 text:sTrendingSubredditsLimit
                                                  tag:TagTrendingLimit
                                            numerical:YES];
-        case 4:
+        case 6:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Trending"
                                                       label:@"Trending Source"
                                                 placeholder:defaultTrendingSubredditsSource
                                                        text:sTrendingSubredditsSource
                                                         tag:TagTrendingSubredditsSource];
-        case 5:
+        case 7:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Random"
                                                       label:@"Random Source"
                                                 placeholder:defaultRandomSubredditsSource
                                                        text:sRandomSubredditsSource
                                                         tag:TagRandomSubredditsSource];
-        case 6:
+        case 8:
             return [self switchCellWithIdentifier:@"Cell_Sub_RandNSFW"
                                             label:@"Show RandNSFW in Search"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRandNsfw]
                                            action:@selector(randNsfwSwitchToggled:)];
-        case 7:
+        case 9:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_RandNSFW_Source"
                                                       label:@"RandNSFW Source"
                                                 placeholder:@"(empty)"
@@ -2074,6 +2084,18 @@ typedef NS_ENUM(NSInteger, Tag) {
     sShowSubredditHeaders = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowSubredditHeaders forKey:UDKeyShowSubredditHeaders];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloSubredditHeaderToggleChangedNotification" object:nil];
+}
+
+- (void)communityHighlightsSwitchToggled:(UISwitch *)sender {
+    sCommunityHighlights = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sCommunityHighlights forKey:UDKeyCommunityHighlights];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloCommunityHighlightsToggleChangedNotification" object:nil];
+}
+
+- (void)communityHighlightsWebSwitchToggled:(UISwitch *)sender {
+    sCommunityHighlightsWeb = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sCommunityHighlightsWeb forKey:UDKeyCommunityHighlightsWeb];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloCommunityHighlightsToggleChangedNotification" object:nil];
 }
 
 - (void)textPostThumbnailsSwitchToggled:(UISwitch *)sender {

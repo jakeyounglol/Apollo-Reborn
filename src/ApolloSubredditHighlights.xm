@@ -1,0 +1,1491 @@
+// ApolloSubredditHighlights.xm
+//
+// Adds a horizontally-scrolling "Community Highlights" carousel to the top of a
+// subreddit's post feed, mirroring new-Reddit / the official app. Moderators
+// pin posts ("community highlights" / sticky posts); Reddit exposes them via the
+// REST/OAuth listing as `stickied` posts (the OAuth token can't reach the
+// GraphQL endpoint the first-party apps use for the richer up-to-6 carousel, so
+// we render the stickied posts the REST API does return — historically the same
+// first two slots old-Reddit shows).
+//
+// Data: a small `/r/{sub}/hot?limit=...` fetch filtered to `stickied` posts
+// (sort-independent — highlights show on every feed sort, just like the site),
+// keyed + cached by subreddit. We deliberately do NOT read Apollo's in-memory
+// `links` array: it's a Swift `[RDKLink]` value type (fragile raw layout) and is
+// empty on new/top/rising sorts.
+//
+// Surface: installed as the feed UITableView's `tableHeaderView`, so it scrolls
+// away with the content (matching the site) and needs no datasource/IGListKit
+// surgery. ApolloSubredditHeaders.xm owns that same slot when "Show Subreddit
+// Headers" is ON, and only marks/wraps tables when that toggle is on — so while
+// it is OFF the slot is free and we own it with zero conflict. Coexistence with
+// that feature (both ON) is handled separately; here we defer to it.
+//
+// Gated behind sCommunityHighlights (Settings → Subreddits → Community
+// Highlights).
+
+#import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
+#import <CoreImage/CoreImage.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import "ApolloState.h"
+#import "ApolloCommon.h"
+#import "ApolloSubredditHighlights.h"
+
+#pragma mark - Minimal runtime interfaces
+
+@interface RDKSubreddit : NSObject
+- (NSString *)name;
+@property (retain, nonatomic) NSURL *communityIconURL;
+@property (retain, nonatomic) NSURL *iconImageURL;
+@end
+
+@interface RDKLinkLite : NSObject  // minimal view of RDKLink for de-dup
+@property (nonatomic) BOOL stickied;
+@property (copy, nonatomic) NSString *subreddit;
+@property (copy, nonatomic) NSString *fullName;
+@end
+
+// ASSizeRange (matches ASDisplayKit's struct layout).
+struct ApolloHLSizeRange { CGSize min; CGSize max; };
+
+@interface ApolloHLLayoutSpec : NSObject @end
+@interface ApolloHLStackSpec : ApolloHLLayoutSpec
++ (instancetype)stackLayoutSpecWithDirection:(NSInteger)direction
+                                     spacing:(CGFloat)spacing
+                              justifyContent:(NSUInteger)justifyContent
+                                  alignItems:(NSUInteger)alignItems
+                                    children:(NSArray *)children;
+@end
+
+#pragma mark - Tunables
+
+static CGFloat const kApolloHLCardWidth = 160.0;
+static CGFloat const kApolloHLCardHeight = 120.0;
+static CGFloat const kApolloHLCardSpacing = 10.0;
+static CGFloat const kApolloHLSidePadding = 16.0;
+static CGFloat const kApolloHLTitleRowHeight = 26.0;
+static CGFloat const kApolloHLTopPadding = 6.0;
+static CGFloat const kApolloHLBottomPadding = 14.0;
+static NSInteger const kApolloHLFetchLimit = 15;
+
+#pragma mark - Associated-object keys
+
+static const void *kApolloHLCarouselKey       = &kApolloHLCarouselKey;       // carousel UIView on the VC
+static const void *kApolloHLWrapperKey         = &kApolloHLWrapperKey;        // wrapper UIView on the VC
+static const void *kApolloHLOriginalHeaderKey  = &kApolloHLOriginalHeaderKey; // pre-existing tableHeaderView
+static const void *kApolloHLSubredditKey       = &kApolloHLSubredditKey;      // NSString subreddit currently shown
+static const void *kApolloHLSignatureKey       = &kApolloHLSignatureKey;      // NSString carousel-content signature
+static const void *kApolloHLManagedTableKey    = &kApolloHLManagedTableKey;   // BOOL on the UITableView
+static const void *kApolloHLManagedVCKey       = &kApolloHLManagedVCKey;      // weak-ish VC on the table
+static const void *kApolloHLRewrapInProgressKey = &kApolloHLRewrapInProgressKey; // BOOL guard on the table
+static const void *kApolloHLWrapperMarkerKey   = &kApolloHLWrapperMarkerKey;  // BOOL on the wrapper view
+static const void *kApolloHLTeardownMarkerKey  = &kApolloHLTeardownMarkerKey; // BOOL on the VC
+static const void *kApolloHLActiveSubKey       = &kApolloHLActiveSubKey;      // NSString sub added to the hide-set by this VC
+static const void *kApolloHLContainerKey       = &kApolloHLContainerKey;      // ApolloHLHeaderContainerView on the VC (headers-on coexistence)
+
+#pragma mark - Subreddit detection (adapted from ApolloSubredditHeaders.xm)
+
+static BOOL ApolloHLIsLikelyObjectPointer(id value) {
+    if (!value) return NO;
+    uintptr_t addr = (uintptr_t)(__bridge void *)value;
+#if __arm64__
+    if (addr & 0x1) return YES; // tagged pointer
+#endif
+    if (addr < 0x100000000ULL || addr > 0x8000000000ULL) return NO;
+    return YES;
+}
+
+static id ApolloHLTypedIvar(id object, NSString *name, Class expectedClass) {
+    if (!object || name.length == 0 || !expectedClass) return nil;
+    for (Class cls = [object class]; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        Ivar ivar = class_getInstanceVariable(cls, name.UTF8String);
+        if (!ivar) continue;
+        ptrdiff_t offset = ivar_getOffset(ivar);
+        void *raw = NULL;
+        memcpy(&raw, (uint8_t *)(__bridge void *)object + offset, sizeof(raw));
+        id value = (__bridge id)raw;
+        if (!ApolloHLIsLikelyObjectPointer(value)) return nil;
+        @try {
+            return [value isKindOfClass:expectedClass] ? value : nil;
+        } @catch (__unused NSException *exception) {
+            return nil;
+        }
+    }
+    return nil;
+}
+
+// PostsType case tag lives at offset 0x20 of the `currentPostsType` Swift-enum
+// ivar; 0 = named single subreddit, 5 = random (both backed by one subreddit).
+static const ptrdiff_t kApolloHLPostsTypeTagOffset = 0x20;
+static BOOL ApolloHLPostsTypeTag(id viewController, uint8_t *tag) {
+    Ivar ivar = class_getInstanceVariable([viewController class], "currentPostsType");
+    if (!ivar) return NO;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    uint8_t value = 0;
+    memcpy(&value, (uint8_t *)(__bridge void *)viewController + offset + kApolloHLPostsTypeTagOffset, sizeof(value));
+    if (tag) *tag = value;
+    return YES;
+}
+
+static NSString *ApolloHLNormalizedName(NSString *subredditName) {
+    if (![subredditName isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [subredditName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([clean hasPrefix:@"/r/"] || [clean hasPrefix:@"/R/"]) clean = [clean substringFromIndex:3];
+    if ([clean hasPrefix:@"r/"] || [clean hasPrefix:@"R/"]) clean = [clean substringFromIndex:2];
+    if (clean.length == 0) return nil;
+    NSArray<NSString *> *blocked = @[@"home", @"popular", @"all", @"search", @"profile",
+                                     @"settings", @"inbox", @"friends", @"mod"];
+    if ([blocked containsObject:clean.lowercaseString]) return nil;
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:
+                                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"] invertedSet];
+    if ([clean rangeOfCharacterFromSet:invalid].location != NSNotFound) return nil;
+    return clean;
+}
+
+static NSString *ApolloHLSubredditName(UIViewController *viewController) {
+    if (!viewController) return nil;
+    uint8_t tag = 0;
+    BOOL haveTag = ApolloHLPostsTypeTag(viewController, &tag);
+    if (haveTag && tag != 0 && tag != 5) return nil; // multireddit / special feed
+    // Reddit subreddit names are canonically lowercase; the nav-title fallback can
+    // carry display casing ("Apple"). Lowercase the result so every comparison and
+    // cache key is consistent (the authoritative `currentSubreddit.name` and the
+    // title fallback then always agree).
+    id subreddit = ApolloHLTypedIvar(viewController, @"currentSubreddit", objc_getClass("RDKSubreddit"));
+    if (subreddit && [subreddit respondsToSelector:@selector(name)]) {
+        id nameValue = ((id (*)(id, SEL))objc_msgSend)(subreddit, @selector(name));
+        if ([nameValue isKindOfClass:[NSString class]]) {
+            NSString *normalized = ApolloHLNormalizedName(nameValue);
+            if (normalized.length) return normalized.lowercaseString;
+        }
+    }
+    if (haveTag) {
+        NSString *title = viewController.navigationItem.title;
+        if (title.length == 0) title = viewController.title;
+        NSString *normalized = ApolloHLNormalizedName(title);
+        return normalized.lowercaseString;
+    }
+    return nil;
+}
+
+static BOOL ApolloHLShouldSkipViewController(UIViewController *viewController) {
+    if (!viewController) return YES;
+    if ([objc_getAssociatedObject(viewController, kApolloHLTeardownMarkerKey) boolValue]) return YES;
+    if (viewController.isMovingFromParentViewController || viewController.isBeingDismissed) return YES;
+    if (viewController.parentViewController == nil && viewController.presentingViewController == nil && viewController.view.window == nil) {
+        return YES;
+    }
+    return NO;
+}
+
+static UIView *ApolloHLFindSubviewOfClass(UIView *root, Class cls) {
+    if (!root || !cls) return nil;
+    if ([root isKindOfClass:cls]) return root;
+    for (UIView *subview in root.subviews) {
+        UIView *match = ApolloHLFindSubviewOfClass(subview, cls);
+        if (match) return match;
+    }
+    return nil;
+}
+
+static UITableView *ApolloHLFindTableView(UIViewController *viewController) {
+    if ([viewController respondsToSelector:@selector(tableView)]) {
+        UITableView *(*msgSend)(id, SEL) = (UITableView *(*)(id, SEL))objc_msgSend;
+        id tableView = msgSend(viewController, @selector(tableView));
+        if ([tableView isKindOfClass:[UITableView class]]) return tableView;
+    }
+    return (UITableView *)ApolloHLFindSubviewOfClass(viewController.view, [UITableView class]);
+}
+
+// Reload the feed's ASTableNode (used only on the rare path where we need to
+// restore inline stickied cells we optimistically collapsed).
+static void ApolloHLReloadFeed(UIViewController *vc) {
+    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+    if (tableNode && [tableNode respondsToSelector:@selector(reloadData)]) {
+        ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
+    }
+}
+
+#pragma mark - Data model
+
+@interface ApolloHLItem : NSObject
+@property (nonatomic, copy) NSString *title;
+@property (nonatomic, copy) NSString *permalink;   // "/r/sub/comments/..."
+@property (nonatomic, copy) NSString *fullName;    // "t3_xxxx"
+@property (nonatomic, copy) NSString *flairText;
+@property (nonatomic) long long numComments;
+@property (nonatomic, strong) NSURL *thumbnailURL;
+@property (nonatomic) BOOL isSpoiler;
+@end
+@implementation ApolloHLItem
+@end
+
+#pragma mark - Highlights fetch (cached, main-queue-only cache)
+
+// subreddit (lowercase) -> NSArray<ApolloHLItem*>. An empty array means "fetched,
+// nothing pinned" (a negative cache so we don't refetch every layout pass).
+static NSMutableDictionary<NSString *, NSArray<ApolloHLItem *> *> *ApolloHLCache(void) {
+    static NSMutableDictionary *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    return cache;
+}
+static NSMutableSet<NSString *> *ApolloHLInFlight(void) {
+    static NSMutableSet *set; static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSMutableSet set]; });
+    return set;
+}
+
+// Lowercased subreddits whose foreground single-subreddit feed should collapse
+// inline stickied cells (the carousel shows them instead). Set SYNCHRONOUSLY in
+// ApolloHLInstall (before cells lay out) so de-dup needs no async re-layout on a
+// cold load; cleared on teardown or if the fetch turns up nothing to show.
+static NSMutableSet<NSString *> *ApolloHLHideSubs(void) {
+    static NSMutableSet *set; static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSMutableSet set]; });
+    return set;
+}
+
+// Subreddits where we actually collapsed at least one inline stickied cell — so
+// the empty/failed-fetch path only forces a feed reload (to restore them) when
+// something was hidden, never on the common "no pinned posts" subreddit.
+static NSMutableSet<NSString *> *ApolloHLDidCollapseSubs(void) {
+    static NSMutableSet *set; static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSMutableSet set]; });
+    return set;
+}
+
+#pragma mark - Per-subreddit collapsed state (persisted)
+
+// The user can tap the "Community Highlights" header to collapse the carousel to
+// just its title bar; the choice is remembered per subreddit across launches
+// (mirrors the Reddit website's collapsible highlights). Runtime-mutated state, so
+// it lives directly in standardUserDefaults (no settings toggle / registerDefaults).
+static NSString *const kApolloHLCollapsedSubsKey = @"CollapsedSubredditHighlights";
+
+static NSMutableSet<NSString *> *ApolloHLCollapsedSet(void) {
+    static NSMutableSet *set; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kApolloHLCollapsedSubsKey];
+        set = [saved isKindOfClass:[NSArray class]] ? [NSMutableSet setWithArray:saved] : [NSMutableSet set];
+    });
+    return set;
+}
+
+static BOOL ApolloHLIsCollapsed(NSString *sub) {
+    return sub.length > 0 && [ApolloHLCollapsedSet() containsObject:sub.lowercaseString];
+}
+
+static void ApolloHLSetCollapsed(NSString *sub, BOOL collapsed) {
+    NSString *key = sub.lowercaseString;
+    if (key.length == 0) return;
+    NSMutableSet *set = ApolloHLCollapsedSet();
+    if (collapsed) [set addObject:key]; else [set removeObject:key];
+    [[NSUserDefaults standardUserDefaults] setObject:set.allObjects forKey:kApolloHLCollapsedSubsKey];
+}
+
+static NSString *ApolloHLStringValue(id v) { return [v isKindOfClass:[NSString class]] ? v : nil; }
+
+// "/r/sub/comments/<id>/slug/" -> "<id>" (matches API + web permalinks).
+static NSString *ApolloHLPostIDFromPermalink(NSString *permalink) {
+    if (permalink.length == 0) return nil;
+    NSArray<NSString *> *parts = [permalink componentsSeparatedByString:@"/"];
+    for (NSUInteger i = 0; i + 1 < parts.count; i++) {
+        if ([parts[i] isEqualToString:@"comments"]) return parts[i + 1];
+    }
+    return nil;
+}
+
+// Strip subreddit-emoji :tokens: from flair text for display (e.g. r/soccer's
+// ":n_discussion: Daily Discussion").
+static NSString *ApolloHLStripEmojiTokens(NSString *raw) {
+    if (raw.length == 0) return raw;
+    static NSRegularExpression *regex; static dispatch_once_t once;
+    dispatch_once(&once, ^{ regex = [NSRegularExpression regularExpressionWithPattern:@":[A-Za-z0-9_+-]+:" options:0 error:NULL]; });
+    NSString *s = [regex stringByReplacingMatchesInString:raw options:0 range:NSMakeRange(0, raw.length) withTemplate:@""];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    while ([s containsString:@"  "]) s = [s stringByReplacingOccurrencesOfString:@"  " withString:@" "];
+    return s.length > 0 ? s : raw;
+}
+
+static NSURL *ApolloHLThumbnailFromPostData(NSDictionary *d) {
+    // Prefer a real preview image; fall back to thumbnail when it's an http URL.
+    NSDictionary *preview = [d[@"preview"] isKindOfClass:[NSDictionary class]] ? d[@"preview"] : nil;
+    NSArray *images = [preview[@"images"] isKindOfClass:[NSArray class]] ? preview[@"images"] : nil;
+    NSDictionary *first = images.firstObject;
+    if ([first isKindOfClass:[NSDictionary class]]) {
+        // A resolution close to the card thumbnail is lighter than `source`.
+        NSArray *resolutions = [first[@"resolutions"] isKindOfClass:[NSArray class]] ? first[@"resolutions"] : nil;
+        for (NSDictionary *res in resolutions) {
+            if (![res isKindOfClass:[NSDictionary class]]) continue;
+            NSNumber *w = res[@"width"];
+            if ([w isKindOfClass:[NSNumber class]] && w.doubleValue >= 108.0) {
+                NSString *u = ApolloHLStringValue(res[@"url"]);
+                if (u.length) return [NSURL URLWithString:u];
+            }
+        }
+        NSDictionary *source = [first[@"source"] isKindOfClass:[NSDictionary class]] ? first[@"source"] : nil;
+        NSString *su = ApolloHLStringValue(source[@"url"]);
+        if (su.length) return [NSURL URLWithString:su];
+    }
+    NSString *thumb = ApolloHLStringValue(d[@"thumbnail"]);
+    if ([thumb hasPrefix:@"http"]) return [NSURL URLWithString:thumb];
+    return nil;
+}
+
+// Builds one carousel item from a t3 post's `data` dict. No stickied filter — the
+// caller decides (the hot listing keeps only stickied; /api/info keeps everything).
+static ApolloHLItem *ApolloHLItemFromPostData(NSDictionary *d) {
+    if (![d isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *title = ApolloHLStringValue(d[@"title"]);
+    NSString *permalink = ApolloHLStringValue(d[@"permalink"]);
+    if (title.length == 0 || permalink.length == 0) return nil;
+    ApolloHLItem *item = [[ApolloHLItem alloc] init];
+    item.title = title;
+    item.permalink = permalink;
+    item.fullName = ApolloHLStringValue(d[@"name"]);
+    item.flairText = ApolloHLStringValue(d[@"link_flair_text"]);
+    NSNumber *nc = d[@"num_comments"];
+    item.numComments = [nc isKindOfClass:[NSNumber class]] ? nc.longLongValue : 0;
+    item.thumbnailURL = ApolloHLThumbnailFromPostData(d);
+    item.isSpoiler = [d[@"spoiler"] respondsToSelector:@selector(boolValue)] && [d[@"spoiler"] boolValue];
+    return item;
+}
+
+static NSArray<ApolloHLItem *> *ApolloHLParseListing(NSDictionary *root) {
+    NSDictionary *data = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+    NSArray *children = [data[@"children"] isKindOfClass:[NSArray class]] ? data[@"children"] : nil;
+    NSMutableArray<ApolloHLItem *> *items = [NSMutableArray array];
+    for (NSDictionary *child in children) {
+        if (![child isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *d = [child[@"data"] isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        if (!d) continue;
+        BOOL stickied = [d[@"stickied"] respondsToSelector:@selector(boolValue)] && [d[@"stickied"] boolValue];
+        if (!stickied) continue;
+        ApolloHLItem *item = ApolloHLItemFromPostData(d);
+        if (item) [items addObject:item];
+    }
+    return items;
+}
+
+// Maps t3 fullname -> item for an /api/info Listing response (no stickied filter).
+static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDictionary *root) {
+    NSDictionary *data = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+    NSArray *children = [data[@"children"] isKindOfClass:[NSArray class]] ? data[@"children"] : nil;
+    NSMutableDictionary<NSString *, ApolloHLItem *> *map = [NSMutableDictionary dictionary];
+    for (NSDictionary *child in children) {
+        if (![child isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *d = [child[@"data"] isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        ApolloHLItem *item = ApolloHLItemFromPostData(d);
+        if (item.fullName.length) map[item.fullName] = item;
+    }
+    return map;
+}
+
+// Harvests the FULL highlights set (up to 6) via a hidden WKWebView — the only
+// path past Reddit's JS bot-challenge that blocks direct fetches. Loads the
+// new-Reddit subreddit page (logged out — highlights are public), waits for the
+// challenge to clear + the carousel to render, then scrapes title/permalink/
+// thumbnail from the DOM. Calls `done` on the main queue (empty array on
+// fail/timeout). Heavy — callers must cache + gate behind sCommunityHighlightsWeb.
+@interface ApolloHLWebFetch : NSObject <WKNavigationDelegate>
+@property (nonatomic, strong) WKWebView *web;
+@property (nonatomic, copy) NSString *sub;
+@property (nonatomic, copy) void (^done)(NSArray<ApolloHLItem *> *items);
+@property (nonatomic) int polls;
+@end
+@implementation ApolloHLWebFetch
+- (void)startForSub:(NSString *)sub completion:(void (^)(NSArray<ApolloHLItem *> *))done {
+    self.sub = sub; self.done = done; self.polls = 0;
+    UIWindow *win = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) { if (w.isKeyWindow) win = w; }
+    }
+    if (!win) win = UIApplication.sharedApplication.windows.firstObject;
+    if (!win) { [self finish:nil]; return; }
+    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:[[WKWebViewConfiguration alloc] init]];
+    self.web.navigationDelegate = self;
+    self.web.alpha = 0.011; self.web.userInteractionEnabled = NO;
+    [win insertSubview:self.web atIndex:0];
+    [self.web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://www.reddit.com/r/%@/", sub]]]];
+    ApolloLog(@"[Highlights][web] loading r/%@ for full highlights", sub);
+    [self pollAfter:3.0];
+}
+- (void)pollAfter:(double)delay {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws poll]; });
+}
+- (void)poll {
+    if (!self.web) return;
+    self.polls++;
+    NSString *js = @"(function(){"
+        "var all=document.querySelectorAll('*'),heading=null;"
+        "for(var i=0;i<all.length;i++){var e=all[i];if(e.children.length===0&&(e.textContent||'').trim().toLowerCase()==='community highlights'){heading=e;break;}}"
+        "if(!heading)return JSON.stringify({n:0});"
+        "var c=heading;for(var d=0;d<7&&c.parentElement;d++){c=c.parentElement;if(c.querySelectorAll('a[href*=\"/comments/\"]').length>=1)break;}"
+        "var links=c.querySelectorAll('a[href*=\"/comments/\"]');var seen={},out=[];"
+        "for(var j=0;j<links.length;j++){var l=links[j];var h=(l.getAttribute('href')||'').split('?')[0];if(!h||seen[h])continue;var t=(l.textContent||'').trim().split('\\n')[0].trim();if(!t)continue;seen[h]=1;"
+        "var img=l.querySelector('img');var src=img?(img.getAttribute('src')||img.getAttribute('data-src')||''):'';"
+        "out.push({t:t.substring(0,140),h:h,img:src});}"
+        "return JSON.stringify({n:out.length,items:out});})()";
+    __weak typeof(self) ws = self;
+    [self.web evaluateJavaScript:js completionHandler:^(id res, NSError *e) {
+        NSArray<ApolloHLItem *> *items = [ApolloHLWebFetch parseItems:res];
+        if (items.count > 0) { ApolloLog(@"[Highlights][web] r/%@ extracted %lu highlights (poll#%d)", ws.sub, (unsigned long)items.count, ws.polls); [ws finish:items]; }
+        else if (ws.polls >= 8) { ApolloLog(@"[Highlights][web] r/%@ timed out", ws.sub); [ws finish:@[]]; }
+        else [ws pollAfter:2.0];
+    }];
+}
++ (NSArray<ApolloHLItem *> *)parseItems:(id)res {
+    if (![res isKindOfClass:[NSString class]]) return @[];
+    NSData *d = [(NSString *)res dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *json = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    NSArray *arr = [json[@"items"] isKindOfClass:[NSArray class]] ? json[@"items"] : nil;
+    NSMutableArray<ApolloHLItem *> *out = [NSMutableArray array];
+    for (NSDictionary *it in arr) {
+        if (![it isKindOfClass:[NSDictionary class]]) continue;
+        NSString *t = ApolloHLStringValue(it[@"t"]), *h = ApolloHLStringValue(it[@"h"]);
+        if (t.length == 0 || h.length == 0) continue;
+        ApolloHLItem *item = [[ApolloHLItem alloc] init];
+        item.title = t;
+        item.permalink = h;
+        NSString *img = ApolloHLStringValue(it[@"img"]);
+        // Skip the subreddit profile icon (shown for text-post highlights) — that's
+        // not a real thumbnail; let those render as plain text cards.
+        if ([img hasPrefix:@"http"] && [img rangeOfString:@"profileIcon" options:NSCaseInsensitiveSearch].location == NSNotFound)
+            item.thumbnailURL = [NSURL URLWithString:img];
+        [out addObject:item];
+        if (out.count >= 6) break;
+    }
+    return out;
+}
+- (void)finish:(NSArray<ApolloHLItem *> *)items {
+    if (self.web) { self.web.navigationDelegate = nil; [self.web removeFromSuperview]; self.web = nil; }
+    void (^d)(NSArray *) = self.done; self.done = nil;
+    if (d) d(items ?: @[]);
+}
+- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {}
+@end
+
+// Fetches the subreddit's stickied posts and calls completion on the main queue
+// with the (possibly empty) item array. Caches the result. completion may be nil
+// (warm the cache only).
+static void ApolloHLFetchHighlights(NSString *subredditName, void (^completion)(NSArray<ApolloHLItem *> *items)) {
+    NSString *key = subredditName.lowercaseString;
+    if (key.length == 0) { if (completion) completion(@[]); return; }
+
+    NSArray<ApolloHLItem *> *cached = ApolloHLCache()[key];
+    if (cached) { if (completion) completion(cached); return; }
+    if ([ApolloHLInFlight() containsObject:key]) { if (completion) completion(nil); return; }
+    [ApolloHLInFlight() addObject:key];
+
+    NSMutableCharacterSet *allowed = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
+    [allowed addCharactersInString:@"_-"];
+    NSString *escaped = [subredditName stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: subredditName;
+    NSString *token = [sLatestRedditBearerToken copy];
+    NSString *urlString = token.length > 0
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/r/%@/hot?limit=%ld&raw_json=1", escaped, (long)kApolloHLFetchLimit]
+        : [NSString stringWithFormat:@"https://www.reddit.com/r/%@/hot.json?limit=%ld&raw_json=1", escaped, (long)kApolloHLFetchLimit];
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    request.timeoutInterval = 15.0;
+    if (token.length > 0) [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [request setValue:(sUserAgent.length > 0 ? sUserAgent : @"ApolloHighlights/1.0") forHTTPHeaderField:@"User-Agent"];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : -1;
+        id json = data.length > 0 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSArray<ApolloHLItem *> *items = [json isKindOfClass:[NSDictionary class]] ? ApolloHLParseListing(json) : @[];
+        ApolloLog(@"[Highlights] fetch r/%@ status=%ld stickied=%lu err=%@", subredditName,
+                  (long)status, (unsigned long)items.count, error.localizedDescription ?: @"nil");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ApolloHLInFlight() removeObject:key];
+            // Only cache a successful response (200 / parsed). On error, leave it
+            // uncached so a later layout pass can retry.
+            if (status == 200 || items.count > 0) ApolloHLCache()[key] = items;
+            if (completion) completion(items);
+        });
+    }] resume];
+}
+
+#pragma mark - Thumbnail image loader
+
+static NSCache<NSString *, UIImage *> *ApolloHLImageCache(void) {
+    static NSCache *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [[NSCache alloc] init]; cache.countLimit = 120; });
+    return cache;
+}
+
+static void ApolloHLLoadImage(NSURL *url, void (^completion)(UIImage *image)) {
+    if (!url || !completion) { if (completion) completion(nil); return; }
+    NSString *key = url.absoluteString;
+    UIImage *cached = [ApolloHLImageCache() objectForKey:key];
+    if (cached) { completion(cached); return; }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.timeoutInterval = 15.0;
+    [request setValue:(sUserAgent.length > 0 ? sUserAgent : @"ApolloHighlights/1.0") forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        UIImage *image = data.length > 0 ? [UIImage imageWithData:data] : nil;
+        if (image) [ApolloHLImageCache() setObject:image forKey:key];
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(image); });
+    }] resume];
+}
+
+// Heavy gaussian blur for spoiler thumbnails — obscures the image content while
+// keeping its colours (a real CIGaussianBlur, not a frosted material overlay), so
+// a spoiler card reads as "blurred photo" like the Reddit website. Radius scales
+// with the source pixel width so the blur stays heavy regardless of thumbnail size.
+static UIImage *ApolloHLSpoilerBlur(UIImage *image) {
+    if (!image || !image.CGImage) return image;
+    CIImage *ci = [CIImage imageWithCGImage:image.CGImage];
+    CIImage *clamped = [ci imageByClampingToExtent]; // avoid transparent blurred edges
+    CGFloat radius = MAX(18.0, MIN(60.0, (CGFloat)CGImageGetWidth(image.CGImage) * 0.06));
+    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+    [blur setValue:clamped forKey:kCIInputImageKey];
+    [blur setValue:@(radius) forKey:kCIInputRadiusKey];
+    CIImage *out = blur.outputImage;
+    if (!out) return image;
+    static CIContext *ctx; static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
+    CGImageRef cg = [ctx createCGImage:out fromRect:ci.extent];
+    if (!cg) return image;
+    UIImage *result = [UIImage imageWithCGImage:cg scale:image.scale orientation:image.imageOrientation];
+    CGImageRelease(cg);
+    return result;
+}
+
+#pragma mark - Card view
+
+// Cards are plain UIViews driven by a tap GESTURE (not UIControls). A tap
+// recognizer coexists with the scroll view's pan, so a horizontal drag scrolls
+// the carousel; UIControls swallow the drag and the carousel can't move.
+@interface ApolloHLCardView : UIView
+@property (nonatomic, copy) NSString *permalink;
+@property (nonatomic, strong) UIImageView *thumbView;
+@property (nonatomic, copy) NSString *thumbToken; // guards async image reuse
+@end
+@implementation ApolloHLCardView @end
+
+static UIColor *ApolloHLCardFillColor(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? [UIColor colorWithWhite:1.0 alpha:0.10]
+            : [UIColor colorWithWhite:0.0 alpha:0.06];
+    }];
+}
+
+static NSShadow *ApolloHLTextShadow(void) {
+    NSShadow *shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.85];
+    shadow.shadowOffset = CGSizeMake(0, 1);
+    shadow.shadowBlurRadius = 3.0;
+    return shadow;
+}
+
+static ApolloHLCardView *ApolloHLBuildCard(ApolloHLItem *item) {
+    CGFloat W = kApolloHLCardWidth, H = kApolloHLCardHeight, pad = 10.0;
+    ApolloHLCardView *card = [[ApolloHLCardView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
+    card.permalink = item.permalink;
+    card.layer.cornerRadius = 14.0;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+    // Fully touch-transparent: every touch (drag OR tap) falls straight through
+    // to the scroll view, so the WHOLE card body scrolls. A single tap recognizer
+    // on the scroll view (below) hit-tests which card was tapped by frame.
+    card.userInteractionEnabled = NO;
+
+    BOOL hasImage = item.thumbnailURL != nil;
+    BOOL spoiler = item.isSpoiler;
+    if (hasImage) {
+        // Image fills the whole card as a background.
+        UIImageView *bg = [[UIImageView alloc] initWithFrame:card.bounds];
+        bg.contentMode = UIViewContentModeScaleAspectFill;
+        bg.clipsToBounds = YES;
+        bg.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
+        bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        bg.userInteractionEnabled = NO;
+        [card addSubview:bg];
+        card.thumbView = bg;
+
+        // Normal cards get a light frosted blur so the overlaid text reads. Spoiler
+        // cards instead get a HEAVY gaussian blur of the image itself (applied below
+        // on load), so we skip the frosted material to keep the blurred photo vivid.
+        if (!spoiler) {
+            UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+            blur.frame = card.bounds;
+            blur.alpha = 0.8;
+            blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            blur.userInteractionEnabled = NO;
+            [card addSubview:blur];
+        }
+
+        // Extra darkening at the top (title) and bottom (meta); spoiler cards darken
+        // the middle a little more so the title reads over the blurred photo.
+        UIView *scrim = [[UIView alloc] initWithFrame:card.bounds];
+        scrim.userInteractionEnabled = NO;
+        CAGradientLayer *grad = [CAGradientLayer layer];
+        grad.frame = CGRectMake(0, 0, W, H);
+        grad.colors = @[ (id)[UIColor colorWithWhite:0 alpha:0.55].CGColor,
+                         (id)[UIColor colorWithWhite:0 alpha:(spoiler ? 0.30 : 0.08)].CGColor,
+                         (id)[UIColor colorWithWhite:0 alpha:(spoiler ? 0.45 : 0.38)].CGColor ];
+        grad.locations = @[@0.0, @0.5, @1.0];
+        [scrim.layer addSublayer:grad];
+        [card addSubview:scrim];
+
+        NSString *token = item.thumbnailURL.absoluteString;
+        card.thumbToken = token;
+        __weak ApolloHLCardView *weakCard = card;
+        ApolloHLLoadImage(item.thumbnailURL, ^(UIImage *image) {
+            ApolloHLCardView *strongCard = weakCard;
+            if (!image || !strongCard || ![strongCard.thumbToken isEqualToString:token]) return;
+            if (spoiler) {
+                // Heavy-blur off the main thread (the card may scroll meanwhile).
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    UIImage *blurred = ApolloHLSpoilerBlur(image);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        ApolloHLCardView *sc = weakCard;
+                        if (sc && [sc.thumbToken isEqualToString:token]) sc.thumbView.image = blurred;
+                    });
+                });
+            } else {
+                strongCard.thumbView.image = image;
+            }
+        });
+    } else {
+        card.backgroundColor = ApolloHLCardFillColor();
+    }
+
+    // Spoiler badge (top-left) so the user knows why the image is obscured.
+    CGFloat titleTop = pad;
+    if (spoiler) {
+        CGFloat badgeH = 18.0, iconSize = 11.0, gap = 3.0, hpad = 6.0;
+        UILabel *sl = [[UILabel alloc] init];
+        sl.text = @"SPOILER";
+        sl.font = [UIFont systemFontOfSize:9.5 weight:UIFontWeightBold];
+        sl.textColor = UIColor.whiteColor;
+        [sl sizeToFit];
+        CGFloat textW = ceil(sl.bounds.size.width);
+        UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(pad, pad, hpad + iconSize + gap + textW + hpad, badgeH)];
+        badge.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        badge.layer.cornerRadius = badgeH / 2.0;
+        badge.clipsToBounds = YES;
+        badge.userInteractionEnabled = NO;
+        UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"eye.slash.fill"]];
+        icon.tintColor = UIColor.whiteColor;
+        icon.contentMode = UIViewContentModeScaleAspectFit;
+        icon.frame = CGRectMake(hpad, (badgeH - iconSize) / 2.0, iconSize, iconSize);
+        [badge addSubview:icon];
+        sl.frame = CGRectMake(hpad + iconSize + gap, (badgeH - sl.bounds.size.height) / 2.0, textW, sl.bounds.size.height);
+        [badge addSubview:sl];
+        [card addSubview:badge];
+        titleTop = pad + badgeH + 4.0;
+    }
+
+    // Title — top-aligned, white over an image, label color on a plain card.
+    UILabel *title = [[UILabel alloc] init];
+    title.numberOfLines = 4;
+    title.userInteractionEnabled = NO;
+    NSMutableDictionary *attrs = [@{
+        NSFontAttributeName: [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold],
+        NSForegroundColorAttributeName: hasImage ? UIColor.whiteColor : UIColor.labelColor,
+    } mutableCopy];
+    if (hasImage) attrs[NSShadowAttributeName] = ApolloHLTextShadow();
+    title.attributedText = [[NSAttributedString alloc] initWithString:item.title attributes:attrs];
+    CGSize tfit = [title sizeThatFits:CGSizeMake(W - pad * 2, H - titleTop - 16.0)];
+    title.frame = CGRectMake(pad, titleTop, W - pad * 2, MIN(tfit.height, H - titleTop - 16.0));
+    [card addSubview:title];
+
+    // Meta (flair or comment count) bottom-left.
+    NSString *flair = ApolloHLStripEmojiTokens(item.flairText);
+    NSString *meta = flair.length ? flair
+                   : (item.numComments > 0 ? [NSString stringWithFormat:@"%lld comments", item.numComments] : nil);
+    if (meta.length) {
+        UILabel *metaLabel = [[UILabel alloc] init];
+        metaLabel.userInteractionEnabled = NO;
+        NSMutableDictionary *mattrs = [@{
+            NSFontAttributeName: [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold],
+            NSForegroundColorAttributeName: hasImage ? [UIColor colorWithWhite:1.0 alpha:0.95] : UIColor.secondaryLabelColor,
+        } mutableCopy];
+        if (hasImage) mattrs[NSShadowAttributeName] = ApolloHLTextShadow();
+        metaLabel.attributedText = [[NSAttributedString alloc] initWithString:meta attributes:mattrs];
+        metaLabel.frame = CGRectMake(pad, H - pad - 15.0, W - pad * 2, 16.0);
+        [card addSubview:metaLabel];
+    }
+    return card;
+}
+
+#pragma mark - Carousel view
+
+// The cards are UIControls; UIScrollView's default touchesShouldCancelInContentView:
+// returns NO for UIControl subviews, so a drag that starts on a card is swallowed
+// as a tap and the carousel never scrolls. Returning YES lets a drag take over.
+// A UIScrollView IS its own pan gesture's delegate (and forbids replacing it —
+// setting panGestureRecognizer.delegate throws). So we subclass and implement the
+// simultaneous-recognition delegate method here: it lets the carousel's horizontal
+// pan recognize ALONGSIDE the feed table's vertical pan, so a horizontal drag is
+// never swallowed by the table (the cause of the "only certain spots scroll"
+// flakiness). The other delegate methods stay UIScrollView's own.
+@interface ApolloHLCarouselScrollView : UIScrollView <UIGestureRecognizerDelegate>
+@end
+@implementation ApolloHLCarouselScrollView
+- (BOOL)touchesShouldCancelInContentView:(UIView *)view { return YES; }
+// Coexist with the feed's vertical scroll (also a UIScrollView pan) so vertical
+// drags still scroll the feed — but NOT with the nav's back-swipe (handled below).
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return [other.view isKindOfClass:[UIScrollView class]];
+}
+// Make the navigation controller's swipe-to-go-back pan (a non-scrollview pan /
+// screen-edge pan on an ancestor) WAIT for our horizontal scroll to fail. A
+// sideways swipe then scrolls the carousel; it only falls through to "go back"
+// when our scroll can't move (e.g. already at the end). This is the fix for the
+// back-swipe stealing horizontal drags over the carousel.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)other {
+    if (g != self.panGestureRecognizer) return NO;
+    if (![other isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
+    if ([other.view isKindOfClass:[UIScrollView class]]) return NO; // feed table — coexist instead
+    return YES; // nav back-swipe pan must fail for our scroll to win
+}
+// The delegate method above isn't re-consulted when the carousel is REBUILT (e.g.
+// the web upgrade swaps in a new scroll view), so the new pan loses priority and
+// the back-swipe steals horizontal drags again. Re-establish it explicitly every
+// time we (re)enter a window: make every ancestor back-swipe pan require OUR pan
+// to fail (only affects touches actually on the carousel).
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (!self.window) return;
+    for (UIView *v = self.superview; v != nil; v = v.superview) {
+        for (UIGestureRecognizer *g in v.gestureRecognizers) {
+            if (g == self.panGestureRecognizer) continue;
+            if ([g isKindOfClass:[UIPanGestureRecognizer class]] && ![g.view isKindOfClass:[UIScrollView class]]) {
+                [g requireGestureRecognizerToFail:self.panGestureRecognizer];
+            }
+        }
+    }
+}
+@end
+
+static void ApolloHLToggleCollapsed(NSString *sub); // fwd (defined after ApplyItems)
+
+@interface ApolloHLCarouselView : UIView
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, copy) NSString *signature;
+@property (nonatomic, copy) NSString *subreddit; // for the collapse toggle
+@end
+@implementation ApolloHLCarouselView
+// Tapping the title row toggles (and persists) the collapsed state for this sub.
+- (void)headerTapped:(UITapGestureRecognizer *)gesture {
+    if (self.subreddit.length) ApolloHLToggleCollapsed(self.subreddit);
+}
+// Single tap recognizer lives on the scroll view; find the card under the tap.
+- (void)cardTapped:(UITapGestureRecognizer *)gesture {
+    UIScrollView *sv = self.scrollView;
+    if (!sv) return;
+    CGPoint p = [gesture locationInView:sv];
+    NSString *permalink = nil;
+    for (UIView *v in sv.subviews) {
+        if ([v isKindOfClass:[ApolloHLCardView class]] && CGRectContainsPoint(v.frame, p)) {
+            permalink = ((ApolloHLCardView *)v).permalink;
+            break;
+        }
+    }
+    if (permalink.length == 0) return;
+    NSString *full = [permalink hasPrefix:@"http"] ? permalink
+                   : [NSString stringWithFormat:@"https://reddit.com%@", permalink];
+    NSURL *url = [NSURL URLWithString:full];
+    if (!url) return;
+    ApolloLog(@"[Highlights] card tapped -> %@", full);
+    ApolloRouteResolvedURLViaApolloScheme(url);
+}
+@end
+
+// A stable signature for a set of items PLUS the collapse state, so we rebuild
+// when either the content or the collapsed/expanded state changes.
+static NSString *ApolloHLSignature(NSString *sub, NSArray<ApolloHLItem *> *items) {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (ApolloHLItem *it in items) [ids addObject:(it.fullName ?: it.permalink ?: @"?")];
+    NSString *state = ApolloHLIsCollapsed(sub) ? @"C|" : @"E|";
+    return [state stringByAppendingString:[ids componentsJoinedByString:@"|"]];
+}
+
+static CGFloat ApolloHLCarouselHeight(void) {
+    return kApolloHLTitleRowHeight + kApolloHLTopPadding + kApolloHLCardHeight + kApolloHLBottomPadding;
+}
+
+static ApolloHLCarouselView *ApolloHLBuildCarousel(NSString *sub, NSArray<ApolloHLItem *> *items, CGFloat width) {
+    if (items.count == 0) return nil;
+    BOOL collapsed = ApolloHLIsCollapsed(sub);
+    CGFloat height = collapsed ? (kApolloHLTitleRowHeight + 8.0) : ApolloHLCarouselHeight();
+    ApolloHLCarouselView *view = [[ApolloHLCarouselView alloc] initWithFrame:CGRectMake(0, 0, width, height)];
+    view.backgroundColor = [UIColor clearColor];
+    view.subreddit = sub.lowercaseString;
+    view.signature = ApolloHLSignature(sub, items);
+
+    // Section title row: pin glyph + "Community Highlights" + collapse chevron.
+    UIImageView *pin = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"pin.fill"]];
+    pin.tintColor = UIColor.secondaryLabelColor;
+    pin.contentMode = UIViewContentModeScaleAspectFit;
+    pin.frame = CGRectMake(kApolloHLSidePadding, 6.0, 12.0, 14.0);
+    [view addSubview:pin];
+
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(kApolloHLSidePadding + 18.0, 2.0, width - kApolloHLSidePadding * 2 - 18.0 - 20.0, kApolloHLTitleRowHeight - 2.0)];
+    titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+    titleLabel.textColor = UIColor.secondaryLabelColor;
+    titleLabel.text = @"Community Highlights";
+    [view addSubview:titleLabel];
+
+    // Chevron at the trailing edge: up = expanded (tap to collapse), down = collapsed.
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:(collapsed ? @"chevron.down" : @"chevron.up")]];
+    chevron.tintColor = UIColor.secondaryLabelColor;
+    chevron.contentMode = UIViewContentModeScaleAspectFit;
+    chevron.frame = CGRectMake(width - kApolloHLSidePadding - 13.0, 7.0, 13.0, 11.0);
+    [view addSubview:chevron];
+
+    // Transparent tap target over the whole title row toggles collapse.
+    UIView *headerTap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, kApolloHLTitleRowHeight)];
+    headerTap.backgroundColor = [UIColor clearColor];
+    [headerTap addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:view action:@selector(headerTapped:)]];
+    [view addSubview:headerTap];
+
+    if (collapsed) return view; // just the title bar; no scroller or cards
+
+    // Horizontal scroller of cards.
+    CGFloat scrollY = kApolloHLTitleRowHeight + kApolloHLTopPadding;
+    UIScrollView *scroll = [[ApolloHLCarouselScrollView alloc] initWithFrame:CGRectMake(0, scrollY, width, kApolloHLCardHeight)];
+    scroll.showsHorizontalScrollIndicator = NO;
+    scroll.alwaysBounceHorizontal = YES;
+    scroll.clipsToBounds = NO;
+    scroll.delaysContentTouches = NO;
+    scroll.directionalLockEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:view action:@selector(cardTapped:)];
+    [scroll addGestureRecognizer:tap];
+    [view addSubview:scroll];
+    view.scrollView = scroll;
+
+    CGFloat x = kApolloHLSidePadding;
+    for (ApolloHLItem *item in items) {
+        ApolloHLCardView *card = ApolloHLBuildCard(item);
+        card.frame = CGRectMake(x, 0, kApolloHLCardWidth, kApolloHLCardHeight);
+        [scroll addSubview:card];
+        x += kApolloHLCardWidth + kApolloHLCardSpacing;
+    }
+    x = x - kApolloHLCardSpacing + kApolloHLSidePadding; // trailing inset
+    scroll.contentSize = CGSizeMake(x, kApolloHLCardHeight);
+
+    return view;
+}
+
+static void ApolloHLForEachPostsVC(void (^block)(UIViewController *postsVC)); // fwd
+
+// A subreddit turned out to have nothing to show (no pinned posts, or the fetch
+// failed): stop de-duplicating it and, only if we'd actually collapsed cells,
+// reload the feed to restore them.
+static void ApolloHLClearDeDup(NSString *subreddit) {
+    NSString *sub = subreddit.lowercaseString;
+    if (![ApolloHLHideSubs() containsObject:sub]) return;
+    [ApolloHLHideSubs() removeObject:sub];
+    if ([ApolloHLDidCollapseSubs() containsObject:sub]) {
+        [ApolloHLDidCollapseSubs() removeObject:sub];
+        ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+            if ([ApolloHLSubredditName(postsVC) isEqualToString:sub]) ApolloHLReloadFeed(postsVC);
+        });
+    }
+}
+
+#pragma mark - Coexistence: host the carousel inside the subreddit-header wrapper
+
+// Stacks the carousel above Apollo's real "original header" so the headers
+// module can treat the whole thing as its original-header slot (its existing
+// layout sizes/positions it). The carousel may be absent until data lands.
+@interface ApolloHLHeaderContainerView : UIView
+@property (nonatomic, strong) UIView *hlCarouselView; // nil until data arrives
+@property (nonatomic, strong) UIView *realOriginal;   // Apollo's real header (may be nil)
+@property (nonatomic, copy) NSString *subreddit;
+- (void)installCarousel:(UIView *)carousel;
+- (void)resizeToFit;
+@end
+@implementation ApolloHLHeaderContainerView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width, y = 0;
+    if (self.hlCarouselView) {
+        self.hlCarouselView.frame = CGRectMake(0, y, w, self.hlCarouselView.frame.size.height);
+        y += self.hlCarouselView.frame.size.height;
+    }
+    if (self.realOriginal) {
+        self.realOriginal.frame = CGRectMake(0, y, w, self.realOriginal.frame.size.height);
+    }
+}
+- (void)resizeToFit {
+    CGFloat cH = self.hlCarouselView ? self.hlCarouselView.frame.size.height : 0;
+    CGFloat roH = self.realOriginal ? self.realOriginal.frame.size.height : 0;
+    CGRect f = self.frame; f.size.height = cH + roH; self.frame = f;
+    [self setNeedsLayout];
+}
+- (void)installCarousel:(UIView *)carousel {
+    if (self.hlCarouselView == carousel) return;
+    [self.hlCarouselView removeFromSuperview];
+    self.hlCarouselView = carousel;
+    if (carousel) [self addSubview:carousel];
+    [self resizeToFit];
+}
+@end
+
+UIView *ApolloHLHeaderOriginalSubstitute(NSString *subreddit, UIViewController *hostVC, UIView *realOriginalHeader, CGFloat width) {
+    if (!sCommunityHighlights || subreddit.length == 0) return realOriginalHeader;
+    NSString *sub = subreddit.lowercaseString;
+    if (width <= 0) width = UIScreen.mainScreen.bounds.size.width;
+
+    // De-dup membership now (the header installs before cells render).
+    [ApolloHLHideSubs() addObject:sub];
+    if (hostVC) objc_setAssociatedObject(hostVC, kApolloHLActiveSubKey, sub, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    // Don't nest containers across rebuilds — recover the true original.
+    UIView *realOriginal = realOriginalHeader;
+    if ([realOriginalHeader isKindOfClass:[ApolloHLHeaderContainerView class]]) {
+        realOriginal = ((ApolloHLHeaderContainerView *)realOriginalHeader).realOriginal;
+    }
+
+    ApolloHLHeaderContainerView *container =
+        [[ApolloHLHeaderContainerView alloc] initWithFrame:CGRectMake(0, 0, width, realOriginal ? realOriginal.frame.size.height : 0)];
+    container.subreddit = sub;
+    container.realOriginal = realOriginal;
+    if (realOriginal) [container addSubview:realOriginal];
+    if (hostVC) objc_setAssociatedObject(hostVC, kApolloHLContainerKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSArray<ApolloHLItem *> *items = ApolloHLCache()[sub];
+    if (items.count > 0) {
+        [container installCarousel:ApolloHLBuildCarousel(sub, items, width)];
+    } else if (items == nil) {
+        CGFloat fetchWidth = width;
+        ApolloHLFetchHighlights(sub, ^(NSArray<ApolloHLItem *> *fetched) {
+            if (fetched == nil) return;
+            if (fetched.count == 0) { ApolloHLClearDeDup(sub); return; }
+            // Populate any live containers for this sub, then re-measure the
+            // (now taller) header so the feed sits below the carousel.
+            ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+                if (![ApolloHLSubredditName(postsVC) isEqualToString:sub]) return;
+                ApolloHLHeaderContainerView *c = objc_getAssociatedObject(postsVC, kApolloHLContainerKey);
+                if (![c isKindOfClass:[ApolloHLHeaderContainerView class]] || c.hlCarouselView) return;
+                CGFloat w = c.bounds.size.width > 0 ? c.bounds.size.width : fetchWidth;
+                [c installCarousel:ApolloHLBuildCarousel(sub, fetched, w)];
+                UIView *wrapper = c.superview;
+                UITableView *tv = ApolloHLFindTableView(postsVC);
+                if (wrapper && tv && tv.tableHeaderView == wrapper) {
+                    CGRect wf = wrapper.frame;
+                    wf.size.height = CGRectGetMaxY(c.frame);
+                    wrapper.frame = wf;
+                    [tv setTableHeaderView:wrapper]; // force the table to re-read the header height
+                }
+            });
+            [[NSNotificationCenter defaultCenter] postNotificationName:ApolloHLDataReadyNotification object:nil];
+        });
+    }
+    [container resizeToFit];
+    return container;
+}
+
+#pragma mark - tableHeaderView install / teardown
+
+static UIView *ApolloHLBuildWrapper(ApolloHLCarouselView *carousel, UIView *originalHeader, CGFloat width) {
+    if (!carousel) return nil;
+    CGFloat carouselHeight = carousel.frame.size.height;
+    CGFloat originalHeight = originalHeader ? originalHeader.frame.size.height : 0.0;
+    UIView *wrapper = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, carouselHeight + originalHeight)];
+    wrapper.backgroundColor = [UIColor clearColor];
+    objc_setAssociatedObject(wrapper, kApolloHLWrapperMarkerKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    carousel.frame = CGRectMake(0, 0, width, carouselHeight);
+    [wrapper addSubview:carousel];
+    if (originalHeader) {
+        originalHeader.frame = CGRectMake(0, carouselHeight, width, originalHeight);
+        [wrapper addSubview:originalHeader];
+    }
+    return wrapper;
+}
+
+// Remove the standalone-managed tableHeaderView (carousel) and restore Apollo's
+// native header. Does NOT touch de-dup state (the hide-set) — used both by full
+// teardown and when handing placement over to the subreddit-headers feature.
+static void ApolloHLRestoreStandaloneHeader(UIViewController *vc) {
+    UITableView *tableView = ApolloHLFindTableView(vc);
+    UIView *wrapper = objc_getAssociatedObject(vc, kApolloHLWrapperKey);
+    UIView *originalHeader = objc_getAssociatedObject(vc, kApolloHLOriginalHeaderKey);
+
+    if (tableView && wrapper && tableView.tableHeaderView == wrapper) {
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        tableView.tableHeaderView = originalHeader;
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (tableView) {
+        objc_setAssociatedObject(tableView, kApolloHLManagedTableKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tableView, kApolloHLManagedVCKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    objc_setAssociatedObject(vc, kApolloHLCarouselKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLWrapperKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLOriginalHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLSubredditKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLSignatureKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+static void ApolloHLTeardown(UIViewController *vc, BOOL restoreNativeHeader) {
+    if (!vc) return;
+
+    // Stop de-duplicating this VC's subreddit.
+    NSString *activeSub = objc_getAssociatedObject(vc, kApolloHLActiveSubKey);
+    if (activeSub.length) {
+        [ApolloHLHideSubs() removeObject:activeSub];
+        [ApolloHLDidCollapseSubs() removeObject:activeSub];
+        objc_setAssociatedObject(vc, kApolloHLActiveSubKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    objc_setAssociatedObject(vc, kApolloHLContainerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloHLRestoreStandaloneHeader(vc);
+}
+
+static void ApolloHLInstallCarousel(UIViewController *vc, UITableView *tableView, NSArray<ApolloHLItem *> *items, NSString *subreddit) {
+    if (items.count == 0) {
+        // Nothing pinned — make sure we aren't leaving a stale carousel up.
+        if (objc_getAssociatedObject(vc, kApolloHLWrapperKey)) ApolloHLTeardown(vc, YES);
+        return;
+    }
+    NSString *signature = ApolloHLSignature(subreddit, items);
+    NSString *storedSubreddit = objc_getAssociatedObject(vc, kApolloHLSubredditKey);
+    NSString *storedSignature = objc_getAssociatedObject(vc, kApolloHLSignatureKey);
+    UIView *wrapper = objc_getAssociatedObject(vc, kApolloHLWrapperKey);
+
+    BOOL sameContent = [storedSubreddit isEqualToString:subreddit] && [storedSignature isEqualToString:signature];
+    if (sameContent && wrapper && tableView.tableHeaderView == wrapper) {
+        return; // already installed and current
+    }
+
+    CGFloat width = tableView.bounds.size.width > 0 ? tableView.bounds.size.width : UIScreen.mainScreen.bounds.size.width;
+
+    if (sameContent && wrapper) {
+        // Carousel exists but isn't the live header (Apollo swapped it). Re-seat.
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        tableView.tableHeaderView = wrapper;
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tableView, kApolloHLManagedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tableView, kApolloHLManagedVCKey, vc, OBJC_ASSOCIATION_ASSIGN);
+        return;
+    }
+
+    // Build fresh.
+    ApolloHLCarouselView *carousel = ApolloHLBuildCarousel(subreddit, items, width);
+    if (!carousel) return;
+
+    UIView *currentHeader = tableView.tableHeaderView;
+    // On a REBUILD (collapse toggle, web upgrade) the live header is already OUR
+    // marked wrapper — recover Apollo's real header from storage rather than
+    // dropping it (otherwise the native header is permanently lost). On a first
+    // install the live header is Apollo's own, so adopt it directly.
+    BOOL currentIsOurWrapper = currentHeader && objc_getAssociatedObject(currentHeader, kApolloHLWrapperMarkerKey);
+    UIView *originalHeader = currentIsOurWrapper ? objc_getAssociatedObject(vc, kApolloHLOriginalHeaderKey) : currentHeader;
+    UIView *newWrapper = ApolloHLBuildWrapper(carousel, originalHeader, width);
+
+    objc_setAssociatedObject(vc, kApolloHLCarouselKey, carousel, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLWrapperKey, newWrapper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLOriginalHeaderKey, originalHeader, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLSubredditKey, subreddit, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLSignatureKey, signature, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    objc_setAssociatedObject(tableView, kApolloHLManagedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(tableView, kApolloHLManagedVCKey, vc, OBJC_ASSOCIATION_ASSIGN);
+
+    objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    tableView.tableHeaderView = newWrapper;
+    objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ApolloLog(@"[Highlights] installed carousel r/%@ items=%lu width=%.0f", subreddit, (unsigned long)items.count, width);
+}
+
+// Collect all live root view controllers across every connected window scene
+// (iOS 13+/scene apps; UIApplication.windows alone can miss the active scene).
+static NSArray<UIViewController *> *ApolloHLRootViewControllers(void) {
+    NSMutableArray<UIViewController *> *roots = [NSMutableArray array];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.rootViewController) [roots addObject:window.rootViewController];
+        }
+    }
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.rootViewController && ![roots containsObject:window.rootViewController]) {
+            [roots addObject:window.rootViewController];
+        }
+    }
+    return roots;
+}
+
+// Walk the live VC hierarchy and invoke `block` for every PostsViewController.
+static void ApolloHLForEachPostsVC(void (^block)(UIViewController *postsVC)) {
+    Class postsClass = objc_getClass("_TtC6Apollo19PostsViewController");
+    if (!postsClass || !block) return;
+    NSMutableArray<UIViewController *> *stack = [[ApolloHLRootViewControllers() mutableCopy] ?: [NSMutableArray array] mutableCopy];
+    NSMutableSet *seen = [NSMutableSet set];
+    while (stack.count) {
+        UIViewController *vc = stack.lastObject;
+        [stack removeLastObject];
+        if (!vc || [seen containsObject:@((uintptr_t)vc)]) continue;
+        [seen addObject:@((uintptr_t)vc)];
+        if ([vc isKindOfClass:postsClass]) block(vc);
+        [stack addObjectsFromArray:vc.childViewControllers];
+        if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
+    }
+}
+
+#pragma mark - Web upgrade (full highlights via hidden WebView)
+
+// Subreddits whose web-fetch has completed (so we don't re-run the heavy WebView)
+// and those currently fetching.
+static NSMutableSet<NSString *> *ApolloHLWebDone(void) {
+    static NSMutableSet *s; static dispatch_once_t o; dispatch_once(&o, ^{ s = [NSMutableSet set]; }); return s;
+}
+static NSMutableDictionary<NSString *, ApolloHLWebFetch *> *ApolloHLWebFetchers(void) {
+    static NSMutableDictionary *d; static dispatch_once_t o; dispatch_once(&o, ^{ d = [NSMutableDictionary dictionary]; }); return d;
+}
+
+// Rebuild the carousel(s) for `sub` with a new (fuller) item set — used when the
+// WebView upgrade lands. Handles both placement modes.
+static void ApolloHLApplyItems(NSString *sub, NSArray<ApolloHLItem *> *items) {
+    if (sub.length == 0 || items.count == 0) return;
+    ApolloHLCache()[sub] = items;
+    ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+        if (ApolloHLShouldSkipViewController(postsVC)) return;
+        if (![ApolloHLSubredditName(postsVC) isEqualToString:sub]) return;
+        if (!sShowSubredditHeaders) {
+            UITableView *tv = ApolloHLFindTableView(postsVC);
+            if (tv) ApolloHLInstallCarousel(postsVC, tv, items, sub); // signature change → rebuilds
+        } else {
+            ApolloHLHeaderContainerView *c = objc_getAssociatedObject(postsVC, kApolloHLContainerKey);
+            if (![c isKindOfClass:[ApolloHLHeaderContainerView class]]) return;
+            CGFloat w = c.bounds.size.width > 0 ? c.bounds.size.width : UIScreen.mainScreen.bounds.size.width;
+            [c installCarousel:ApolloHLBuildCarousel(sub, items, w)];
+            UIView *wrapper = c.superview;
+            UITableView *tv = ApolloHLFindTableView(postsVC);
+            if (wrapper && tv && tv.tableHeaderView == wrapper) {
+                CGRect wf = wrapper.frame; wf.size.height = CGRectGetMaxY(c.frame); wrapper.frame = wf;
+                [tv setTableHeaderView:wrapper];
+            }
+        }
+    });
+}
+
+// Flip the persisted collapse state for `sub` and rebuild its live carousel(s).
+// The collapse state is part of the carousel signature, so ApplyItems' standalone
+// path rebuilds (instead of early-returning on unchanged content); the headers path
+// always rebuilds + re-measures. De-dup is left intact, so collapsing just hides the
+// cards behind the title bar (the highlights don't reappear inline), matching the web.
+static void ApolloHLToggleCollapsed(NSString *sub) {
+    NSString *key = sub.lowercaseString;
+    if (key.length == 0) return;
+    BOOL now = !ApolloHLIsCollapsed(key);
+    ApolloHLSetCollapsed(key, now);
+    ApolloLog(@"[Highlights] %@ r/%@", now ? @"collapsed" : @"expanded", key);
+    NSArray<ApolloHLItem *> *items = ApolloHLCache()[key];
+    if (items.count > 0) ApolloHLApplyItems(key, items);
+}
+
+// The WebView reliably gives us the LIST of highlights (titles + permalinks, in
+// order) but its DOM thumbnails are lazy-loaded/unreliable for cards scrolled off
+// screen. So we don't trust the DOM image: we take the post ids from the web set
+// and batch-fetch each post's real data via the API's /api/info endpoint — the same
+// reliable source that gives the first 2 their crisp thumbnails. Thumbnail/flair/
+// comment-count are filled from /api/info, then the API stickied cache, then the
+// web DOM as a last resort. Web order is preserved. `completion` runs on main.
+static void ApolloHLEnrichViaInfo(NSArray<ApolloHLItem *> *webItems, NSArray<ApolloHLItem *> *apiItems, void (^completion)(NSArray<ApolloHLItem *> *)) {
+    NSMutableDictionary<NSString *, ApolloHLItem *> *apiByID = [NSMutableDictionary dictionary];
+    for (ApolloHLItem *a in apiItems) {
+        NSString *pid = ApolloHLPostIDFromPermalink(a.permalink);
+        if (pid.length) apiByID[pid] = a;
+    }
+    NSMutableArray<NSString *> *pidsInOrder = [NSMutableArray array];
+    NSMutableArray<NSString *> *fullnames = [NSMutableArray array];
+    for (ApolloHLItem *w in webItems) {
+        NSString *pid = ApolloHLPostIDFromPermalink(w.permalink) ?: @"";
+        [pidsInOrder addObject:pid];
+        if (pid.length) [fullnames addObject:[@"t3_" stringByAppendingString:pid]];
+    }
+
+    void (^finish)(NSDictionary<NSString *, ApolloHLItem *> *) = ^(NSDictionary<NSString *, ApolloHLItem *> *infoMap) {
+        NSMutableArray<ApolloHLItem *> *out = [NSMutableArray array];
+        for (NSUInteger i = 0; i < webItems.count; i++) {
+            ApolloHLItem *w = webItems[i];
+            NSString *pid = pidsInOrder[i];
+            ApolloHLItem *info = pid.length ? infoMap[[@"t3_" stringByAppendingString:pid]] : nil;
+            ApolloHLItem *api = pid.length ? apiByID[pid] : nil;
+            if (!w.thumbnailURL) w.thumbnailURL = info.thumbnailURL ?: api.thumbnailURL;
+            if (!w.flairText.length) w.flairText = info.flairText ?: api.flairText;
+            if (w.numComments == 0) w.numComments = info ? info.numComments : (api ? api.numComments : 0);
+            if (!w.isSpoiler) w.isSpoiler = info ? info.isSpoiler : (api ? api.isSpoiler : NO);
+            [out addObject:w];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
+    };
+
+    if (fullnames.count == 0) { finish(@{}); return; }
+    NSString *idParam = [fullnames componentsJoinedByString:@","];
+    NSString *token = [sLatestRedditBearerToken copy];
+    NSString *urlString = token.length > 0
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/api/info?id=%@&raw_json=1", idParam]
+        : [NSString stringWithFormat:@"https://www.reddit.com/api/info.json?id=%@&raw_json=1", idParam];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    request.timeoutInterval = 15.0;
+    if (token.length > 0) [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [request setValue:(sUserAgent.length > 0 ? sUserAgent : @"ApolloHighlights/1.0") forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : -1;
+        id json = data.length > 0 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSDictionary<NSString *, ApolloHLItem *> *infoMap = [json isKindOfClass:[NSDictionary class]] ? ApolloHLParseInfoListing(json) : @{};
+        ApolloLog(@"[Highlights] info enrich status=%ld ids=%lu resolved=%lu", (long)status, (unsigned long)fullnames.count, (unsigned long)infoMap.count);
+        finish(infoMap);
+    }] resume];
+}
+
+// If enabled, kick a one-time hidden-WebView fetch of the FULL highlights for the
+// sub and upgrade the carousel when it lands (only if it found more than the API).
+static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
+    if (!sCommunityHighlights || !sCommunityHighlightsWeb) return;
+    NSString *sub = subreddit.lowercaseString;
+    if (sub.length == 0 || [ApolloHLWebDone() containsObject:sub] || ApolloHLWebFetchers()[sub]) return;
+    ApolloHLWebFetch *fetch = [[ApolloHLWebFetch alloc] init];
+    ApolloHLWebFetchers()[sub] = fetch;
+    [fetch startForSub:sub completion:^(NSArray<ApolloHLItem *> *items) {
+        [ApolloHLWebFetchers() removeObjectForKey:sub];
+        [ApolloHLWebDone() addObject:sub];
+        NSArray<ApolloHLItem *> *apiItems = ApolloHLCache()[sub];
+        if (items.count <= apiItems.count) return; // web found no more than the API
+        // Enrich the web list with reliable /api/info thumbnails before applying.
+        ApolloHLEnrichViaInfo(items, apiItems, ^(NSArray<ApolloHLItem *> *enriched) {
+            NSArray<ApolloHLItem *> *cur = ApolloHLCache()[sub];
+            if (enriched.count > cur.count) {
+                ApolloLog(@"[Highlights] web upgrade r/%@: %lu → %lu", sub, (unsigned long)cur.count, (unsigned long)enriched.count);
+                ApolloHLApplyItems(sub, enriched);
+            }
+        });
+    }];
+}
+
+static void ApolloHLInstall(UIViewController *vc) {
+    if (!vc) return;
+
+    // Fully off → tear everything down (carousel + de-dup).
+    if (!sCommunityHighlights) {
+        if (objc_getAssociatedObject(vc, kApolloHLWrapperKey) || objc_getAssociatedObject(vc, kApolloHLActiveSubKey)) ApolloHLTeardown(vc, YES);
+        return;
+    }
+    if (ApolloHLShouldSkipViewController(vc)) return;
+
+    NSString *subreddit = ApolloHLSubredditName(vc);
+    if (subreddit.length == 0) {
+        if (objc_getAssociatedObject(vc, kApolloHLWrapperKey) || objc_getAssociatedObject(vc, kApolloHLActiveSubKey)) ApolloHLTeardown(vc, YES);
+        return;
+    }
+
+    UITableView *tableView = ApolloHLFindTableView(vc);
+    if (!tableView) return;
+
+    // Subreddit changed under a reused controller — drop old state.
+    NSString *storedActive = objc_getAssociatedObject(vc, kApolloHLActiveSubKey);
+    if (storedActive.length && ![storedActive isEqualToString:subreddit]) {
+        ApolloHLTeardown(vc, YES);
+    }
+
+    // Mark this subreddit's foreground feed for inline de-duplication NOW (before
+    // its cells lay out), so the pinned posts collapse on first layout instead of
+    // flashing then collapsing once the async carousel data lands. Done in BOTH
+    // placement modes (standalone tableHeaderView, or hosted in the headers wrapper).
+    [ApolloHLHideSubs() addObject:subreddit];
+    objc_setAssociatedObject(vc, kApolloHLActiveSubKey, subreddit, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    // Opt-in: harvest the full highlights set (>2) via a hidden WebView, once per
+    // sub. The fast API carousel shows immediately; this upgrades it when it lands.
+    ApolloHLMaybeWebUpgrade(subreddit);
+
+    // When the subreddit-headers feature is enabled it hosts the carousel inside
+    // its wrapper (ApolloHLHeaderOriginalSubstitute), so we only manage de-dup
+    // here — make sure no standalone wrapper of ours lingers and defer placement.
+    if (sShowSubredditHeaders) {
+        if (objc_getAssociatedObject(vc, kApolloHLWrapperKey)) ApolloHLRestoreStandaloneHeader(vc);
+        return;
+    }
+
+    NSString *key = subreddit.lowercaseString;
+    NSArray<ApolloHLItem *> *cached = ApolloHLCache()[key];
+    if (cached) {
+        ApolloHLInstallCarousel(vc, tableView, cached, subreddit);
+        return;
+    }
+
+    // No data yet — fetch once, then install on whichever PostsViewController is
+    // currently showing this subreddit (the VC that kicked the fetch may have
+    // been replaced, and layout may have settled, so don't rely on it).
+    ApolloHLFetchHighlights(subreddit, ^(NSArray<ApolloHLItem *> *items) {
+        if (items == nil) return; // an in-flight dedupe call, ignore
+        if (!sCommunityHighlights || sShowSubredditHeaders) return;
+        if (items.count == 0) { ApolloHLClearDeDup(subreddit); return; }
+        ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+            if (ApolloHLShouldSkipViewController(postsVC)) return;
+            if (![ApolloHLSubredditName(postsVC) isEqualToString:subreddit]) return;
+            UITableView *tv = ApolloHLFindTableView(postsVC);
+            if (tv) ApolloHLInstallCarousel(postsVC, tv, items, subreddit);
+        });
+    });
+}
+
+#pragma mark - Auto-scroll-past-header suppression
+
+// Apollo auto-scrolls past its tableHeaderView once posts load. Block ONLY the
+// scroll whose target Y matches our wrapper's height (its signature), while at
+// the top and not user-dragging — every other scroll passes through.
+static BOOL ApolloHLShouldBlockOffset(UITableView *tableView, CGPoint newOffset) {
+    if (![objc_getAssociatedObject(tableView, kApolloHLManagedTableKey) boolValue]) return NO;
+    UIView *header = tableView.tableHeaderView;
+    if (!header || !objc_getAssociatedObject(header, kApolloHLWrapperMarkerKey)) return NO;
+    if (tableView.tracking || tableView.dragging || tableView.decelerating) return NO;
+    CGFloat topY = -tableView.adjustedContentInset.top;
+    BOOL atTop = (tableView.contentOffset.y - topY) <= 0.5;
+    if (!atTop) return NO;
+    CGFloat targetDelta = newOffset.y - topY;
+    return fabs(targetDelta - header.frame.size.height) < 5.0;
+}
+
+#pragma mark - Inline de-duplication (collapse stickied cells the carousel covers)
+
+// A post cell should be hidden inline when its subreddit's foreground feed is
+// showing the carousel. Gated on `stickied` (only set in a post's own subreddit
+// listing, not Home/All) AND the subreddit being an active highlights feed, so
+// Home/multireddit feeds and non-pinned posts are never touched. The hide-set is
+// synchronous (no async carousel dependency) → cells collapse on first layout.
+static BOOL ApolloHLShouldHideCell(id cellNode) {
+    if (!sCommunityHighlights) return NO;
+    if (ApolloHLHideSubs().count == 0) return NO;
+    RDKLinkLite *link = (RDKLinkLite *)ApolloHLTypedIvar(cellNode, @"link", objc_getClass("RDKLink"));
+    if (!link || ![link respondsToSelector:@selector(stickied)] || !link.stickied) return NO;
+    NSString *sub = link.subreddit.lowercaseString;
+    if (sub.length == 0 || ![ApolloHLHideSubs() containsObject:sub]) return NO;
+    [ApolloHLDidCollapseSubs() addObject:sub];
+    return YES;
+}
+
+// Zero-size layout spec used to collapse a hidden cell.
+static id ApolloHLEmptySpec(void) {
+    Class stackClass = objc_getClass("ASStackLayoutSpec");
+    if (!stackClass) return nil;
+    return [stackClass stackLayoutSpecWithDirection:0 spacing:0 justifyContent:0 alignItems:0 children:@[]];
+}
+
+#pragma mark - Hooks
+
+%hook UITableView
+
+- (void)setTableHeaderView:(UIView *)tableHeaderView {
+    if (![objc_getAssociatedObject(self, kApolloHLManagedTableKey) boolValue]) { %orig; return; }
+    if ([objc_getAssociatedObject(self, kApolloHLRewrapInProgressKey) boolValue]) { %orig; return; }
+    // Already our wrapper — nothing to do.
+    if (tableHeaderView && objc_getAssociatedObject(tableHeaderView, kApolloHLWrapperMarkerKey)) { %orig; return; }
+    if (!sCommunityHighlights || sShowSubredditHeaders) { %orig; return; }
+
+    UIViewController *vc = objc_getAssociatedObject(self, kApolloHLManagedVCKey);
+    ApolloHLCarouselView *carousel = objc_getAssociatedObject(vc, kApolloHLCarouselKey);
+    if (!vc || !carousel) { %orig; return; }
+
+    // Re-wrap: stack our carousel above whatever Apollo is installing.
+    CGFloat width = self.bounds.size.width > 0 ? self.bounds.size.width : UIScreen.mainScreen.bounds.size.width;
+    UIView *wrapper = ApolloHLBuildWrapper(carousel, tableHeaderView, width);
+    objc_setAssociatedObject(vc, kApolloHLWrapperKey, wrapper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, kApolloHLOriginalHeaderKey, tableHeaderView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig(wrapper);
+}
+
+%end
+
+%hook UIScrollView
+
+- (void)setContentOffset:(CGPoint)contentOffset {
+    if ([self isKindOfClass:[UITableView class]] &&
+        ApolloHLShouldBlockOffset((UITableView *)self, contentOffset)) {
+        return;
+    }
+    %orig;
+}
+
+- (void)setContentOffset:(CGPoint)contentOffset animated:(BOOL)animated {
+    if ([self isKindOfClass:[UITableView class]] &&
+        ApolloHLShouldBlockOffset((UITableView *)self, contentOffset)) {
+        return;
+    }
+    %orig;
+}
+
+%end
+
+// Collapse the inline cell for a pinned post that the carousel already shows.
+%hook _TtC6Apollo17LargePostCellNode
+- (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
+    if (ApolloHLShouldHideCell(self)) {
+        id empty = ApolloHLEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
+- (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
+    if (ApolloHLShouldHideCell(self)) {
+        id empty = ApolloHLEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
+%end
+
+%hook _TtC6Apollo19PostsViewController
+
+- (void)viewDidLoad {
+    %orig;
+    ApolloHLInstall((UIViewController *)self);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloHLInstall((UIViewController *)self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloHLInstall((UIViewController *)self);
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloHLInstall((UIViewController *)self);
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    BOOL leaving = [(UIViewController *)self isMovingFromParentViewController] || [(UIViewController *)self isBeingDismissed];
+    %orig(animated);
+    if (leaving) ApolloHLTeardown((UIViewController *)self, YES);
+}
+
+%end
+
+#pragma mark - Constructor
+
+%ctor {
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"ApolloCommunityHighlightsToggleChangedNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        // Install/teardown + re-layout every feed controller so the carousel and
+        // the inline de-dup both update live (cells already laid out under the old
+        // state need a reload to collapse/restore).
+        ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+            ApolloHLInstall(postsVC);
+            ApolloHLReloadFeed(postsVC);
+        });
+    }];
+}
