@@ -67,7 +67,7 @@ static CGFloat const kApolloHLCardSpacing = 10.0;
 static CGFloat const kApolloHLSidePadding = 16.0;
 static CGFloat const kApolloHLTitleRowHeight = 26.0;
 static CGFloat const kApolloHLTopPadding = 6.0;
-static CGFloat const kApolloHLBottomPadding = 14.0;
+static CGFloat const kApolloHLBottomPadding = 6.0;
 static NSInteger const kApolloHLFetchLimit = 15;
 
 #pragma mark - Associated-object keys
