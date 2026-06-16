@@ -727,7 +727,10 @@ static ApolloHLCardView *ApolloHLBuildCard(ApolloHLItem *item) {
 // pan recognize ALONGSIDE the feed table's vertical pan, so a horizontal drag is
 // never swallowed by the table (the cause of the "only certain spots scroll"
 // flakiness). The other delegate methods stay UIScrollView's own.
-@interface ApolloHLCarouselScrollView : UIScrollView <UIGestureRecognizerDelegate>
+@interface ApolloHLCarouselScrollView : UIScrollView <UIGestureRecognizerDelegate, UIScrollViewDelegate>
+// The feed scroll view whose vertical pan we've paused for the duration of a
+// horizontal carousel drag (weak so a torn-down feed can't dangle).
+@property (nonatomic, weak) UIScrollView *ahlLockedFeed;
 @end
 @implementation ApolloHLCarouselScrollView
 - (BOOL)touchesShouldCancelInContentView:(UIView *)view { return YES; }
@@ -754,7 +757,7 @@ static ApolloHLCardView *ApolloHLBuildCard(ApolloHLItem *item) {
 // to fail (only affects touches actually on the carousel).
 - (void)didMoveToWindow {
     [super didMoveToWindow];
-    if (!self.window) return;
+    if (!self.window) { [self ahlUnlockFeed]; return; } // torn down mid-drag — never leave the feed locked
     for (UIView *v = self.superview; v != nil; v = v.superview) {
         for (UIGestureRecognizer *g in v.gestureRecognizers) {
             if (g == self.panGestureRecognizer) continue;
@@ -763,6 +766,50 @@ static ApolloHLCardView *ApolloHLBuildCard(ApolloHLItem *item) {
             }
         }
     }
+}
+
+// Horizontal-scroll LOCK: simultaneous recognition (above) is what stops the feed
+// table from swallowing horizontal swipes — but it also lets the feed scroll
+// vertically at the same time, so an unsteady thumb bounces the whole page while
+// swiping the cards. To fix that we pause the feed's vertical pan for the duration
+// of a carousel drag (we're the scroll view's own UIScrollViewDelegate). The drag
+// only begins once the carousel commits to horizontal movement, so a purely
+// vertical drag that started on the carousel still scrolls the feed normally.
+- (UIScrollView *)ahlEnclosingFeedScrollView {
+    for (UIView *v = self.superview; v != nil; v = v.superview) {
+        if ([v isKindOfClass:[UIScrollView class]]) return (UIScrollView *)v; // nearest ancestor = the feed
+    }
+    return nil;
+}
+- (void)ahlUnlockFeed {
+    UIScrollView *feed = self.ahlLockedFeed;
+    if (feed) { feed.panGestureRecognizer.enabled = YES; self.ahlLockedFeed = nil; }
+}
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    if (scrollView != self || self.ahlLockedFeed) return;
+    // Only lock for a horizontal-dominant drag; a vertical drag that began on the
+    // carousel should still scroll the feed.
+    CGPoint t = [self.panGestureRecognizer translationInView:self];
+    if (fabs(t.x) < fabs(t.y)) return;
+    UIScrollView *feed = [self ahlEnclosingFeedScrollView];
+    if (feed && feed.panGestureRecognizer.enabled) {
+        feed.panGestureRecognizer.enabled = NO; // cancels any in-flight vertical scroll, blocks new ones
+        self.ahlLockedFeed = feed;
+    }
+}
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (scrollView == self) [self ahlUnlockFeed]; // finger up -> no touch can bounce the feed; release immediately
+}
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (scrollView == self) [self ahlUnlockFeed]; // backstop
+}
+// If THIS carousel is removed mid-drag — e.g. the web upgrade or a collapse toggle
+// rebuilds it while the user is swiping — release our feed lock as we leave the
+// window, so the feed's vertical scroll can never be left permanently disabled
+// (the replacement scroll view has no reference to the old lock).
+- (void)willMoveToWindow:(UIWindow *)newWindow {
+    [super willMoveToWindow:newWindow];
+    if (!newWindow) [self ahlUnlockFeed];
 }
 @end
 
@@ -858,6 +905,7 @@ static ApolloHLCarouselView *ApolloHLBuildCarousel(NSString *sub, NSArray<Apollo
     scroll.clipsToBounds = NO;
     scroll.delaysContentTouches = NO;
     scroll.directionalLockEnabled = YES;
+    scroll.delegate = (ApolloHLCarouselScrollView *)scroll; // self-delegate for the horizontal-scroll lock
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:view action:@selector(cardTapped:)];
     [scroll addGestureRecognizer:tap];
     [view addSubview:scroll];
