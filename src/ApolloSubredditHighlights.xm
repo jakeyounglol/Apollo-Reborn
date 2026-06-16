@@ -84,6 +84,7 @@ static const void *kApolloHLWrapperMarkerKey   = &kApolloHLWrapperMarkerKey;  //
 static const void *kApolloHLTeardownMarkerKey  = &kApolloHLTeardownMarkerKey; // BOOL on the VC
 static const void *kApolloHLActiveSubKey       = &kApolloHLActiveSubKey;      // NSString sub added to the hide-set by this VC
 static const void *kApolloHLContainerKey       = &kApolloHLContainerKey;      // ApolloHLHeaderContainerView on the VC (headers-on coexistence)
+static char kApolloHLHiddenRowsKey;            // NSMutableSet<NSNumber*> of de-duped sticky rows, per ASTableNode
 
 #pragma mark - Subreddit detection (adapted from ApolloSubredditHeaders.xm)
 
@@ -1089,6 +1090,13 @@ static void ApolloHLTeardown(UIViewController *vc, BOOL restoreNativeHeader) {
         objc_setAssociatedObject(vc, kApolloHLActiveSubKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
     }
     objc_setAssociatedObject(vc, kApolloHLContainerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Clear the per-table de-duped-sticky rows so the next sub's separators can't
+    // self-collapse against stale rows. EMPTY it (don't free the set) under the same
+    // owningTable lock — an off-main layout pass may be reading it concurrently.
+    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+    if (tableNode) @synchronized(tableNode) {
+        [(NSMutableSet *)objc_getAssociatedObject(tableNode, &kApolloHLHiddenRowsKey) removeAllObjects];
+    }
     ApolloHLRestoreStandaloneHeader(vc);
 }
 
@@ -1338,6 +1346,7 @@ static void ApolloHLInstall(UIViewController *vc) {
     UITableView *tableView = ApolloHLFindTableView(vc);
     if (!tableView) return;
 
+
     // De-dup collapses the leading stickied posts but leaves their trailing
     // separators, doubling the breaker below the carousel. Collapse the orphaned
     // ones — deferred so we never relayout mid-layout-pass (handles refresh /
@@ -1471,6 +1480,65 @@ static BOOL ApolloHLNodeIsPostCell(id node) {
     return [c isEqualToString:@"Apollo.LargePostCellNode"] || [c isEqualToString:@"Apollo.CompactPostCellNode"];
 }
 
+// Zero a node's fixed style.height so an empty layoutSpec actually collapses it
+// (the separator has a hard-coded 8pt height that overrides the spec). ASDimension
+// = {NSInteger unit; CGFloat value}; unit 1 = ASDimensionUnitPoints.
+static void ApolloHLZeroNodeHeight(id node) {
+    id style = [node respondsToSelector:@selector(style)] ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(style)) : nil;
+    if ([style respondsToSelector:@selector(setHeight:)]) {
+        typedef struct { NSInteger unit; CGFloat value; } ApolloHLDim;
+        ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setHeight:), (ApolloHLDim){1, 0.0});
+    }
+}
+
+// FLASH-FREE first-layout collapse. The reactive pass above only runs AFTER cells
+// lay out, so the breaker briefly shows thick before correcting. Instead, the post
+// hook records each de-duped sticky's ROW in a per-ASTableNode set (indexPath +
+// owningNode are both available during node layout — safe, unlike raw ivar access),
+// and the separator collapses itself on its FIRST layout when it sits BETWEEN two
+// recorded stickies. The last sticky's separator (row below is a real post) is kept
+// as the single breaker. (kApolloHLHiddenRowsKey declared up top so teardown can clear it.)
+
+static id ApolloHLOwningTableNode(id cellNode) {
+    id me = (id)cellNode;
+    return [me respondsToSelector:@selector(owningNode)] ? ((id (*)(id, SEL))objc_msgSend)(me, @selector(owningNode)) : nil;
+}
+static NSInteger ApolloHLNodeRow(id cellNode) {
+    id me = (id)cellNode;
+    if (![me respondsToSelector:@selector(indexPath)]) return -1;
+    NSIndexPath *ip = ((NSIndexPath *(*)(id, SEL))objc_msgSend)(me, @selector(indexPath));
+    return ip ? ip.row : -1;
+}
+// Caller MUST hold @synchronized(owningTable). The set is associated with the
+// owningTable for its whole lifetime and only ever EMPTIED (never niled), so it
+// can't be freed while an off-main layout is reading it.
+static NSMutableSet *ApolloHLHiddenRowsSet(id owningTable, BOOL create) {
+    if (!owningTable) return nil;
+    NSMutableSet *set = objc_getAssociatedObject(owningTable, &kApolloHLHiddenRowsKey);
+    if (!set && create) {
+        set = [NSMutableSet set];
+        objc_setAssociatedObject(owningTable, &kApolloHLHiddenRowsKey, set, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return set;
+}
+static void ApolloHLRecordHiddenStickyRow(id postNode) {
+    id owning = ApolloHLOwningTableNode(postNode);
+    NSInteger row = ApolloHLNodeRow(postNode);
+    if (!owning || row < 0) return;
+    @synchronized(owning) { [ApolloHLHiddenRowsSet(owning, YES) addObject:@(row)]; } // lock the stable owningTable, not the set
+}
+static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
+    if ([objc_getAssociatedObject(sepNode, &kApolloHLSepCollapseKey) boolValue]) return YES; // reactive pass
+    if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return NO;
+    id owning = ApolloHLOwningTableNode(sepNode);
+    NSInteger r = ApolloHLNodeRow(sepNode);
+    if (!owning || r < 1) return NO;
+    @synchronized(owning) {
+        NSMutableSet *set = ApolloHLHiddenRowsSet(owning, NO);
+        return set && [set containsObject:@(r - 1)] && [set containsObject:@(r + 1)];
+    }
+}
+
 static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
     if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return;
     UITableView *tv = ApolloHLFindTableView(vc);
@@ -1500,14 +1568,7 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
         id node = runSeps[i];
         if (![objc_getAssociatedObject(node, &kApolloHLSepCollapseKey) boolValue]) {
             objc_setAssociatedObject(node, &kApolloHLSepCollapseKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            // The separator has a FIXED style.height (8pt), which overrides an empty
-            // layoutSpec — so zero its height style directly too. ASDimension =
-            // {NSInteger unit; CGFloat value}; unit 1 = ASDimensionUnitPoints.
-            id style = [node respondsToSelector:@selector(style)] ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(style)) : nil;
-            if ([style respondsToSelector:@selector(setHeight:)]) {
-                typedef struct { NSInteger unit; CGFloat value; } ApolloHLDim;
-                ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setHeight:), (ApolloHLDim){1, 0.0});
-            }
+            ApolloHLZeroNodeHeight(node);
             if ([node respondsToSelector:@selector(setNeedsLayout)]) ((void (*)(id, SEL))objc_msgSend)(node, @selector(setNeedsLayout));
             changed = YES;
         }
@@ -1572,6 +1633,7 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 %hook _TtC6Apollo17LargePostCellNode
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
     if (ApolloHLShouldHideCell(self)) {
+        ApolloHLRecordHiddenStickyRow(self); // so the trailing separator can self-collapse on first layout
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
@@ -1582,6 +1644,7 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 %hook _TtC6Apollo19CompactPostCellNode
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
     if (ApolloHLShouldHideCell(self)) {
+        ApolloHLRecordHiddenStickyRow(self);
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
@@ -1594,7 +1657,8 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 // breaker matches the single post→post one instead of doubling up.
 %hook _TtC6Apollo22ThickSeparatorCellNode
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
-    if ([objc_getAssociatedObject(self, &kApolloHLSepCollapseKey) boolValue]) {
+    if (ApolloHLSeparatorShouldCollapse(self)) {
+        ApolloHLZeroNodeHeight(self); // collapse on first layout (no thick-then-thin flash)
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
