@@ -1316,6 +1316,9 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
     }];
 }
 
+static char kApolloHLSepScheduledKey; // per-VC guard: which sub we've scheduled separator passes for
+static void ApolloHLCollapseOrphanSeparators(UIViewController *vc); // defined with the de-dup helpers
+
 static void ApolloHLInstall(UIViewController *vc) {
     if (!vc) return;
 
@@ -1334,6 +1337,33 @@ static void ApolloHLInstall(UIViewController *vc) {
 
     UITableView *tableView = ApolloHLFindTableView(vc);
     if (!tableView) return;
+
+    // De-dup collapses the leading stickied posts but leaves their trailing
+    // separators, doubling the breaker below the carousel. Collapse the orphaned
+    // ones — deferred so we never relayout mid-layout-pass (handles refresh /
+    // scroll-back-to-top) and a few scheduled passes once per sub-visit for the cold
+    // load before the cells have laid out.
+    {
+        NSString *sub0 = subreddit;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+                if ([ApolloHLSubredditName(postsVC) isEqualToString:sub0]) ApolloHLCollapseOrphanSeparators(postsVC);
+            });
+        });
+        NSString *scheduledFor = objc_getAssociatedObject(vc, &kApolloHLSepScheduledKey);
+        if (![scheduledFor isEqualToString:subreddit]) {
+            objc_setAssociatedObject(vc, &kApolloHLSepScheduledKey, subreddit, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            NSString *sub = subreddit;
+            void (^pass)(void) = ^{
+                ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+                    if ([ApolloHLSubredditName(postsVC) isEqualToString:sub]) ApolloHLCollapseOrphanSeparators(postsVC);
+                });
+            };
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), pass);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), pass);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), pass);
+        }
+    }
 
     // Subreddit changed under a reused controller — drop old state.
     NSString *storedActive = objc_getAssociatedObject(vc, kApolloHLActiveSubKey);
@@ -1425,6 +1455,69 @@ static id ApolloHLEmptySpec(void) {
     return [stackClass stackLayoutSpecWithDirection:0 spacing:0 justifyContent:0 alignItems:0 children:@[]];
 }
 
+// Every Apollo post cell is followed by a ThickSeparatorCellNode (the 8pt breaker
+// with top+bottom hairlines). When we de-dup the leading stickied posts (collapsing
+// them to 0), their trailing separators stay — so the carousel→feed boundary gets a
+// DOUBLED breaker (extra hairline) vs the single post→post one. Collapse all but the
+// LAST separator in that leading sticky run, so one clean breaker remains.
+// ASTableNode does not reuse cell nodes, so a flag set on a separator node is stable.
+static char kApolloHLSepCollapseKey;
+
+static BOOL ApolloHLNodeIsSeparator(id node) {
+    return node && [NSStringFromClass([node class]) isEqualToString:@"Apollo.ThickSeparatorCellNode"];
+}
+static BOOL ApolloHLNodeIsPostCell(id node) {
+    NSString *c = node ? NSStringFromClass([node class]) : nil;
+    return [c isEqualToString:@"Apollo.LargePostCellNode"] || [c isEqualToString:@"Apollo.CompactPostCellNode"];
+}
+
+static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
+    if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return;
+    UITableView *tv = ApolloHLFindTableView(vc);
+    if (!tv) return;
+    NSArray<UITableViewCell *> *cells = [tv.visibleCells sortedArrayUsingComparator:^NSComparisonResult(UITableViewCell *a, UITableViewCell *b) {
+        NSIndexPath *ia = [tv indexPathForCell:a], *ib = [tv indexPathForCell:b];
+        if (!ia || !ib) return NSOrderedSame;
+        return [ia compare:ib];
+    }];
+    if (cells.count == 0) return;
+    if ([tv indexPathForCell:cells.firstObject].row != 0) return; // only when the feed top is visible
+
+    // Collect the separators in the leading run of de-duped stickies (until the first real post).
+    NSMutableArray *runSeps = [NSMutableArray array];
+    for (UITableViewCell *c in cells) {
+        id node = [c respondsToSelector:@selector(node)] ? ((id (*)(id, SEL))objc_msgSend)(c, @selector(node)) : nil;
+        if (!node) continue;
+        if (ApolloHLNodeIsSeparator(node)) { [runSeps addObject:node]; continue; }
+        if (ApolloHLNodeIsPostCell(node)) {
+            if (ApolloHLShouldHideCell(node)) continue; // still a hidden sticky
+            break;                                       // first real post → run ends
+        }
+    }
+    // Keep the last separator (the breaker before the first real post); collapse the rest.
+    BOOL changed = NO;
+    for (NSUInteger i = 0; i + 1 < runSeps.count; i++) {
+        id node = runSeps[i];
+        if (![objc_getAssociatedObject(node, &kApolloHLSepCollapseKey) boolValue]) {
+            objc_setAssociatedObject(node, &kApolloHLSepCollapseKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // The separator has a FIXED style.height (8pt), which overrides an empty
+            // layoutSpec — so zero its height style directly too. ASDimension =
+            // {NSInteger unit; CGFloat value}; unit 1 = ASDimensionUnitPoints.
+            id style = [node respondsToSelector:@selector(style)] ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(style)) : nil;
+            if ([style respondsToSelector:@selector(setHeight:)]) {
+                typedef struct { NSInteger unit; CGFloat value; } ApolloHLDim;
+                ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setHeight:), (ApolloHLDim){1, 0.0});
+            }
+            if ([node respondsToSelector:@selector(setNeedsLayout)]) ((void (*)(id, SEL))objc_msgSend)(node, @selector(setNeedsLayout));
+            changed = YES;
+        }
+    }
+    if (changed) {
+        id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+        if ([tableNode respondsToSelector:@selector(relayoutItems)]) ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(relayoutItems));
+    }
+}
+
 #pragma mark - Hooks
 
 %hook UITableView
@@ -1484,6 +1577,19 @@ static id ApolloHLEmptySpec(void) {
 %hook _TtC6Apollo19CompactPostCellNode
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
     if (ApolloHLShouldHideCell(self)) {
+        id empty = ApolloHLEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
+%end
+
+// Collapse the orphaned breaker(s) left behind when a leading stickied post is
+// de-duped (flag set by ApolloHLCollapseOrphanSeparators), so the carousel→feed
+// breaker matches the single post→post one instead of doubling up.
+%hook _TtC6Apollo22ThickSeparatorCellNode
+- (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
+    if ([objc_getAssociatedObject(self, &kApolloHLSepCollapseKey) boolValue]) {
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
