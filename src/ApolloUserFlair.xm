@@ -1,4 +1,5 @@
 #import "ApolloCommon.h"
+#import "ApolloState.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -49,29 +50,6 @@ static __thread __unsafe_unretained id tApolloUserFlairCustomRowOption = nil;
 @property (nonatomic, copy) NSString *templateID;
 @property (nonatomic, copy) NSString *initialText;
 + (instancetype)sessionWithSelectorAdapter:(ApolloUserFlairSelectorAdapter *)selectorAdapter optionAdapter:(ApolloUserFlairOptionAdapter *)optionAdapter subredditName:(NSString *)subredditName templateID:(NSString *)templateID initialText:(NSString *)initialText;
-@end
-
-@interface ApolloUserFlairTextFieldObserver : NSObject
-@property (nonatomic, weak) UIAlertController *alert;
-@property (nonatomic, weak) UIAlertAction *saveAction;
-@end
-
-@implementation ApolloUserFlairTextFieldObserver
-
-- (void)textFieldChanged:(UITextField *)textField {
-    NSString *text = textField.text ?: @"";
-    if (text.length > kApolloUserFlairMaxLength) {
-        text = [text substringToIndex:kApolloUserFlairMaxLength];
-        textField.text = text;
-    }
-
-    self.alert.message = [NSString stringWithFormat:@"Preview: %@\n\n%lu/%lu characters",
-        text.length > 0 ? text : @"(empty)",
-        (unsigned long)text.length,
-        (unsigned long)kApolloUserFlairMaxLength];
-    self.saveAction.enabled = text.length <= kApolloUserFlairMaxLength;
-}
-
 @end
 
 #pragma mark - Runtime Access
@@ -566,72 +544,465 @@ static BOOL ApolloUserFlairCommitEditedSession(ApolloUserFlairEditSession *sessi
     return [session.selectorAdapter performNativeUpdate];
 }
 
+#pragma mark - Subreddit Emoji Picker
+
+// Reddit caps user flair at 64 text characters and 10 emojis. An emoji is inserted
+// into the flair text as a :name: token, which Reddit renders back as the image.
+static const NSUInteger kApolloUserFlairMaxEmojis = 10;
+
+static NSRegularExpression *ApolloUserFlairEmojiTokenRegex(void) {
+    static NSRegularExpression *regex = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        regex = [NSRegularExpression regularExpressionWithPattern:@":[A-Za-z0-9_+\\-]+:" options:0 error:NULL];
+    });
+    return regex;
+}
+
+// Cache of the user-flair-allowed emoji list per subreddit (lowercased key).
+// Each item: @{ @"name": <token without colons>, @"url": <png url> }.
+static NSMutableDictionary<NSString *, NSArray *> *ApolloUserFlairEmojiListCache(void) {
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    return cache;
+}
+
+static void ApolloUserFlairFetchEmojis(NSString *subreddit, void (^completion)(NSArray *emojis)) {
+    NSString *key = subreddit.lowercaseString;
+    if (key.length == 0) { if (completion) completion(@[]); return; }
+    NSArray *cached;
+    @synchronized (ApolloUserFlairEmojiListCache()) { cached = ApolloUserFlairEmojiListCache()[key]; }
+    if (cached) { if (completion) completion(cached); return; }
+
+    NSString *token = [sLatestRedditBearerToken copy];
+    NSString *enc = [subreddit stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: subreddit;
+    NSString *urlStr = token.length
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/api/v1/%@/emojis/all?raw_json=1", enc]
+        : [NSString stringWithFormat:@"https://www.reddit.com/api/v1/%@/emojis/all.json?raw_json=1", enc];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    if (token.length) [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+    req.timeoutInterval = 20;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+        NSMutableArray *emojis = [NSMutableArray array];
+        id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            for (NSString *group in (NSDictionary *)json) {
+                id g = ((NSDictionary *)json)[group];
+                if (![g isKindOfClass:[NSDictionary class]]) continue;
+                for (NSString *name in (NSDictionary *)g) {
+                    id meta = ((NSDictionary *)g)[name];
+                    if (![meta isKindOfClass:[NSDictionary class]]) continue;
+                    if (![meta[@"user_flair_allowed"] boolValue]) continue;
+                    NSString *url = meta[@"url"];
+                    if (![url isKindOfClass:[NSString class]] || url.length == 0) continue;
+                    [emojis addObject:@{ @"name": name, @"url": url }];
+                }
+            }
+        }
+        [emojis sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"name"] caseInsensitiveCompare:b[@"name"]];
+        }];
+        ApolloLog(@"[UserFlair] fetched %lu user-flair emoji for r/%@", (unsigned long)emojis.count, subreddit);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @synchronized (ApolloUserFlairEmojiListCache()) { ApolloUserFlairEmojiListCache()[key] = emojis; }
+            if (completion) completion(emojis);
+        });
+    }] resume];
+}
+
+static NSCache<NSString *, UIImage *> *ApolloUserFlairEmojiImageCache(void) {
+    static NSCache *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSCache new]; cache.countLimit = 800; });
+    return cache;
+}
+
+static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(UIImage *image)) {
+    if (urlStr.length == 0) { if (completion) completion(nil); return; }
+    UIImage *cached = [ApolloUserFlairEmojiImageCache() objectForKey:urlStr];
+    if (cached) { if (completion) completion(cached); return; }
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) { if (completion) completion(nil); return; }
+    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+        UIImage *image = data ? [UIImage imageWithData:data scale:UIScreen.mainScreen.scale] : nil;
+        if (image) [ApolloUserFlairEmojiImageCache() setObject:image forKey:urlStr];
+        dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(image); });
+    }] resume];
+}
+
+#pragma mark Emoji grid cell
+
+@interface ApolloUserFlairEmojiCell : UICollectionViewCell
+@property (nonatomic, strong) UIImageView *imageView;
+@property (nonatomic, copy) NSString *urlKey;
+@end
+
+@implementation ApolloUserFlairEmojiCell
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        _imageView = [[UIImageView alloc] initWithFrame:CGRectInset(self.contentView.bounds, 4, 4)];
+        _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _imageView.contentMode = UIViewContentModeScaleAspectFit;
+        [self.contentView addSubview:_imageView];
+    }
+    return self;
+}
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    self.imageView.image = nil;
+    self.urlKey = nil;
+}
+@end
+
+#pragma mark Flair editor view controller
+
+@interface ApolloUserFlairEditorViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UITextFieldDelegate>
+@property (nonatomic, strong) ApolloUserFlairEditSession *session;
+@property (nonatomic, copy) NSString *subreddit;
+@property (nonatomic, strong) NSArray *allEmojis;       // [{name,url}]
+@property (nonatomic, strong) NSArray *filteredEmojis;
+@property (nonatomic, strong) NSDictionary *emojiURLByName;
+@property (nonatomic, strong) UITextField *textField;
+@property (nonatomic, strong) UILabel *previewLabel;
+@property (nonatomic, strong) UILabel *counterLabel;
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, strong) UICollectionView *collectionView;
+@property (nonatomic, strong) UIActivityIndicatorView *spinner;
+@property (nonatomic, strong) UIBarButtonItem *saveItem;
+@property (nonatomic, assign) BOOL didFinish;
+@end
+
+@implementation ApolloUserFlairEditorViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Set Flair";
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancelTapped)];
+    self.saveItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSave target:self action:@selector(saveTapped)];
+    self.navigationItem.rightBarButtonItem = self.saveItem;
+
+    // Preview (rendered flair with inline emoji)
+    UILabel *previewTitle = [UILabel new];
+    previewTitle.text = @"Preview";
+    previewTitle.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    previewTitle.textColor = [UIColor secondaryLabelColor];
+
+    self.previewLabel = [UILabel new];
+    self.previewLabel.numberOfLines = 2;
+    self.previewLabel.font = [UIFont systemFontOfSize:15];
+    self.previewLabel.textColor = [UIColor labelColor];
+
+    // Text field
+    self.textField = [UITextField new];
+    self.textField.placeholder = @"Flair text";
+    self.textField.borderStyle = UITextBorderStyleRoundedRect;
+    self.textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.textField.autocorrectionType = UITextAutocorrectionTypeDefault;
+    self.textField.returnKeyType = UIReturnKeyDone;
+    self.textField.delegate = self;
+    NSString *initial = self.session.initialText ?: @"";
+    self.textField.text = initial;
+    [self.textField addTarget:self action:@selector(textChanged) forControlEvents:UIControlEventEditingChanged];
+
+    self.counterLabel = [UILabel new];
+    self.counterLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    self.counterLabel.textColor = [UIColor secondaryLabelColor];
+    self.counterLabel.textAlignment = NSTextAlignmentRight;
+
+    // Search bar (filter emoji)
+    self.searchBar = [UISearchBar new];
+    self.searchBar.placeholder = @"Search emoji";
+    self.searchBar.delegate = self;
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.searchBar.hidden = YES; // shown once emoji arrive
+
+    // Emoji grid
+    UICollectionViewFlowLayout *layout = [UICollectionViewFlowLayout new];
+    layout.itemSize = CGSizeMake(44, 44);
+    layout.minimumInteritemSpacing = 6;
+    layout.minimumLineSpacing = 6;
+    layout.sectionInset = UIEdgeInsetsMake(4, 12, 12, 12);
+    self.collectionView = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
+    self.collectionView.backgroundColor = [UIColor clearColor];
+    self.collectionView.dataSource = self;
+    self.collectionView.delegate = self;
+    self.collectionView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    self.collectionView.alwaysBounceVertical = YES;
+    [self.collectionView registerClass:[ApolloUserFlairEmojiCell class] forCellWithReuseIdentifier:@"emoji"];
+
+    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.spinner.hidesWhenStopped = YES;
+
+    UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[previewTitle, self.previewLabel, self.textField, self.counterLabel, self.searchBar]];
+    top.axis = UILayoutConstraintAxisVertical;
+    top.spacing = 6;
+    [top setCustomSpacing:2 afterView:previewTitle];
+    [top setCustomSpacing:14 afterView:self.previewLabel];
+    [top setCustomSpacing:2 afterView:self.textField];
+
+    top.translatesAutoresizingMaskIntoConstraints = NO;
+    self.collectionView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:top];
+    [self.view addSubview:self.collectionView];
+    [self.view addSubview:self.spinner];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [top.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+        [top.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [top.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [self.collectionView.topAnchor constraintEqualToAnchor:top.bottomAnchor constant:4],
+        [self.collectionView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.collectionView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.collectionView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.spinner.centerXAnchor constraintEqualToAnchor:self.collectionView.centerXAnchor],
+        [self.spinner.topAnchor constraintEqualToAnchor:self.collectionView.topAnchor constant:24],
+    ]];
+
+    [self updateCounterAndPreview];
+    [self loadEmojis];
+}
+
+- (void)loadEmojis {
+    [self.spinner startAnimating];
+    __weak typeof(self) weakSelf = self;
+    ApolloUserFlairFetchEmojis(self.subreddit, ^(NSArray *emojis) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        [self.spinner stopAnimating];
+        self.allEmojis = emojis;
+        self.filteredEmojis = emojis;
+        NSMutableDictionary *map = [NSMutableDictionary dictionary];
+        for (NSDictionary *e in emojis) map[e[@"name"]] = e[@"url"];
+        self.emojiURLByName = map;
+        self.searchBar.hidden = (emojis.count <= 24);
+        [self.collectionView reloadData];
+        [self updateCounterAndPreview]; // preview can now resolve tokens to images
+    });
+}
+
+#pragma mark counter + preview
+
+// Counts recognised :emoji: tokens, and reports the length of the remaining text
+// (characters not part of a recognised token). Unknown :x: tokens count as text.
+- (NSUInteger)emojiCountInText:(NSString *)text textLength:(NSUInteger *)outTextLen {
+    NSUInteger emojiCount = 0;
+    NSMutableIndexSet *emojiChars = [NSMutableIndexSet indexSet];
+    NSArray *matches = [ApolloUserFlairEmojiTokenRegex() matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    for (NSTextCheckingResult *m in matches) {
+        NSString *tok = [text substringWithRange:m.range];
+        NSString *name = [tok substringWithRange:NSMakeRange(1, tok.length - 2)];
+        if (self.emojiURLByName[name]) {
+            emojiCount++;
+            [emojiChars addIndexesInRange:m.range];
+        }
+    }
+    if (outTextLen) *outTextLen = text.length - emojiChars.count;
+    return emojiCount;
+}
+
+- (void)updateCounterAndPreview {
+    NSString *text = self.textField.text ?: @"";
+    NSUInteger textLen = 0;
+    NSUInteger emojiCount = [self emojiCountInText:text textLength:&textLen];
+    BOOL overText = textLen > kApolloUserFlairMaxLength;
+    BOOL overEmoji = emojiCount > kApolloUserFlairMaxEmojis;
+    self.counterLabel.text = [NSString stringWithFormat:@"%lu/%lu chars · %lu/%lu emoji",
+        (unsigned long)textLen, (unsigned long)kApolloUserFlairMaxLength,
+        (unsigned long)emojiCount, (unsigned long)kApolloUserFlairMaxEmojis];
+    self.counterLabel.textColor = (overText || overEmoji) ? [UIColor systemRedColor] : [UIColor secondaryLabelColor];
+    self.saveItem.enabled = !overText && !overEmoji;
+    [self refreshPreview];
+}
+
+- (void)refreshPreview {
+    NSString *text = self.textField.text ?: @"";
+    if (text.length == 0) {
+        self.previewLabel.attributedText = nil;
+        self.previewLabel.text = @"(empty)";
+        self.previewLabel.textColor = [UIColor tertiaryLabelColor];
+        return;
+    }
+    self.previewLabel.textColor = [UIColor labelColor];
+    self.previewLabel.attributedText = [self attributedFlairForText:text];
+}
+
+// Build an attributed string, replacing recognised :name: tokens with inline emoji
+// images (loaded async; refreshes the preview when an image arrives).
+- (NSAttributedString *)attributedFlairForText:(NSString *)text {
+    NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
+    NSDictionary *baseAttrs = @{ NSFontAttributeName: [UIFont systemFontOfSize:15], NSForegroundColorAttributeName: [UIColor labelColor] };
+    NSArray *matches = [ApolloUserFlairEmojiTokenRegex() matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    NSUInteger cursor = 0;
+    __weak typeof(self) weakSelf = self;
+    for (NSTextCheckingResult *m in matches) {
+        NSString *name = [[text substringWithRange:m.range] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@":"]];
+        NSString *url = self.emojiURLByName[name];
+        if (!url) continue; // leave unknown tokens as literal text (handled below)
+        if (m.range.location > cursor) {
+            [out appendAttributedString:[[NSAttributedString alloc] initWithString:[text substringWithRange:NSMakeRange(cursor, m.range.location - cursor)] attributes:baseAttrs]];
+        }
+        NSTextAttachment *att = [NSTextAttachment new];
+        att.bounds = CGRectMake(0, -3, 18, 18);
+        UIImage *img = [ApolloUserFlairEmojiImageCache() objectForKey:url];
+        if (img) {
+            att.image = img;
+        } else {
+            ApolloUserFlairLoadEmojiImage(url, ^(UIImage *image) {
+                typeof(self) self = weakSelf;
+                if (self && image) [self refreshPreview];
+            });
+        }
+        [out appendAttributedString:[NSAttributedString attributedStringWithAttachment:att]];
+        cursor = m.range.location + m.range.length;
+    }
+    if (cursor < text.length) {
+        [out appendAttributedString:[[NSAttributedString alloc] initWithString:[text substringFromIndex:cursor] attributes:baseAttrs]];
+    }
+    return out;
+}
+
+- (void)textChanged { [self updateCounterAndPreview]; }
+
+#pragma mark actions
+
+- (void)insertEmojiToken:(NSString *)name {
+    NSUInteger textLen = 0;
+    NSUInteger emojiCount = [self emojiCountInText:(self.textField.text ?: @"") textLength:&textLen];
+    if (emojiCount >= kApolloUserFlairMaxEmojis) {
+        [self flashCounter];
+        return;
+    }
+    NSString *token = [NSString stringWithFormat:@":%@:", name];
+    UITextField *tf = self.textField;
+    UITextRange *range = tf.selectedTextRange;
+    if (!range) range = [tf textRangeFromPosition:tf.endOfDocument toPosition:tf.endOfDocument];
+    [tf replaceRange:range withText:token];
+    [self updateCounterAndPreview];
+}
+
+- (void)flashCounter {
+    self.counterLabel.textColor = [UIColor systemRedColor];
+    UISelectionFeedbackGenerator *fb = [UISelectionFeedbackGenerator new];
+    [fb selectionChanged];
+}
+
+- (void)cancelTapped { [self finishAndDismiss]; }
+
+- (void)saveTapped {
+    NSString *text = self.textField.text ?: @"";
+    ApolloUserFlairEditSession *session = self.session;
+    ApolloLog(@"[UserFlair] save tapped subreddit=%@ templateID=%@ textLen=%lu",
+        session.subredditName ?: @"(nil)", session.templateID ?: @"(nil)", (unsigned long)text.length);
+    self.didFinish = YES;
+    UIViewController *presenter = ApolloUserFlairPresenterForController(session.selectorAdapter.controller);
+    UIViewController *flairController = session.selectorAdapter.controller;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (flairController) objc_setAssociatedObject(flairController, &kApolloUserFlairEditorPresentedKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (!ApolloUserFlairCommitEditedSession(session, text)) {
+            ApolloUserFlairShowError(presenter, @"Apollo's native flair update action was unavailable.");
+        }
+    }];
+}
+
+- (void)finishAndDismiss {
+    self.didFinish = YES;
+    UIViewController *flairController = self.session.selectorAdapter.controller;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (flairController) objc_setAssociatedObject(flairController, &kApolloUserFlairEditorPresentedKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    // Catch interactive (swipe-down) dismissal so the selector can present again later.
+    if (!self.didFinish) {
+        UIViewController *flairController = self.session.selectorAdapter.controller;
+        if (flairController) objc_setAssociatedObject(flairController, &kApolloUserFlairEditorPresentedKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
+#pragma mark text field
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField { [textField resignFirstResponder]; return NO; }
+
+#pragma mark search
+
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    if (searchText.length == 0) {
+        self.filteredEmojis = self.allEmojis;
+    } else {
+        NSPredicate *p = [NSPredicate predicateWithBlock:^BOOL(NSDictionary *e, NSDictionary *bindings) {
+            return [e[@"name"] rangeOfString:searchText options:NSCaseInsensitiveSearch].location != NSNotFound;
+        }];
+        self.filteredEmojis = [self.allEmojis filteredArrayUsingPredicate:p];
+    }
+    [self.collectionView reloadData];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar { [searchBar resignFirstResponder]; }
+
+#pragma mark collection view
+
+- (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
+    return self.filteredEmojis.count;
+}
+
+- (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath {
+    ApolloUserFlairEmojiCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"emoji" forIndexPath:indexPath];
+    if (indexPath.item >= (NSInteger)self.filteredEmojis.count) return cell;
+    NSDictionary *e = self.filteredEmojis[indexPath.item];
+    NSString *url = e[@"url"];
+    cell.urlKey = url;
+    UIImage *cached = [ApolloUserFlairEmojiImageCache() objectForKey:url];
+    if (cached) {
+        cell.imageView.image = cached;
+    } else {
+        // Capture the cell weakly so an in-flight download for a since-recycled cell
+        // doesn't keep it alive while scrolling thousands of emoji; the urlKey guard
+        // still prevents a stale image from landing on a reused cell.
+        __weak ApolloUserFlairEmojiCell *weakCell = cell;
+        ApolloUserFlairLoadEmojiImage(url, ^(UIImage *image) {
+            ApolloUserFlairEmojiCell *strongCell = weakCell;
+            if (image && strongCell && [strongCell.urlKey isEqualToString:url]) strongCell.imageView.image = image;
+        });
+    }
+    return cell;
+}
+
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    [collectionView deselectItemAtIndexPath:indexPath animated:NO];
+    if (indexPath.item >= (NSInteger)self.filteredEmojis.count) return;
+    NSDictionary *e = self.filteredEmojis[indexPath.item];
+    [self insertEmojiToken:e[@"name"]];
+}
+
+@end
+
 static void ApolloUserFlairPresentEditor(ApolloUserFlairEditSession *session) {
     UIViewController *controller = session.selectorAdapter.controller;
     if ([objc_getAssociatedObject(controller, &kApolloUserFlairEditorPresentedKey) boolValue]) return;
     objc_setAssociatedObject(controller, &kApolloUserFlairEditorPresentedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    NSString *templateID = session.templateID;
-    NSString *subredditName = session.subredditName;
-    NSString *initialText = session.initialText ?: @"";
-    if (initialText.length > kApolloUserFlairMaxLength) initialText = [initialText substringToIndex:kApolloUserFlairMaxLength];
+    ApolloUserFlairEditorViewController *editor = [ApolloUserFlairEditorViewController new];
+    editor.session = session;
+    editor.subreddit = session.subredditName;
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Edit User Flair"
-                                                                   message:[NSString stringWithFormat:@"Preview: %@\n\n%lu/%lu characters",
-                                                                            initialText.length > 0 ? initialText : @"(empty)",
-                                                                            (unsigned long)initialText.length,
-                                                                            (unsigned long)kApolloUserFlairMaxLength]
-                                                            preferredStyle:UIAlertControllerStyleAlert];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
 
-    __weak UIAlertController *weakAlert = alert;
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.text = initialText;
-        textField.placeholder = @"Flair text";
-        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
-        textField.autocorrectionType = UITextAutocorrectionTypeDefault;
-        textField.returnKeyType = UIReturnKeyDone;
-    }];
-
-    __weak UIViewController *weakController = controller;
-    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *action) {
-        UIViewController *strongController = weakController;
-        if (strongController) objc_setAssociatedObject(strongController, &kApolloUserFlairEditorPresentedKey, nil, OBJC_ASSOCIATION_ASSIGN);
-    }];
-    [alert addAction:cancelAction];
-
-    UIAlertAction *saveAction = [UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        UIViewController *strongController = weakController;
-        UIAlertController *strongAlert = weakAlert;
-        NSString *text = strongAlert.textFields.firstObject.text ?: @"";
-        if (text.length > kApolloUserFlairMaxLength) text = [text substringToIndex:kApolloUserFlairMaxLength];
-        ApolloLog(@"[UserFlair] save tapped subreddit=%@ templateID=%@ textLen=%lu option=%@",
-            subredditName ?: @"(nil)",
-            templateID ?: @"(nil)",
-            (unsigned long)text.length,
-            session.optionAdapter.option ? NSStringFromClass([session.optionAdapter.option class]) : @"(nil)");
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ApolloUserFlairCommitEditedSession(session, text)) {
-                if (strongController) objc_setAssociatedObject(strongController, &kApolloUserFlairEditorPresentedKey, nil, OBJC_ASSOCIATION_ASSIGN);
-                ApolloUserFlairShowError(strongController, @"Apollo's native flair update action was unavailable.");
-            }
-        });
-    }];
-    [alert addAction:saveAction];
-
-    ApolloUserFlairTextFieldObserver *observer = [ApolloUserFlairTextFieldObserver new];
-    observer.alert = alert;
-    observer.saveAction = saveAction;
-    UITextField *textField = alert.textFields.firstObject;
-    [textField addTarget:observer action:@selector(textFieldChanged:) forControlEvents:UIControlEventEditingChanged];
-    objc_setAssociatedObject(alert, @selector(textFieldChanged:), observer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [observer textFieldChanged:textField];
-
-    ApolloLog(@"[UserFlair] presenting editor subreddit=%@ templateID=%@ initialLen=%lu",
-        subredditName ?: @"(nil)",
-        templateID ?: @"(nil)",
-        (unsigned long)initialText.length);
-    [[session.selectorAdapter presenter] presentViewController:alert animated:YES completion:nil];
+    ApolloLog(@"[UserFlair] presenting flair editor subreddit=%@ templateID=%@ initialLen=%lu",
+        session.subredditName ?: @"(nil)",
+        session.templateID ?: @"(nil)",
+        (unsigned long)(session.initialText.length));
+    [[session.selectorAdapter presenter] presentViewController:nav animated:YES completion:nil];
 }
 
 #pragma mark - Row Option Capture
