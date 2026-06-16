@@ -1234,7 +1234,10 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
             ApolloLinkPreview *preview = [ApolloLinkPreview new];
             preview.siteName = @"Bluesky";
             preview.title = title;
-            preview.desc = ApolloLinkPreviewTruncatedString(text, 300);
+            // Keep the post's paragraph breaks in desc too — it's the body
+            // the Bluesky card falls back to, and newlines are part of how
+            // the post reads. (TruncatedString would flatten them.)
+            preview.desc = text.length > 300 ? [[text substringToIndex:300] stringByAppendingString:@"..."] : text;
             preview.previewKind = @"bluesky-post-v2";
             preview.authorDisplayName = displayName;
             preview.authorHandle = handle;

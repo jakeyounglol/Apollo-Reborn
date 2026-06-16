@@ -6,6 +6,7 @@
 #import "ApolloCommon.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
+#import "ApolloSubredditInfoCache.h"
 #import "ApolloBannedProfile.h"
 
 static NSString *const ApolloUserAvatarsToggleChangedNotification = @"ApolloUserAvatarsToggleChangedNotification";
@@ -2030,6 +2031,158 @@ static void ApolloProfileOpenRedditProfileEditor(void) {
     %orig;
     if (!sShowUserAvatars) return;
     ApolloApplyAvatarToCellWithDiameter(self, ApolloUsernameFromCell(self, @"link"), ApolloFeedInlineAvatarDiameter);
+}
+
+%end
+
+// Share as Image renders the post into a fresh SaveAsImagePreviewNode instead
+// of snapshotting the live cell, so the exported image loses the inline author
+// avatar (issue #381). Comments inside the preview are real CommentCellNode
+// instances (hooked above) and already get theirs; only the post's info line
+// needs help. The preview's `link` ivar carries the post author, and the
+// shared text-node machinery handles binding/fetch/late re-apply.
+//
+// The preview node's view is never loaded (Apollo rasterizes the node tree),
+// so didLoad never fires — hook layoutSpecThatFits: like
+// ApolloShareAsImageGallery does. It runs on Texture's background layout
+// threads and fires repeatedly; gate to one main-queue application per node.
+static BOOL ApolloAvatarIvarBool(id obj, const char *name) {
+    if (!obj || !name) return NO;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
+    if (!ivar) return NO;
+    const uint8_t *base = (const uint8_t *)(__bridge const void *)obj;
+    return base[ivar_getOffset(ivar)] != 0;
+}
+
+// ASSizeRange { CGSize min; CGSize max; } — same -layoutSpecThatFits: ABI
+// name the rest of the repo uses (see ApolloShareAsImageGallery.xm).
+struct CDStruct_90e057aa { CGSize min; CGSize max; };
+
+static char kApolloAvatarSharePreviewAppliedKey;
+
+// Apollo builds the preview's PostInfoNode with showSubredditIcon=NO — the
+// subredditIconNode is never created, so there is nothing to unhide. Mirror
+// the native icon by inserting it into the byline text in front of the
+// subreddit name, the same way the author avatar rides the username.
+static void ApolloAvatarInsertSubredditIconIntoPostInfo(id postInfo, NSString *subreddit, UIImage *iconImage) {
+    if (!postInfo || subreddit.length == 0 || !iconImage) return;
+    NSMutableArray *textNodes = [NSMutableArray array];
+    ApolloCollectTextNodes(postInfo, [NSMutableSet set], textNodes, 0);
+    for (id textNode in textNodes) {
+        NSAttributedString *text = ApolloAttributedTextForNode(textNode);
+        if (text.length == 0) continue;
+        // Case-insensitive: the model carries the lowercased subreddit name
+        // (e.g. "benfica") while the byline renders the display case
+        // ("Benfica").
+        NSRange range = [text.string rangeOfString:subreddit options:NSCaseInsensitiveSearch];
+        if (range.location == NSNotFound) continue;
+
+        // Already iconed (attachment + spacer directly before the name)?
+        if (range.location >= 2 &&
+            [text attribute:kApolloAvatarAttachmentMarkerAttributeName atIndex:range.location - 2 effectiveRange:nil]) {
+            return;
+        }
+
+        // Same font-scaled sizing as the author avatar attachment, so both
+        // icons in the byline come out the same size.
+        NSUInteger attrIndex = MIN(range.location, text.length - 1);
+        UIFont *font = [text attribute:NSFontAttributeName atIndex:attrIndex effectiveRange:nil];
+        if (![font isKindOfClass:[UIFont class]]) font = [UIFont systemFontOfSize:13.0];
+        CGFloat capHeight = font.capHeight > 0.0 ? font.capHeight : (font.pointSize * 0.7);
+        CGFloat lineHeight = font.lineHeight > 0.0 ? font.lineHeight : (font.pointSize * 1.2);
+        CGFloat diameter = MIN(ApolloFeedInlineAvatarDiameter,
+                               MIN(floor(lineHeight * 1.4), MAX(20.0, floor(capHeight * 2.25))));
+
+        NSTextAttachment *attachment = [[NSTextAttachment alloc] init];
+        attachment.image = ApolloCircularAvatarImage(iconImage, diameter);
+        attachment.bounds = CGRectMake(0.0, (capHeight - diameter) / 2.0, diameter, diameter);
+
+        NSDictionary *baseAttributes = [text attributesAtIndex:attrIndex effectiveRange:nil] ?: @{};
+        NSMutableAttributedString *attachmentString = [[NSMutableAttributedString alloc] initWithAttributedString:[NSAttributedString attributedStringWithAttachment:attachment]];
+        [attachmentString addAttribute:kApolloAvatarAttachmentMarkerAttributeName value:@YES range:NSMakeRange(0, attachmentString.length)];
+
+        NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithAttributedString:text];
+        [result insertAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:baseAttributes] atIndex:range.location];
+        [result insertAttributedString:attachmentString atIndex:range.location];
+        ApolloSetAttributedTextForNode(textNode, result);
+        ApolloNodeSetNeedsLayout(textNode);
+        ApolloLog(@"[UserAvatars] Share preview subreddit icon applied r/%@", subreddit);
+        return;
+    }
+}
+
+// Apollo's own "show subreddit icons on posts" setting — the share preview
+// should mirror the live byline, which follows this, not the tweak's user
+// avatar setting. Missing key = Apollo's default (icons on).
+static BOOL ApolloNativeShowSubredditIconsForPosts(void) {
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:@"ShowSubredditIconsForPosts"];
+    return value ? [value boolValue] : YES;
+}
+
+static void ApolloAvatarApplySubredditIconToSharePreview(id postInfo, NSString *subreddit) {
+    if (!postInfo || subreddit.length == 0) return;
+    __weak id weakPostInfo = postInfo;
+    void (^applyInfo)(ApolloSubredditInfo *) = ^(ApolloSubredditInfo *info) {
+        if (!info.iconURL) {
+            ApolloLog(@"[UserAvatars] Share preview subreddit icon unavailable r/%@ (no iconURL)", subreddit);
+            return;
+        }
+        [[ApolloUserProfileCache sharedCache] requestImageForURL:info.iconURL completion:^(UIImage *image) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ApolloAvatarInsertSubredditIconIntoPostInfo(weakPostInfo, subreddit, image);
+            });
+        }];
+    };
+    ApolloSubredditInfoCache *cache = [ApolloSubredditInfoCache sharedCache];
+    ApolloSubredditInfo *cached = [cache cachedInfoForSubreddit:subreddit];
+    if (cached) {
+        applyInfo(cached);
+    } else {
+        [cache requestInfoForSubreddit:subreddit completion:^(ApolloSubredditInfo *info) {
+            applyInfo(info);
+        }];
+    }
+}
+
+%hook _TtC6Apollo22SaveAsImagePreviewNode
+
+- (id)layoutSpecThatFits:(struct CDStruct_90e057aa)constrainedSize {
+    if ((sShowUserAvatars || ApolloNativeShowSubredditIconsForPosts()) &&
+        ![objc_getAssociatedObject(self, &kApolloAvatarSharePreviewAppliedKey) boolValue]) {
+        // Synchronous flip: layout passes come in bursts on multiple threads.
+        objc_setAssociatedObject(self, &kApolloAvatarSharePreviewAppliedKey, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        __weak id weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id node = weakSelf;
+            if (!node) return;
+            BOOL includePostDetails = ApolloAvatarIvarBool(node, "includePostDetails");
+            BOOL hideUsernames = ApolloAvatarIvarBool(node, "hideUsernames");
+            BOOL hideSubreddit = ApolloAvatarIvarBool(node, "hideSubreddit");
+            NSString *username = ApolloUsernameFromCell(node, @"link");
+            ApolloLog(@"[UserAvatars] Share preview layout details=%d hideUsernames=%d hideSubreddit=%d username=%@ node=%p",
+                      includePostDetails, hideUsernames, hideSubreddit, username, node);
+            // No author line without post details; no avatar when usernames
+            // are hidden — the rendered text won't contain the author.
+            if (!includePostDetails) return;
+            // Each icon follows its own setting, mirroring the live byline:
+            // author avatar = the tweak's user avatars option, subreddit
+            // icon = Apollo's native subreddit icons option.
+            if (sShowUserAvatars && !hideUsernames) {
+                ApolloApplyAvatarToCellWithDiameter(node, username, ApolloFeedInlineAvatarDiameter);
+            }
+            if (ApolloNativeShowSubredditIconsForPosts() && !hideSubreddit) {
+                id link = ApolloObjectIvarValue(node, @"link");
+                NSString *subreddit = nil;
+                @try {
+                    if ([link respondsToSelector:@selector(subreddit)]) subreddit = [link performSelector:@selector(subreddit)];
+                } @catch (__unused NSException *e) {}
+                if ([subreddit isKindOfClass:[NSString class]]) {
+                    ApolloAvatarApplySubredditIconToSharePreview(ApolloObjectIvarValue(node, @"postInfoNode"), subreddit);
+                }
+            }
+        });
+    }
+    return %orig;
 }
 
 %end

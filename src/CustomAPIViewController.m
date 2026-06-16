@@ -58,11 +58,14 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
 // mapping above so the API Keys index math lives in one place instead of being
 // inlined at each call site.
 typedef NS_ENUM(NSInteger, ApolloAPIKeyRow) {
-    kAPIKeyRowTroubleshooting = 7,
-    kAPIKeyRowSetupGuide      = 8,
-    kAPIKeyRowWebJSONSwitch   = 9,
-    kAPIKeyRowWebSessionLogin = 10,
-    kAPIKeyRowWidgetSetupCode = 11,
+    // Rows 0-5 are the API-key text fields, row 6 is the Universal OAuth Sign-In
+    // switch, and row 7 is the User Agent field; the navigable/auxiliary rows below
+    // follow it.
+    kAPIKeyRowTroubleshooting = 8,
+    kAPIKeyRowSetupGuide      = 9,
+    kAPIKeyRowWebJSONSwitch   = 10,
+    kAPIKeyRowWebSessionLogin = 11,
+    kAPIKeyRowWidgetSetupCode = 12,
 };
 
 // Map a displayed (visible) API Keys row to its canonical index (ApolloAPIKeyRow).
@@ -159,6 +162,26 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
     }
     return NO;
+}
+
+- (BOOL)apollo_usesCustomOAuthSignIn {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn];
+}
+
+- (NSString *)apollo_redirectURIDetailText {
+    if ([self apollo_usesCustomOAuthSignIn]) {
+        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported.";
+    }
+
+    NSString *registered = [[self registeredURLSchemes] componentsJoinedByString:@", "];
+    if (registered.length == 0) registered = @"none";
+    return [NSString stringWithFormat:@"Must match the app whose API key you're using. URI scheme (part before ://) must be registered in Info.plist under CFBundleURLTypes. Registered: %@", registered];
+}
+
+- (void)apollo_applyRedirectURITextColorToCell:(UITableViewCell *)cell {
+    UITextField *textField = [self apollo_textFieldInCell:cell];
+    if (!textField) return;
+    textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
 }
 
 - (UIImage *)decodeBase64ToImage:(NSString *)strEncodeData {
@@ -688,13 +711,14 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case SectionBackupRestore: return 4;
-        // 7 text fields + Can't sign in? + API key setup guide + Web JSON switch + Copy Widget Setup Code
-        // (+ Web Session Login row, only while Web JSON mode is on). Widget Setup
-        // Code is the last canonical row, so the count is its index + 1, minus the
-        // Web Session Login row when the mode is off.
+        // 7 text fields + Universal OAuth switch + Can't sign in? + API key setup
+        // guide + Web JSON switch + Copy Widget Setup Code (+ Web Session Login row,
+        // only while Web JSON mode is on). Widget Setup Code is the last canonical
+        // row, so the count is its index + 1, minus the Web Session Login row when
+        // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
-        case SectionMedia: return 12 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -974,14 +998,21 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                                 placeholder:defaultRedirectURI
                                                                        text:sRedirectURI
                                                                         tag:TagRedirectURI
-                                                                     detail:@"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported."];
+                                                                      detail:[self apollo_redirectURIDetailText]];
+            [self apollo_applyRedirectURITextColorToCell:cell];
             return cell;
         }
         case 6:
+            return [self switchCellWithIdentifier:@"Cell_API_CustomOAuth"
+                                            label:@"Universal OAuth Sign-In"
+                                           detail:@"Signs in with an in-app web view so any Redirect URI works. Turn off for Apollo's native sign-in."
+                                               on:[self apollo_usesCustomOAuthSignIn]
+                                           action:@selector(customOAuthSignInSwitchToggled:)];
+        case 7:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_API_UserAgent"
                                                       label:@"User Agent"
                                                 placeholder:defaultUserAgent
-                                                       text:sUserAgent
+                                                        text:sUserAgent
                                                         tag:TagUserAgent];
         case kAPIKeyRowTroubleshooting: {
             UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_Troubleshooting"];
@@ -1240,11 +1271,16 @@ typedef NS_ENUM(NSInteger, Tag) {
             return cell;
         }
         case 10:
+            return [self switchCellWithIdentifier:@"Cell_Media_TextPostThumbnails"
+                                            label:@"Text Post Thumbnails"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails]
+                                           action:@selector(textPostThumbnailsSwitchToggled:)];
+        case 11:
             return [self switchCellWithIdentifier:@"Cell_Media_UserAvatars"
                                             label:@"Show User Profile Pictures"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars]
                                            action:@selector(userAvatarsSwitchToggled:)];
-        case 11:
+        case 12:
             return [self switchCellWithIdentifier:@"Cell_Media_ProfileTabAvatar"
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
@@ -1963,7 +1999,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sRedirectURI = textField.text;
         [[NSUserDefaults standardUserDefaults] setValue:sRedirectURI forKey:UDKeyRedirectURI];
-        textField.textColor = [UIColor labelColor];
+        textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
     } else if (textField.tag == TagUserAgent) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sUserAgent = textField.text;
@@ -2076,6 +2112,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
 }
 
+- (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseCustomOAuthSignIn];
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:5 inSection:SectionAPIKeys]]
+                          withRowAnimation:UITableViewRowAnimationNone];
+}
+
 - (void)subredditListEnhancementsSwitchToggled:(UISwitch *)sender {
     BOOL wasOn = sSubredditListEnhancements;
     sSubredditListEnhancements = sender.isOn;
@@ -2158,6 +2200,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     sShowSubredditHeaders = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowSubredditHeaders forKey:UDKeyShowSubredditHeaders];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloSubredditHeaderToggleChangedNotification" object:nil];
+}
+
+- (void)textPostThumbnailsSwitchToggled:(UISwitch *)sender {
+    sFeedTextPostThumbnails = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedTextPostThumbnails forKey:UDKeyFeedTextPostThumbnails];
 }
 
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {

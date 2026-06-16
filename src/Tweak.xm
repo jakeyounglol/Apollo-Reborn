@@ -348,6 +348,10 @@ static const char kARCompletion = '\0';
 }
 
 - (BOOL)start {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn]) {
+        return %orig;
+    }
+
     NSString *callbackScheme = objc_getAssociatedObject(self, &kARScheme);
     NSURL *authURL            = objc_getAssociatedObject(self, &kARAuthURL);
     void (^completion)(NSURL *, NSError *) = objc_getAssociatedObject(self, &kARCompletion);
@@ -1218,11 +1222,13 @@ static void initializeRandomSources() {
                                     UDKeyTapToRevealDeletedComments: @NO,
                                     UDKeyEnableFlairColors: @NO,
                                     UDKeyShowRecentlyReadThumbnails: @YES,
+                                    UDKeyFeedTextPostThumbnails: @YES,
                                     UDKeyPreferredGIFFallbackFormat: @1,
                                     UDKeyUnmuteCommentsVideos: @0,
                                     UDKeyProxyImgurDDG: @NO,
                                     UDKeyImageChestAPIToken: @"",
                                     UDKeyGiphyAPIKey: @"",
+                                    UDKeyUseCustomOAuthSignIn: @YES,
                                     UDKeyEnableInlineImages: @YES,
                                     UDKeyInlineImageAlignment: @(ApolloInlineImageAlignmentCenter),
                                     UDKeyAutoplayInlineGIFs: @(ApolloAutoplayInlineGIFModeDefault),
@@ -1271,6 +1277,7 @@ static void initializeRandomSources() {
     sShowDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDeletedComments];
     sTapToRevealDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTapToRevealDeletedComments];
     sShowRecentlyReadThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails];
+    sFeedTextPostThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails];
     sPreferredGIFFallbackFormat = ([[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sReadPostMaxCount = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyReadPostMaxCount];
     sUnmuteCommentsVideos = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyUnmuteCommentsVideos];

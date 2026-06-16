@@ -63,6 +63,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
     $(SRC_DIR)/ApolloSubredditIndexPolish.xm \
     $(SRC_DIR)/ApolloQuickActions.xm \
+    $(SRC_DIR)/ApolloHideModSubreddits.xm \
     $(SRC_DIR)/ApolloTagFilters.xm \
     $(SRC_DIR)/ApolloImageChestResolver.m \
     $(SRC_DIR)/ApolloLinkPreviewModel.m \
