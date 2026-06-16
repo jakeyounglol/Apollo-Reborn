@@ -6,23 +6,29 @@
 static char kApolloUserFlairEditorPresentedKey;
 static char kApolloUserFlairCapturedOptionsKey;
 static char kApolloUserFlairCollapseModelKey;
+static char kApolloUserFlairCurrentFlairKey;
 
 static const NSUInteger kApolloUserFlairMaxLength = 64;
 
 // The flair selector's flair options live in section 1 of its table.
 static const NSInteger kApolloUserFlairOptionsSection = 1;
 
-// Placeholder shown on the single collapsed "custom flair" row when a subreddit
-// uses the old (empty-template) flair system.
+// Placeholder shown on a blank, editable flair row so it's obvious it's tappable.
 static NSString *const kApolloUserFlairCustomRowText = @"Set custom flair…";
 
 static __thread __unsafe_unretained UIViewController *tApolloUserFlairCaptureController = nil;
 static __thread NSInteger tApolloUserFlairCaptureSection = NSNotFound;
 static __thread NSInteger tApolloUserFlairCaptureRow = NSNotFound;
-// While a collapsed "custom flair" cell is being built, this points at the
-// RDKFlairOption backing that row so its (otherwise empty) getters render the
-// placeholder text instead of nothing. Never mutates the model.
+// While a "custom flair" cell is being built, these let the (otherwise empty)
+// RDKFlairOption getters render either the user's CURRENT flair or the
+// "Set custom flair…" placeholder. They never mutate the model.
 static __thread __unsafe_unretained id tApolloUserFlairCustomRowOption = nil;
+static __thread __unsafe_unretained NSArray *tApolloUserFlairCustomRowFlairs = nil;
+static __thread __unsafe_unretained NSString *tApolloUserFlairCustomRowDisplayText = nil;
+
+// Forward declaration (defined in the collapse section) so the edit session can
+// pre-fill the editor with the user's current flair.
+static NSString *ApolloUserFlairCurrentFlairTextForOption(UIViewController *controller, id option);
 
 @interface ApolloUserFlairOptionAdapter : NSObject
 @property (nonatomic, strong) id option;
@@ -511,11 +517,17 @@ static ApolloUserFlairEditSession *ApolloUserFlairBuildEditSession(UIViewControl
         subredditName ?: @"(nil)");
 
     if (!option || ![selectorAdapter isUserFlairSelector] || !editableKnown || !editable || subredditName.length == 0 || templateID.length == 0) return nil;
+
+    // Pre-fill with the user's CURRENT flair when editing the row it lives on, so
+    // opening the editor shows (and lets you tweak) what you already have.
+    NSString *currentFlairText = ApolloUserFlairCurrentFlairTextForOption(controller, option);
+    NSString *initialText = currentFlairText.length > 0 ? currentFlairText : [optionAdapter displayText];
+
     return [ApolloUserFlairEditSession sessionWithSelectorAdapter:selectorAdapter
                                                     optionAdapter:optionAdapter
                                                     subredditName:subredditName
                                                       templateID:templateID
-                                                     initialText:[optionAdapter displayText]];
+                                                     initialText:initialText];
 }
 
 #pragma mark - Editor
@@ -1079,6 +1091,16 @@ static BOOL ApolloUserFlairOptionIsLabeled(id option) {
     return flairs.count > 0;
 }
 
+// A blank-but-editable template: nothing to show, but you can type into it. These
+// get the "Set custom flair…" placeholder so it's obvious the row is tappable —
+// whether or not the subreddit's templates were collapsed.
+static BOOL ApolloUserFlairOptionIsBlankEditable(id option) {
+    if (!option || ApolloUserFlairOptionIsLabeled(option)) return NO;
+    BOOL editableKnown = NO;
+    BOOL editable = ApolloUserFlairOptionIsEditable(option, &editableKnown);
+    return editableKnown && editable;
+}
+
 @interface ApolloUserFlairCollapseModel : NSObject
 @property (nonatomic) BOOL active;
 // displayRow -> real index into flairOptions
@@ -1147,27 +1169,140 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairCollapseModelFor(UIViewContr
     return model;
 }
 
-// One reusable RDKFlair carrying the placeholder text, so the collapsed row
+static id ApolloUserFlairMakeTextFlair(NSString *text) {
+    Class flairClass = objc_getClass("RDKFlair");
+    SEL initSEL = @selector(initWithRawText:);
+    if (!flairClass || ![flairClass instancesRespondToSelector:initSEL]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)([flairClass alloc], initSEL, text ?: @"");
+}
+
+// An emoji piece must look exactly like Reddit's own: flairType "emoji", the bare
+// emoji name in emojiLabel, the image URL, and a NIL text. Crucially `text` must be
+// nil (not @"") — the native flair cell treats any non-nil text as a text run and
+// renders it instead of loading the emoji image.
+static id ApolloUserFlairMakeEmojiFlair(NSString *name, NSString *imageURL) {
+    id flair = ApolloUserFlairMakeTextFlair(@"");
+    if (!flair) return nil;
+    NSURL *url = imageURL.length ? [NSURL URLWithString:imageURL] : nil;
+    @try { [flair setValue:nil forKey:@"text"]; } @catch (__unused NSException *e) {}
+    @try { [flair setValue:@"emoji" forKey:@"flairType"]; } @catch (__unused NSException *e) {}
+    @try { if (name.length) [flair setValue:name forKey:@"emojiLabel"]; } @catch (__unused NSException *e) {}
+    @try { if (url) [flair setValue:url forKey:@"imageURL"]; } @catch (__unused NSException *e) {}
+    return flair;
+}
+
+// One reusable RDKFlair carrying the placeholder text, so a blank editable row
 // renders through Apollo's normal flair cell layout instead of as a blank pill.
-static NSArray *ApolloUserFlairCustomRowSyntheticFlairs(void) {
+static NSArray *ApolloUserFlairPlaceholderFlairs(void) {
     static NSArray *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        Class flairClass = objc_getClass("RDKFlair");
-        SEL initSEL = @selector(initWithRawText:);
-        if (flairClass && [flairClass instancesRespondToSelector:initSEL]) {
-            id flair = ((id (*)(id, SEL, id))objc_msgSend)([flairClass alloc], initSEL, kApolloUserFlairCustomRowText);
-            if (flair) cached = @[flair];
-        }
-        if (!cached) {
-            // The synthetic flair is what makes the collapsed row render its label;
-            // without it the row falls back to Apollo's empty rendering (still a
-            // single collapsed row, just unlabelled). Surface the failure so a
-            // future RDKFlair API change doesn't degrade silently.
-            ApolloLog(@"[UserFlair] warning: could not build synthetic RDKFlair; custom-flair row will render unlabelled");
-        }
+        id flair = ApolloUserFlairMakeTextFlair(kApolloUserFlairCustomRowText);
+        if (flair) cached = @[flair];
+        else ApolloLog(@"[UserFlair] warning: could not build placeholder RDKFlair; custom-flair row will render unlabelled");
     });
     return cached;
+}
+
+// Build RDKFlair pieces from a flair_text string so the user's CURRENT flair
+// renders in the row. Recognised :token: emoji become image pieces (using the
+// subreddit's emoji map); everything else stays text. Unknown tokens remain as
+// literal text. Returns nil if nothing could be built.
+static NSArray *ApolloUserFlairPiecesFromFlairText(NSString *flairText, NSString *subredditLowercase) {
+    if (flairText.length == 0) return nil;
+    NSDictionary *map = nil;
+    NSArray *emojis = nil;
+    @synchronized (ApolloUserFlairEmojiListCache()) { emojis = ApolloUserFlairEmojiListCache()[subredditLowercase]; }
+    if (emojis.count) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        for (NSDictionary *e in emojis) { if (e[@"name"] && e[@"url"]) m[e[@"name"]] = e[@"url"]; }
+        map = m;
+    }
+
+    NSMutableArray *pieces = [NSMutableArray array];
+    NSArray *matches = [ApolloUserFlairEmojiTokenRegex() matchesInString:flairText options:0 range:NSMakeRange(0, flairText.length)];
+    NSUInteger cursor = 0;
+    for (NSTextCheckingResult *m in matches) {
+        NSString *name = [[flairText substringWithRange:m.range] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@":"]];
+        NSString *url = map[name];
+        if (!url) continue; // unknown token: leave it inside the surrounding text run
+        if (m.range.location > cursor) {
+            id t = ApolloUserFlairMakeTextFlair([flairText substringWithRange:NSMakeRange(cursor, m.range.location - cursor)]);
+            if (t) [pieces addObject:t];
+        }
+        id e = ApolloUserFlairMakeEmojiFlair(name, url);
+        if (e) [pieces addObject:e];
+        cursor = m.range.location + m.range.length;
+    }
+    if (cursor < flairText.length) {
+        id t = ApolloUserFlairMakeTextFlair([flairText substringFromIndex:cursor]);
+        if (t) [pieces addObject:t];
+    }
+    return pieces.count ? pieces : nil;
+}
+
+#pragma mark - Current Flair (so the user can see their existing flair)
+
+// Stored on the controller: @{ @"text": flair_text, @"templateID": id-or-@"" }.
+// Fetched once per controller from Reddit's flairselector `current`.
+static void ApolloUserFlairFetchCurrentFlair(UIViewController *controller, NSString *subreddit) {
+    if (!controller || subreddit.length == 0) return;
+    if (objc_getAssociatedObject(controller, &kApolloUserFlairCurrentFlairKey)) return; // already fetched
+    // Mark as in-flight so we don't fire twice (numberOfRows is called repeatedly).
+    objc_setAssociatedObject(controller, &kApolloUserFlairCurrentFlairKey, @{}, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSString *token = [sLatestRedditBearerToken copy];
+    if (token.length == 0) return;
+    NSString *enc = [subreddit stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: subreddit;
+    __weak UIViewController *weakController = controller;
+
+    // Fetch the emoji map FIRST so :token: flairs can render as images, then the
+    // current flair, then reload the table once both are available.
+    ApolloUserFlairFetchEmojis(subreddit, ^(NSArray *emojis) {
+        (void)emojis;
+        NSString *urlStr = [NSString stringWithFormat:@"https://oauth.reddit.com/r/%@/api/flairselector?raw_json=1", enc];
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+        req.HTTPMethod = @"POST";
+        [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+        [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [NSData data];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+            id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+            id current = [json isKindOfClass:[NSDictionary class]] ? json[@"current"] : nil;
+            NSString *text = nil, *templateID = nil;
+            if ([current isKindOfClass:[NSDictionary class]]) {
+                id t = current[@"flair_text"]; if ([t isKindOfClass:[NSString class]]) text = t;
+                id tid = current[@"flair_template_id"]; if ([tid isKindOfClass:[NSString class]]) templateID = tid;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *strongController = weakController;
+                if (!strongController) return;
+                objc_setAssociatedObject(strongController, &kApolloUserFlairCurrentFlairKey,
+                    @{ @"text": text ?: @"", @"templateID": templateID ?: @"" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                id tableNode = ApolloUserFlairRawObjectIvar(strongController, @"tableNode");
+                BOOL reloaded = [tableNode respondsToSelector:@selector(reloadData)];
+                if (reloaded) ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
+                ApolloLog(@"[UserFlair] current flair r/%@ textLen=%lu template=%@ reloaded=%d", subreddit, (unsigned long)text.length, templateID.length ? @"yes" : @"none", reloaded);
+            });
+        }] resume];
+    });
+}
+
+// The user's current flair_text IF it belongs on this option's row: either the
+// template ids match, or the flair is free-form (no template) and this is a
+// blank editable row. Returns nil otherwise.
+static NSString *ApolloUserFlairCurrentFlairTextForOption(UIViewController *controller, id option) {
+    NSDictionary *current = objc_getAssociatedObject(controller, &kApolloUserFlairCurrentFlairKey);
+    NSString *text = current[@"text"];
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
+    NSString *templateID = current[@"templateID"];
+    NSString *optionID = ApolloUserFlairOptionIdentifier(option);
+    if (templateID.length > 0) {
+        return [templateID isEqualToString:optionID] ? text : nil;
+    }
+    // Free-form flair (no template): show it on the blank editable "custom" row.
+    return ApolloUserFlairOptionIsBlankEditable(option) ? text : nil;
 }
 
 // YES when the presenter chain contains Apollo's flair selector. Used to scope
@@ -1223,6 +1358,8 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
 
 - (NSInteger)tableNode:(id)tableNode numberOfRowsInSection:(NSInteger)section {
     if (section == kApolloUserFlairOptionsSection) {
+        NSString *sub = ApolloUserFlairCleanSubredditName(ApolloUserFlairSubredditNameFromObject((UIViewController *)self, 0));
+        ApolloUserFlairFetchCurrentFlair((UIViewController *)self, sub);
         ApolloUserFlairCollapseModel *model = ApolloUserFlairCollapseModelFor((UIViewController *)self);
         if (model.active) return (NSInteger)model.realRows.count;
     }
@@ -1246,13 +1383,51 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
 
     id originalBlock = %orig(tableNode, effectiveIndexPath);
     if (!originalBlock) return originalBlock;
+    (void)isCustomRow;
 
-    // For the collapsed "custom flair" row, look up the backing option so its
-    // getters can render the placeholder while this cell is being built.
-    __unsafe_unretained id customRowOption = nil;
-    if (isCustomRow) {
+    // Decide what this row should render via the option's (otherwise empty) getters:
+    //  - the user's CURRENT flair, if it belongs on this row (so you can see it); or
+    //  - a "Set custom flair…" placeholder, if the row is blank but editable.
+    // Labelled rows that aren't the current flair are left to Apollo.
+    // These are STRONG so the async cell block retains them — the synthetic flair
+    // pieces are freshly built (autoreleased) and would otherwise dangle.
+    id customRowOption = nil;
+    NSArray *customRowFlairs = nil;
+    NSString *customRowText = nil;
+    {
         NSArray *options = ApolloUserFlairControllerOptions((UIViewController *)self);
-        if (realRow >= 0 && realRow < (NSInteger)options.count) customRowOption = options[realRow];
+        if (realRow >= 0 && realRow < (NSInteger)options.count) {
+            id opt = options[realRow];
+            NSString *currentText = ApolloUserFlairCurrentFlairTextForOption((UIViewController *)self, opt);
+            // When templates are collapsed into one representative row, the current
+            // flair may live on a different (hidden) empty template — they're all
+            // equivalent, so show it on the representative regardless of which one.
+            if (currentText.length == 0 && isCustomRow) {
+                NSDictionary *cur = objc_getAssociatedObject((UIViewController *)self, &kApolloUserFlairCurrentFlairKey);
+                NSString *t = cur[@"text"];
+                if ([t isKindOfClass:[NSString class]] && t.length > 0) currentText = t;
+            }
+            BOOL blankEditable = ApolloUserFlairOptionIsBlankEditable(opt);
+            if (currentText.length > 0) {
+                NSString *sub = ApolloUserFlairCleanSubredditName(ApolloUserFlairSubredditNameFromObject((UIViewController *)self, 0));
+                NSArray *pieces = ApolloUserFlairPiecesFromFlairText(currentText, sub.lowercaseString);
+                if (pieces.count) {
+                    customRowOption = opt;
+                    customRowFlairs = pieces;
+                    customRowText = currentText;
+                } else if (blankEditable) {
+                    // Have a current flair but couldn't build pieces (e.g. RDKFlair
+                    // unavailable) — don't leave a blank row; show the placeholder.
+                    customRowOption = opt;
+                    customRowFlairs = ApolloUserFlairPlaceholderFlairs();
+                    customRowText = kApolloUserFlairCustomRowText;
+                }
+            } else if (blankEditable) {
+                customRowOption = opt;
+                customRowFlairs = ApolloUserFlairPlaceholderFlairs();
+                customRowText = kApolloUserFlairCustomRowText;
+            }
+        }
     }
 
     id copiedBlock = [originalBlock copy];
@@ -1265,12 +1440,16 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
         NSInteger previousSection = tApolloUserFlairCaptureSection;
         NSInteger previousRow = tApolloUserFlairCaptureRow;
         id previousCustomOption = tApolloUserFlairCustomRowOption;
+        NSArray *previousCustomFlairs = tApolloUserFlairCustomRowFlairs;
+        NSString *previousCustomText = tApolloUserFlairCustomRowDisplayText;
         id node = nil;
 
         tApolloUserFlairCaptureController = strongController;
         tApolloUserFlairCaptureSection = kApolloUserFlairOptionsSection;
         tApolloUserFlairCaptureRow = captureRow;
         tApolloUserFlairCustomRowOption = customRowOption;
+        tApolloUserFlairCustomRowFlairs = customRowFlairs;
+        tApolloUserFlairCustomRowDisplayText = customRowText;
         @try {
             node = ((id (^)(void))copiedBlock)();
         } @finally {
@@ -1278,6 +1457,8 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
             tApolloUserFlairCaptureSection = previousSection;
             tApolloUserFlairCaptureRow = previousRow;
             tApolloUserFlairCustomRowOption = previousCustomOption;
+            tApolloUserFlairCustomRowFlairs = previousCustomFlairs;
+            tApolloUserFlairCustomRowDisplayText = previousCustomText;
         }
 
         return node;
@@ -1324,8 +1505,8 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
 - (NSString *)textRepresentation {
     NSString *textRepresentation = %orig;
     ApolloUserFlairCaptureOptionIfNeeded(self);
-    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self) {
-        return kApolloUserFlairCustomRowText;
+    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self && tApolloUserFlairCustomRowDisplayText) {
+        return tApolloUserFlairCustomRowDisplayText;
     }
     return textRepresentation;
 }
@@ -1339,9 +1520,8 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
 - (NSArray *)flairs {
     NSArray *flairs = %orig;
     ApolloUserFlairCaptureOptionIfNeeded(self);
-    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self) {
-        NSArray *synthetic = ApolloUserFlairCustomRowSyntheticFlairs();
-        if (synthetic) return synthetic;
+    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self && tApolloUserFlairCustomRowFlairs) {
+        return tApolloUserFlairCustomRowFlairs;
     }
     return flairs;
 }
