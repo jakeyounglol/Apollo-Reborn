@@ -143,6 +143,9 @@ static id ApolloWebJSONMakeSyntheticCredential(void) {
     return credential;
 }
 
+// Backfills a missing username onto a live currentUser (defined below).
+static void ApolloWebJSONBackfillUsernameOnUser(id user);
+
 // Installs a synthetic credential on `client` if Web JSON has a usable session
 // and the client has no live credential. Idempotent and cheap; safe to call from
 // several entry points.
@@ -160,6 +163,13 @@ static void ApolloWebJSONInstallSyntheticCredentialIfNeeded(RDKClient *client) {
     }
     if ([client respondsToSelector:@selector(forceSetExistingAuthorizationCredentialOnRequestSerializer)]) {
         [client forceSetExistingAuthorizationCredentialOnRequestSerializer];
+    }
+    // Belt-and-suspenders: if the loaded currentUser came in without a username,
+    // backfill it here too (isAuthenticated is called frequently, including before
+    // authed reads), so the profile listing + comment-edit ownership work even if
+    // the -setCurrentUser: timing is missed.
+    if ([client respondsToSelector:@selector(currentUser)]) {
+        ApolloWebJSONBackfillUsernameOnUser([client currentUser]);
     }
     ApolloLog(@"[WebJSON][identity] Installed synthetic credential for cookie session (user %@)",
               sWebSessionUsername ?: @"(unknown)");
@@ -255,6 +265,43 @@ static NSUInteger ApolloWebJSONExistingAccountCount(NSUserDefaults *group) {
     return [obj isKindOfClass:[NSArray class]] ? [(NSArray *)obj count] : 0;
 }
 
+// Backfills the logged-in username onto a live RDKMe/RDKUser when it has none.
+//
+// Why this is needed: when the current account's currentUser is archived WITHOUT
+// a username (NSKeyedArchiver omits nil values, so an RDKMe whose identity never
+// resolved is stored with no username key at all — and a fullName of "t2_(null)"),
+// two things break in Web JSON mode even though the account "exists":
+//   • the profile tab spins forever — Apollo builds the listing fetch as
+//     /user/<currentUser.username>/overview, and a nil username never fires it
+//     (the header still renders from cached karma/avatar fields, which is why
+//     testers saw the header but an empty posts/comments list);
+//   • comment editing is hidden — Apollo gates the Edit affordance on
+//     comment.author == currentUser.username, which a nil username never matches.
+//
+// The on-disk blob can't be repaired (RDKMe's MTLModel encoding drops a re-set
+// username on re-archive — verified: the value sets without throwing but never
+// persists), so we patch the LIVE object instead, at -setCurrentUser: (where the
+// loaded account installs it) and again whenever we touch the client for the
+// cookie session. Idempotent; only ever writes an absent/empty username, so a
+// real OAuth account's name is never touched. Gated on a usable web session.
+static void ApolloWebJSONBackfillUsernameOnUser(id user) {
+    if (!user || !ApolloWebJSONHasUsableSession()) return;
+    NSString *username = sWebSessionUsername;
+    if (username.length == 0) return;
+
+    NSString *existing = nil;
+    @try { existing = [user valueForKey:@"username"]; }
+    @catch (__unused NSException *e) { return; } // no such key — not our object shape
+    if ([existing isKindOfClass:[NSString class]] && existing.length > 0) return;
+
+    @try {
+        [user setValue:username forKey:@"username"];
+        ApolloLog(@"[WebJSON][identity] Backfilled live currentUser.username -> u/%@", username);
+    } @catch (NSException *e) {
+        ApolloLog(@"[WebJSON][identity] live username backfill failed: %@", e);
+    }
+}
+
 BOOL ApolloWebJSONSynthesizeSignedInAccount(void) {
     if (sWebSessionCookieHeader.length == 0) return NO;
     Class clientClass = objc_getClass("RDKClient");
@@ -262,8 +309,11 @@ BOOL ApolloWebJSONSynthesizeSignedInAccount(void) {
 
     NSUserDefaults *group = [[NSUserDefaults alloc] initWithSuiteName:kApolloGroupSuite];
     if (ApolloWebJSONExistingAccountCount(group) > 0) {
+        // Never clobber an already-loaded account. A present account whose
+        // currentUser lacks a username is fixed at runtime by
+        // ApolloWebJSONBackfillUsernameOnUser (-setCurrentUser: hook below), not here.
         ApolloLog(@"[WebJSON][identity] Account already present — skipping synthesis");
-        return NO; // never clobber a real signed-in account
+        return NO;
     }
 
     NSString *username = sWebSessionUsername.length > 0 ? sWebSessionUsername : @"redditor";
@@ -326,6 +376,16 @@ BOOL ApolloWebJSONSynthesizeSignedInAccount(void) {
 
 %hook RDKClient
 
+// When the loaded account installs its currentUser (RDKMe) without a username,
+// backfill it from the harvested web-session identity before anything reads it.
+// Fixes the spinning profile tab (listing fetch needs the username) and the
+// missing comment-Edit affordance (ownership check compares author to it).
+// %orig passes the same (now-mutated-in-place) object, so no reassignment needed.
+- (void)setCurrentUser:(id)user {
+    ApolloWebJSONBackfillUsernameOnUser(user);
+    %orig;
+}
+
 // Make the rest of the app treat a cookie-only session as authenticated.
 - (BOOL)isAuthenticated {
     if (ApolloWebJSONHasUsableSession()) {
@@ -383,6 +443,22 @@ BOOL ApolloWebJSONSynthesizeSignedInAccount(void) {
     return %orig;
 }
 
+%end
+
+// Cookie-routed comment writes (/api/editusertext, /api/comment) come back from
+// www.reddit.com in the old-reddit {parent, content:"<html>"} shape, which Apollo
+// can't render (the edited/posted comment shows empty with 0 upvotes). Rewrite the
+// serializer's output into the modern shape Apollo expects. No-op outside Web JSON
+// mode / for the modern shape — see ApolloWebJSONFixupWriteResponseObject.
+%hook RDKResponseSerializer
+- (id)responseObjectForResponse:(id)response data:(id)data error:(id *)error {
+    id obj = %orig;
+    if (sWebJSONEnabled) {
+        @try { obj = ApolloWebJSONFixupWriteResponseObject(response, obj); }
+        @catch (NSException *e) { ApolloLog(@"[WebJSON] write-response fixup failed: %@", e); }
+    }
+    return obj;
+}
 %end
 
 // NOTE: -authorizationCredential is intentionally NOT hooked. The install helper

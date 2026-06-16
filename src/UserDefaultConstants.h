@@ -86,6 +86,12 @@ static NSString *const UDKeyWebJSONEnabled = @"WebJSONEnabled";
 // is retained only so ApolloWebJSONLoadPersistedCredentials can migrate an older
 // build's value into the keychain and then delete it.
 static NSString *const UDKeyWebSessionCookieHeader = @"WebSessionCookieHeader";
+// Set when an account is synthesized from a *mid-session* web login (the login VC
+// path), so AccountManager — which only loads accounts at launch — hasn't picked
+// it up yet and the account tab is blank until a relaunch. Drives the
+// "restart to activate" indicator on the Web Session Login settings row, and is
+// cleared in %ctor on the next launch (where the fresh account load resolves it).
+static NSString *const UDKeyWebJSONPendingRestart = @"WebJSONPendingRestart";
 
 // Self-hosted notification backend (forked apollo-backend). Empty disables —
 // the legacy hosts remain in the blocklist and requests are silently dropped.

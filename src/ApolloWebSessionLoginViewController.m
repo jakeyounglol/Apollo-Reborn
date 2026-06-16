@@ -2,6 +2,7 @@
 #import "ApolloWebJSON.h"
 #import "ApolloCommon.h"
 #import "UIWindow+Apollo.h"
+#import "UserDefaultConstants.h"
 
 #import <WebKit/WebKit.h>
 
@@ -366,21 +367,28 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
 
 // Called after a successful harvest. When an account was synthesized, Apollo must
 // relaunch for AccountManager to load it (it reads accounts once per launch), so
-// we prompt to restart — mirroring the settings-restore flow's exit(0). Otherwise
-// (account already present / synthesis skipped) just dismiss.
+// we prompt to quit & reopen — mirroring the settings-restore flow's exit(0).
+// iOS can't relaunch the app for us, so the copy says "quit & reopen", not
+// "restart". If the user defers, we set UDKeyWebJSONPendingRestart so the Web
+// Session Login settings row shows a "restart to activate" reminder rather than
+// leaving them with a silently-blank account tab. Otherwise (account already
+// present / synthesis skipped) just dismiss with no prompt.
 - (void)_finishWithUser:(NSString *)username accountSynthesized:(BOOL)synthesized {
     if (!synthesized) { [self _dismiss]; return; }
+
+    // Mark the pending state up front; clearing happens at next launch (%ctor).
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:UDKeyWebJSONPendingRestart];
 
     NSString *who = username.length > 0 ? [NSString stringWithFormat:@"u/%@", username] : @"your account";
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Signed In"
                          message:[NSString stringWithFormat:
-                             @"Signed in as %@. Apollo needs to restart to finish signing in (load the account, enable voting and commenting).", who]
+                             @"Signed in as %@. Quit and reopen Apollo to finish signing in — your account, voting, and commenting won't be active until you do.", who]
                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Restart Apollo"
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit & Reopen"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) { exit(0); }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Later"
+    [alert addAction:[UIAlertAction actionWithTitle:@"Not Now (account stays inactive)"
                                               style:UIAlertActionStyleCancel
                                             handler:^(UIAlertAction *a) { [self _dismiss]; }]];
     [self presentViewController:alert animated:YES completion:nil];

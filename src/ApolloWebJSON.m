@@ -9,6 +9,11 @@
 NSString *const ApolloWebJSONSessionExpiredNotification = @"ApolloWebJSONSessionExpiredNotification";
 NSString *const ApolloWebJSONSyntheticBearerToken = @"apollo-webjson-cookie-session";
 
+// Marks our own /api/me.json session-verification probe so it bypasses the
+// request rewrite and the block-page expiry counter (it already targets
+// www.reddit.com with the cookie, and counting its response would be circular).
+static NSString *const kApolloWebJSONProbeHeader = @"X-Apollo-WebJSON-Probe";
+
 #pragma mark - Keychain-backed credential storage (item 4)
 
 // The harvested cookie header, modhash, and username are full account
@@ -174,8 +179,15 @@ static BOOL ApolloWebJSONWritePathIsRoutable(NSString *path) {
     if ([path hasPrefix:@"/api/v1/access_token"]) return NO;
     if ([path hasPrefix:@"/api/v1/revoke_token"]) return NO;
     if ([path hasPrefix:@"/api/v1/authorize"]) return NO;
-    // Native media uploads go straight to Reddit's media host via the
-    // ApolloImageUploadHost path; don't intercept their lease/asset POSTs.
+    // Native media uploads POST a lease to oauth.reddit.com/api/media/asset.json
+    // with a bearer token, and the lease ALWAYS stays on the oauth path. With real
+    // API keys the bearer authenticates it there; in the keyless escape hatch there
+    // is no real bearer, so the upload host short-circuits to the Imgur path and
+    // never issues this lease (a spike confirmed www.reddit.com/api/media/asset.json
+    // returns Reddit's 403 block page for cookie+modhash auth — it requires real
+    // OAuth, so routing the lease to www would only break it, including for a
+    // real-account user who also has Web JSON Mode enabled). The big multipart PUT
+    // goes to AWS S3 (self-authenticating) and is untouched either way.
     if ([path hasPrefix:@"/api/media/"]) return NO;
     if ([path isEqualToString:@"/api/v1/media/asset.json"]) return NO;
     return YES;
@@ -185,6 +197,10 @@ static BOOL ApolloWebJSONWritePathIsRoutable(NSString *path) {
 
 NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
     if (!sWebJSONEnabled || !request) return nil;
+
+    // Our own session-verification probe already targets www.reddit.com with the
+    // cookie set; leave it untouched so we don't recurse through the rewrite.
+    if ([request valueForHTTPHeaderField:kApolloWebJSONProbeHeader].length > 0) return nil;
 
     // No session → leave the oauth path untouched. Without the cookie the web
     // host serves its 403 block page, which is strictly worse than oauth.
@@ -275,10 +291,77 @@ static BOOL sSessionExpiredAnnounced = NO;
 static NSUInteger sConsecutiveBlockResponses = 0;
 static const NSUInteger kSessionExpiredBlockThreshold = 3;
 
+// Serializes the probe trigger; ApolloWebJSONNoteResponse can fire from several
+// session-delegate threads at once (the very burst that causes the false
+// positive), so the in-flight guard must be atomic.
+static NSObject *ApolloWebJSONProbeLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static BOOL sSessionProbeInFlight = NO;
+
+// Confirm the cookie is actually dead with a direct GET /api/me.json before
+// declaring expiry. A revoked/expired cookie returns the block page (or no
+// username); a transient Cloudflare/rate-limit 403 burst — common right after
+// the app resumes from a long background, when several cookie-authed requests
+// fire concurrently and all hit the block page before any 200 resets the streak
+// — still authenticates here, so we suppress the spurious "sign in again"
+// prompt. The probe is tagged so it bypasses our own rewrite + this counter.
+static void ApolloWebJSONVerifySessionThenAnnounce(void) {
+    @synchronized (ApolloWebJSONProbeLock()) {
+        if (sSessionProbeInFlight || sSessionExpiredAnnounced) return;
+        sSessionProbeInFlight = YES;
+    }
+
+    NSString *cookie = sWebSessionCookieHeader;
+    if (cookie.length == 0) {
+        @synchronized (ApolloWebJSONProbeLock()) { sSessionProbeInFlight = NO; }
+        return;
+    }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://www.reddit.com/api/me.json"]];
+    [req setValue:cookie forHTTPHeaderField:@"Cookie"];
+    [req setValue:([sUserAgent length] > 0 ? sUserAgent : defaultUserAgent) forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"1" forHTTPHeaderField:kApolloWebJSONProbeHeader];
+    req.HTTPShouldHandleCookies = NO;
+    req.timeoutInterval = 15.0;
+
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        BOOL alive = NO;
+        if (http.statusCode == 200 && data.length > 0) {
+            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            NSDictionary *d = [json isKindOfClass:[NSDictionary class]] ? json[@"data"] : nil;
+            NSString *name = [d isKindOfClass:[NSDictionary class]] ? d[@"name"] : nil;
+            alive = [name isKindOfClass:[NSString class]] && name.length > 0;
+        }
+
+        if (alive) {
+            sConsecutiveBlockResponses = 0;
+            ApolloLog(@"[WebJSON] Session probe still authenticates — suppressing false expiry prompt");
+        } else {
+            sSessionExpiredAnnounced = YES;
+            ApolloLog(@"[WebJSON] Session probe failed (HTTP %ld%@) — session expired, prompting re-login",
+                      (long)http.statusCode, error ? [@", " stringByAppendingString:error.localizedDescription] : @"");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSNotificationCenter defaultCenter] postNotificationName:ApolloWebJSONSessionExpiredNotification object:nil];
+            });
+        }
+        @synchronized (ApolloWebJSONProbeLock()) { sSessionProbeInFlight = NO; }
+        [session finishTasksAndInvalidate];
+    }];
+    [task resume];
+}
+
 void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     if (!sWebJSONEnabled || sWebSessionCookieHeader.length == 0) return;
     if (sSessionExpiredAnnounced) return;
     if (![response isKindOfClass:[NSHTTPURLResponse class]]) return;
+    // Our verification probe must not feed its own result back into the counter.
+    if ([request valueForHTTPHeaderField:kApolloWebJSONProbeHeader].length > 0) return;
 
     NSURL *url = request.URL;
     if (![url.host.lowercaseString isEqualToString:@"www.reddit.com"]) return;
@@ -315,12 +398,140 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
         return;
     }
 
-    sSessionExpiredAnnounced = YES;
-    ApolloLog(@"[WebJSON] Session appears expired — %lu consecutive 403 HTML block pages (latest %@)",
+    // Streak crossed the threshold. Don't announce yet — verify with a direct
+    // /api/me.json probe so a transient block-page burst doesn't fire a spurious
+    // prompt. The probe announces only if the cookie genuinely no longer works.
+    ApolloLog(@"[WebJSON] %lu consecutive 403 HTML block pages (latest %@) — verifying session before prompting",
               (unsigned long)sConsecutiveBlockResponses, url.absoluteString);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloWebJSONSessionExpiredNotification object:nil];
+    ApolloWebJSONVerifySessionThenAnnounce();
+}
+
+#pragma mark - Write-response shape fixup (item 4: comment edit/post re-render)
+
+// Pull the first Reddit fullname (t1_…, t3_…) out of an old-reddit "content"
+// HTML blob; it's emitted as data-fullname="t1_xxx" on the comment <div>.
+static NSString *ApolloWebJSONFullnameFromLegacyContent(NSString *html) {
+    if (html.length == 0) return nil;
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"data-fullname=\"(t[0-9]_[0-9a-z]+)\""
+                                                       options:NSRegularExpressionCaseInsensitive error:NULL];
     });
+    NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    if (m && m.numberOfRanges > 1) return [html substringWithRange:[m rangeAtIndex:1]];
+    return nil;
+}
+
+// Synchronously fetch the modern JSON `data` dict for a single thing via
+// info.json (cookie-authed, tagged so it bypasses our own rewrite + the expiry
+// counter). Called off the main thread from the response serializer.
+static NSDictionary *ApolloWebJSONFetchModernThingData(NSString *fullname) {
+    NSString *cookie = sWebSessionCookieHeader;
+    if (cookie.length == 0 || fullname.length == 0) return nil;
+
+    NSString *urlStr = [NSString stringWithFormat:@"https://www.reddit.com/api/info.json?id=%@&raw_json=1", fullname];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    [req setValue:cookie forHTTPHeaderField:@"Cookie"];
+    [req setValue:([sUserAgent length] > 0 ? sUserAgent : defaultUserAgent) forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"1" forHTTPHeaderField:kApolloWebJSONProbeHeader];
+    req.HTTPShouldHandleCookies = NO;
+    req.timeoutInterval = 15.0;
+
+    __block NSDictionary *result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        if (http.statusCode == 200 && data.length > 0) {
+            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            // info.json shape: {kind:"Listing", data:{children:[{kind, data}]}}
+            NSDictionary *d = [json isKindOfClass:[NSDictionary class]] ? json[@"data"] : nil;
+            NSArray *children = [d isKindOfClass:[NSDictionary class]] ? d[@"children"] : nil;
+            NSDictionary *first = ([children isKindOfClass:[NSArray class]] && children.count > 0) ? children[0] : nil;
+            id cd = [first isKindOfClass:[NSDictionary class]] ? first[@"data"] : nil;
+            if ([cd isKindOfClass:[NSDictionary class]]) result = cd;
+        }
+        dispatch_semaphore_signal(sem);
+        [session finishTasksAndInvalidate];
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+    return result;
+}
+
+// www.reddit.com's old-reddit /api/editusertext and /api/comment responses return
+// each thing's `data` in the legacy shape {parent, content:"<html>"} instead of
+// the modern comment JSON ({body, body_html, score, author, …}) that
+// oauth.reddit.com returns. Apollo parses things[0].data into an RDKComment, finds
+// no body/score, and re-renders the just-edited/posted comment empty with 0
+// upvotes (the write itself succeeded; only the display object is wrong). We
+// detect the legacy shape and swap in the modern object, re-fetched via info.json,
+// so the in-place re-render is correct. No-op outside Web JSON mode, on errors, on
+// the modern shape, or if the refetch fails (degrades to today's behavior).
+id ApolloWebJSONFixupWriteResponseObject(NSURLResponse *response, id responseObject) {
+    if (!ApolloWebJSONHasUsableSession()) return responseObject;
+    if (![response isKindOfClass:[NSHTTPURLResponse class]]) return responseObject;
+    // Synchronous refetch below — never block the main thread (the serializer
+    // normally runs on a background processing queue, so this is rarely hit).
+    if ([NSThread isMainThread]) return responseObject;
+
+    NSString *path = [((NSHTTPURLResponse *)response).URL.path lowercaseString] ?: @"";
+    if (!([path hasSuffix:@"/api/editusertext"] || [path hasSuffix:@"/api/comment"])) return responseObject;
+
+    // The serializer may hand us the parsed dict or the raw JSON data; handle both
+    // and return the same form so we never change the contract for the modern path.
+    BOOL wasData = NO;
+    id root = responseObject;
+    if ([responseObject isKindOfClass:[NSData class]]) {
+        id parsed = [NSJSONSerialization JSONObjectWithData:responseObject options:0 error:NULL];
+        if (![parsed isKindOfClass:[NSDictionary class]]) return responseObject;
+        root = parsed; wasData = YES;
+    } else if (![responseObject isKindOfClass:[NSDictionary class]]) {
+        return responseObject;
+    }
+
+    NSDictionary *json = root[@"json"];
+    if (![json isKindOfClass:[NSDictionary class]]) return responseObject;
+    NSArray *errors = json[@"errors"];
+    if ([errors isKindOfClass:[NSArray class]] && errors.count > 0) return responseObject; // surface the error
+    NSDictionary *dataDict = json[@"data"];
+    NSArray *things = [dataDict isKindOfClass:[NSDictionary class]] ? dataDict[@"things"] : nil;
+    if (![things isKindOfClass:[NSArray class]] || things.count == 0) return responseObject;
+
+    NSMutableArray *newThings = [things mutableCopy];
+    BOOL changed = NO;
+    for (NSUInteger i = 0; i < newThings.count; i++) {
+        NSDictionary *thing = newThings[i];
+        if (![thing isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *td = thing[@"data"];
+        if (![td isKindOfClass:[NSDictionary class]]) continue;
+        if (td[@"body"] != nil || ![td[@"content"] isKindOfClass:[NSString class]]) continue; // already modern
+
+        NSString *fullname = ApolloWebJSONFullnameFromLegacyContent(td[@"content"]);
+        NSDictionary *modern = ApolloWebJSONFetchModernThingData(fullname);
+        if (![modern isKindOfClass:[NSDictionary class]]) continue;
+
+        NSString *kind = [thing[@"kind"] isKindOfClass:[NSString class]] ? thing[@"kind"]
+                       : ([fullname hasPrefix:@"t1_"] ? @"t1" : @"t3");
+        newThings[i] = @{ @"kind": kind, @"data": modern };
+        changed = YES;
+        ApolloLog(@"[WebJSON] Rebuilt %@ response thing %@ from info.json for correct in-place render", path, fullname);
+    }
+    if (!changed) return responseObject;
+
+    NSMutableDictionary *newData = [dataDict mutableCopy];
+    newData[@"things"] = newThings;
+    NSMutableDictionary *newJson = [json mutableCopy];
+    newJson[@"data"] = newData;
+    NSMutableDictionary *newRoot = [root mutableCopy];
+    newRoot[@"json"] = newJson;
+
+    if (wasData) {
+        NSData *out = [NSJSONSerialization dataWithJSONObject:newRoot options:0 error:NULL];
+        return out ?: responseObject;
+    }
+    return newRoot;
 }
 
 #pragma mark - Credential setters / hydration

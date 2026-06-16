@@ -248,3 +248,94 @@ round-trips) — no new plumbing.
   present wipes the app container on every launch (uninstall → reinstall →
   preload) — move the zip aside while iterating on state you want to keep,
   e.g. a harvested cookie session.
+
+## Tester-feedback fixes (June 13, 2026)
+
+Five issues from the PR #442 test thread (r/ApolloReborn + GitHub). All changes
+compile for the simulator and the build launches cleanly (hooks install, no
+crash, flag-off path unaffected).
+
+1. **Spurious "session expired" prompt after backgrounding (FIXED).**
+   `ApolloWebJSONNoteResponse` counted a 3-streak of 403 text/html block pages,
+   but a concurrent Cloudflare/rate-limit burst on app resume could cross it with
+   a still-valid cookie. Now, at the threshold, `ApolloWebJSONVerifySessionThenAnnounce`
+   fires a direct `GET /api/me.json` (tagged `X-Apollo-WebJSON-Probe` so it
+   bypasses the rewrite + counter) and only announces expiry if the probe fails.
+   `src/ApolloWebJSON.m`.
+2. **Blank account tab after mid-session login (UX polished).** `AccountManager`
+   loads accounts only at init; iOS can't self-relaunch, so the restart stays but
+   the foot-guns are gone: the login alert now says "Quit & Reopen" with a clear
+   "account stays inactive" defer option, sets `UDKeyWebJSONPendingRestart`, and
+   the Web Session Login settings row shows an orange "quit & reopen to activate"
+   reminder (tapping it offers to quit) until the next launch clears the flag in
+   `%ctor`. `ApolloWebSessionLoginViewController.m`, `CustomAPIViewController.m`,
+   `Tweak.xm`, `UserDefaultConstants.h`.
+3. **Profile posts/comments list empty — ROOT CAUSE CONFIRMED & FIXED (June 15).**
+   Live sim repro (fresh u/ClydeDroid cookie) showed the Account tab spinning with
+   **zero `/user/` requests** and `[BannedProfile] … reason=no-username`. Dumping
+   the archived `RedditAccounts2` blob proved the loaded account's `currentUser`
+   (an `RDKMe`) had **no username** (NSKeyedArchiver omits nil values, so the
+   username key was simply absent; `fullName` was the broken `t2_(null)`). Karma /
+   avatar / age live on `currentUser` and render from cache without the username,
+   which is exactly why testers saw the **header but an empty listing** — the
+   listing needs `/user/<username>/overview`, which a nil username never builds.
+   **Fix:** backfill the username onto the **live** `currentUser` from the
+   harvested web-session identity (`ApolloWebJSONBackfillUsernameOnUser`), hooked
+   at `-[RDKClient setCurrentUser:]` (fires on account load) with a belt-and-
+   suspenders call in `ApolloWebJSONInstallSyntheticCredentialIfNeeded`. The
+   on-disk blob can't be repaired (`RDKMe`'s MTLModel encoding drops a re-set
+   username on re-archive — tried and verified). Confirmed in sim:
+   `Backfilled live currentUser.username -> u/ClydeDroid`, the ProfileViewController
+   then reports `username=ClydeDroid`, and `/user/ClydeDroid/overview.json` fires +
+   routes to www. `src/ApolloWebJSONIdentity.xm`.
+4. **Comment editing "not an available option" — FIXED (June 15).** Two parts:
+   (a) **Affordance** — the Edit option gates on `comment.author ==
+   currentUser.username`, so it was hidden for the same nil-username reason as #3;
+   the #3 backfill restores it (confirmed: Edit now appears, and edits persist
+   server-side). (b) **Empty re-render after save** — www.reddit.com's
+   `/api/editusertext` *and* `/api/comment` return each thing's `data` in the
+   legacy old-reddit shape `{parent, content:"<html>"}` instead of the modern
+   comment JSON oauth returns, so Apollo parsed no `body`/`score` and re-rendered
+   the comment empty with 0 upvotes (the write succeeded; only the display object
+   was wrong). **Fix:** `ApolloWebJSONFixupWriteResponseObject` (hooked at
+   `-[RDKResponseSerializer responseObjectForResponse:data:error:]`) detects the
+   legacy shape, pulls the `t1_…` fullname out of the `content` HTML, re-fetches
+   the modern object via `info.json`, and swaps it into the `things` envelope.
+   Confirmed in sim for both edit and new-comment posting (`Rebuilt /api/editusertext
+   … from info.json`, `Rebuilt /api/comment … from info.json`). Also kept the
+   earlier host-check broadening (`ApolloIsRedditWriteHost`) so write
+   post-processing survives the www rewrite. `src/ApolloWebJSON.{h,m}`,
+   `src/ApolloWebJSONIdentity.xm`, `src/ApolloImageUploadHost.xm`.
+5. **Keyless image uploads — Track A FAILED, clean Imgur fallback shipped (June 15/16).**
+   **Track A (truly keyless native Reddit upload): not viable.** Device test +
+   credential replay confirmed `www.reddit.com/api/media/asset.json` returns
+   Reddit's **403 HTML block page** for cookie+modhash auth — across every modhash
+   placement (X-Modhash header, `uh` form field, multipart, urlencoded, with/without
+   Origin/Referer). The lease endpoint requires a real OAuth bearer (Reddit's web
+   client uploads via a GraphQL mutation using a token the logged-in site embeds),
+   which the cookie-only session doesn't have. So the lease rewrite was reverted:
+   `ApolloWebJSONWritePathIsRoutable` now **always** keeps `/api/media/asset.json`
+   on the oauth path (routing it to www only 403s — and would have broken uploads
+   for a real-account user who also has Web JSON Mode on).
+   **Fallback (shipped):** in a keyless session (the resolved upload bearer is the
+   synthetic placeholder), both `NSURLSession uploadTask…` hooks now short-circuit
+   **before** attempting the doomed Reddit lease and fall back to Apollo's default
+   Imgur path; if no Imgur key is set either, a one-time alert
+   (`ApolloWarnKeylessUploadUnavailableOnce`) explains that image upload needs an
+   Imgur API key (the previous copy wrongly told users to switch the provider to
+   Reddit to upload without keys). Provider-agnostic, and inert for non-Web-JSON
+   users (the bearer is only synthetic when `HasUsableSession`). Compile-verified;
+   confirm the alert on device. `src/ApolloImageUploadHost.xm`, `src/ApolloWebJSON.m`.
+
+### Follow-up spike — harvest a web OAuth bearer (would unblock native upload)
+
+The logged-in www.reddit.com session has an OAuth access token (new reddit embeds
+one for its GraphQL calls). If the login WebView harvested that bearer alongside
+the cookie + modhash, `/api/media/asset.json` (and potentially the whole transport)
+could use a real bearer instead of cookie rewriting — making native keyless upload
+work and the mode more robust. Not yet attempted (needs RE of where the token is
+exposed + write testing with consent). Tracked as the chosen "investigate token"
+follow-up to the June 16 uploads decision.
+
+Glass IPA app-ID install limit (tester #4) is out of scope — Apple's free-account
+cap of 10 app IDs / 7 days, not a code issue.

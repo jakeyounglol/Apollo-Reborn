@@ -1017,12 +1017,22 @@ typedef NS_ENUM(NSInteger, Tag) {
                 cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
             }
             cell.textLabel.text = @"Web Session Login (Experimental)";
-            if (sWebSessionCookieHeader.length > 0) {
+            BOOL pendingRestart = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart];
+            if (pendingRestart && sWebSessionCookieHeader.length > 0) {
+                // Mid-session login synthesized an account AccountManager hasn't
+                // loaded yet — nudge the user to quit & reopen so it activates.
+                cell.detailTextLabel.text = sWebSessionUsername.length > 0
+                    ? [NSString stringWithFormat:@"Signed in as u/%@ — quit & reopen Apollo to activate", sWebSessionUsername]
+                    : @"Signed in — quit & reopen Apollo to activate";
+                cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
+            } else if (sWebSessionCookieHeader.length > 0) {
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
                 cell.detailTextLabel.text = sWebSessionUsername.length > 0
                     ? [NSString stringWithFormat:@"Signed in as u/%@%@", sWebSessionUsername,
                        sWebSessionModhash.length > 0 ? @"" : @" (read-only — no write token)"]
                     : @"Session active";
             } else {
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
                 cell.detailTextLabel.text = @"Not signed in — tap to harvest a cookie";
             }
             return cell;
@@ -1612,7 +1622,11 @@ typedef NS_ENUM(NSInteger, Tag) {
         } else if (row == kAPIKeyRowSetupGuide) {
             [self pushInstructionsViewController];
         } else if (row == kAPIKeyRowWebSessionLogin) {
-            [self presentWebSessionLoginViewController];
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart] && sWebSessionCookieHeader.length > 0) {
+                [self promptQuitToActivateWebSession];
+            } else {
+                [self presentWebSessionLoginViewController];
+            }
         } else if (row == kAPIKeyRowWidgetSetupCode) {
             [self copyWidgetSetupCode];
         }
@@ -2029,6 +2043,26 @@ typedef NS_ENUM(NSInteger, Tag) {
     ApolloWebSessionLoginViewController *vc = [[ApolloWebSessionLoginViewController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+// A mid-session web login synthesized an account that AccountManager only loads at
+// launch. Offer to quit & reopen so it activates; "Re-sign In" falls back to the
+// login flow. The pending flag clears itself on the next launch (Tweak.xm %ctor).
+- (void)promptQuitToActivateWebSession {
+    NSString *who = sWebSessionUsername.length > 0 ? [NSString stringWithFormat:@"u/%@", sWebSessionUsername] : @"your account";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Quit & Reopen to Activate"
+                         message:[NSString stringWithFormat:
+                             @"You're signed in as %@, but Apollo needs to quit and reopen to load the account and enable voting and commenting.", who]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        exit(0);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Re-sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self presentWebSessionLoginViewController];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)flairColorsSwitchToggled:(UISwitch *)sender {

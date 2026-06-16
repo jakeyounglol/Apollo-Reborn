@@ -1513,6 +1513,9 @@ static void initializeRandomSources() {
         @try { ApolloWebJSONSynthesizeSignedInAccount(); }
         @catch (NSException *e) { ApolloLog(@"[WebJSON][identity] launch synthesis failed: %@", e); }
     }
+    // This launch loads accounts fresh, so any "restart to activate" state left
+    // over from a mid-session web login is now resolved — clear the indicator.
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestart];
 
     // Redirect user to Custom API settings if no API credentials are set — but not
     // when a Web JSON cookie session is driving things (no API key is expected).

@@ -39,6 +39,15 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request);
 // and posts ApolloWebJSONSessionExpiredNotification (at most once per session).
 void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response);
 
+// Fixes up the parsed response object for cookie-routed comment writes
+// (/api/editusertext, /api/comment). www.reddit.com returns each thing's data in
+// the legacy old-reddit {parent, content:"<html>"} shape, which Apollo can't
+// render (the just-edited/posted comment shows empty with 0 upvotes); this swaps
+// in the modern comment JSON re-fetched via info.json. Returns the input
+// unchanged outside Web JSON mode or when the shape is already modern. Called
+// from the RDKResponseSerializer hook with the serializer's output.
+id ApolloWebJSONFixupWriteResponseObject(NSURLResponse *response, id responseObject);
+
 // Updates sWebSessionCookieHeader and persists it to the keychain (nil/empty
 // clears). Called by ApolloWebSessionLoginViewController after harvesting.
 void ApolloWebJSONSetSessionCookieHeader(NSString *cookieHeader);
