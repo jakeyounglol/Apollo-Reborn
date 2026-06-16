@@ -67,7 +67,11 @@ static CGFloat const kApolloHLCardSpacing = 10.0;
 static CGFloat const kApolloHLSidePadding = 16.0;
 static CGFloat const kApolloHLTitleRowHeight = 26.0;
 static CGFloat const kApolloHLTopPadding = 6.0;
-static CGFloat const kApolloHLBottomPadding = 6.0;
+// Gap between the cards and the kept ThickSeparator below. Matched to a feed post's
+// own bottom content inset (measured 13pt: a post's last content sits 13pt above its
+// separator), so the carousel→separator spacing equals the feed's post→separator
+// spacing — the cards relate to the breaker exactly like a post does.
+static CGFloat const kApolloHLBottomPadding = 13.0;
 static NSInteger const kApolloHLFetchLimit = 15;
 
 #pragma mark - Associated-object keys
@@ -85,6 +89,7 @@ static const void *kApolloHLTeardownMarkerKey  = &kApolloHLTeardownMarkerKey; //
 static const void *kApolloHLActiveSubKey       = &kApolloHLActiveSubKey;      // NSString sub added to the hide-set by this VC
 static const void *kApolloHLContainerKey       = &kApolloHLContainerKey;      // ApolloHLHeaderContainerView on the VC (headers-on coexistence)
 static char kApolloHLHiddenRowsKey;            // NSMutableSet<NSNumber*> of de-duped sticky rows, per ASTableNode
+static char kApolloHLStickyCountKey;           // NSNumber (REST sticky count N) per feed ASTableNode — breaker rule
 
 #pragma mark - Subreddit detection (adapted from ApolloSubredditHeaders.xm)
 
@@ -255,6 +260,17 @@ static NSMutableSet<NSString *> *ApolloHLDidCollapseSubs(void) {
     static NSMutableSet *set; static dispatch_once_t once;
     dispatch_once(&once, ^{ set = [NSMutableSet set]; });
     return set;
+}
+
+// Lowercased subreddit -> number of leading stickied posts the REST `hot` fetch
+// returned (= the number of inline cells we de-dup). Set ONLY from the REST parse
+// (never the web upgrade, which inflates the carousel beyond the inline stickies),
+// so the separators can keep exactly the LAST orphan as the single breaker without
+// racing the cell layout. Survives across the web upgrade.
+static NSMutableDictionary<NSString *, NSNumber *> *ApolloHLStickyCount(void) {
+    static NSMutableDictionary *d; static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
 }
 
 #pragma mark - Per-subreddit collapsed state (persisted)
@@ -506,6 +522,8 @@ static void ApolloHLFetchHighlights(NSString *subredditName, void (^completion)(
             // Only cache a successful response (200 / parsed). On error, leave it
             // uncached so a later layout pass can retry.
             if (status == 200 || items.count > 0) ApolloHLCache()[key] = items;
+            // Record the inline-sticky count (REST only) for the breaker rule.
+            if (status == 200) ApolloHLStickyCount()[key] = @(items.count);
             if (completion) completion(items);
         });
     }] resume];
@@ -981,6 +999,8 @@ static void ApolloHLClearDeDup(NSString *subreddit) {
 }
 @end
 
+static void ApolloHLApplyStickyCountToTable(UIViewController *vc, NSString *subreddit); // defined near ApolloHLInstall
+
 UIView *ApolloHLHeaderOriginalSubstitute(NSString *subreddit, UIViewController *hostVC, UIView *realOriginalHeader, CGFloat width) {
     if (!sCommunityHighlights || subreddit.length == 0) return realOriginalHeader;
     NSString *sub = subreddit.lowercaseString;
@@ -1019,6 +1039,7 @@ UIView *ApolloHLHeaderOriginalSubstitute(NSString *subreddit, UIViewController *
                 if (![c isKindOfClass:[ApolloHLHeaderContainerView class]] || c.hlCarouselView) return;
                 CGFloat w = c.bounds.size.width > 0 ? c.bounds.size.width : fetchWidth;
                 [c installCarousel:ApolloHLBuildCarousel(sub, fetched, w)];
+                ApolloHLApplyStickyCountToTable(postsVC, sub); // headers mode: publish N now that the REST fetch landed
                 UIView *wrapper = c.superview;
                 UITableView *tv = ApolloHLFindTableView(postsVC);
                 if (wrapper && tv && tv.tableHeaderView == wrapper) {
@@ -1327,6 +1348,30 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
 static char kApolloHLSepScheduledKey; // per-VC guard: which sub we've scheduled separator passes for
 static void ApolloHLCollapseOrphanSeparators(UIViewController *vc); // defined with the de-dup helpers
 
+// Publish the REST sticky count N onto the feed's ASTableNode so the separators can
+// keep exactly the LAST orphan as the breaker (race-free; see ShouldCollapse). When N
+// first becomes known (or changes), force a re-measure so a cold-load fallback that
+// collapsed the wrong separator is corrected. No-op when N is unchanged, so warm loads
+// (N already published before cells measure) never re-measure.
+static void ApolloHLApplyStickyCountToTable(UIViewController *vc, NSString *subreddit) {
+    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+    NSNumber *stickyN = ApolloHLStickyCount()[subreddit.lowercaseString];
+    if (!tableNode || !stickyN) return;
+    NSNumber *prev = objc_getAssociatedObject(tableNode, &kApolloHLStickyCountKey);
+    if ([prev isEqualToNumber:stickyN]) return;
+    objc_setAssociatedObject(tableNode, &kApolloHLStickyCountKey, stickyN, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // The cold-load fallback collapses exactly the first separator (row 1) — correct
+    // only for the common 2-sticky feed. When N differs (a single sticky that lost its
+    // breaker, or 3+ that kept an orphan), the already-measured separators are wrong and
+    // Texture won't re-measure them via relayoutItems alone (it reuses the cached size),
+    // so reload to re-run the exact rule. N==2 needs nothing — the fallback already matched,
+    // so the common case never reloads (no flash).
+    if (stickyN.integerValue != 2 && [tableNode respondsToSelector:@selector(reloadData)]) {
+        ApolloLog(@"[Highlights] r/%@ sticky count N=%@ → reload to fix breaker", subreddit, stickyN);
+        ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
+    }
+}
+
 static void ApolloHLInstall(UIViewController *vc) {
     if (!vc) return;
 
@@ -1346,6 +1391,13 @@ static void ApolloHLInstall(UIViewController *vc) {
     UITableView *tableView = ApolloHLFindTableView(vc);
     if (!tableView) return;
 
+    // Tell this feed's separators how many leading stickies will collapse, so the
+    // breaker (the LAST orphan separator) is kept race-free. The count is known
+    // synchronously from the cached REST fetch on warm loads — before cells measure —
+    // so the breaker is correct on the first frame. On a cold first load it isn't
+    // known yet; the separators fall back to the common-case rule and the reactive
+    // pass + post-fetch re-install correct them (masked by the carousel popping in).
+    ApolloHLApplyStickyCountToTable(vc, subreddit);
 
     // De-dup collapses the leading stickied posts but leaves their trailing
     // separators, doubling the breaker below the carousel. Collapse the orphaned
@@ -1418,6 +1470,7 @@ static void ApolloHLInstall(UIViewController *vc) {
             if (![ApolloHLSubredditName(postsVC) isEqualToString:subreddit]) return;
             UITableView *tv = ApolloHLFindTableView(postsVC);
             if (tv) ApolloHLInstallCarousel(postsVC, tv, items, subreddit);
+            ApolloHLApplyStickyCountToTable(postsVC, subreddit); // N now known from this fetch
         });
     });
 }
@@ -1485,10 +1538,14 @@ static BOOL ApolloHLNodeIsPostCell(id node) {
 // = {NSInteger unit; CGFloat value}; unit 1 = ASDimensionUnitPoints.
 static void ApolloHLZeroNodeHeight(id node) {
     id style = [node respondsToSelector:@selector(style)] ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(style)) : nil;
-    if ([style respondsToSelector:@selector(setHeight:)]) {
-        typedef struct { NSInteger unit; CGFloat value; } ApolloHLDim;
-        ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setHeight:), (ApolloHLDim){1, 0.0});
-    }
+    if (!style) return;
+    typedef struct { NSInteger unit; CGFloat value; } ApolloHLDim;
+    ApolloHLDim zero = {1, 0.0}; // {ASDimensionUnitPoints, 0}
+    // Clamp every height input: the node may derive 8pt from minHeight/maxHeight or a
+    // preferredSize rather than `height`, so zero them all (maxHeight=0 forces ≤0).
+    if ([style respondsToSelector:@selector(setHeight:)])    ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setHeight:), zero);
+    if ([style respondsToSelector:@selector(setMinHeight:)]) ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setMinHeight:), zero);
+    if ([style respondsToSelector:@selector(setMaxHeight:)]) ((void (*)(id, SEL, ApolloHLDim))objc_msgSend)(style, @selector(setMaxHeight:), zero);
 }
 
 // FLASH-FREE first-layout collapse. The reactive pass above only runs AFTER cells
@@ -1532,23 +1589,21 @@ static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
     if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return NO;
     NSInteger r = ApolloHLNodeRow(sepNode);
     if (r < 1) return NO;
-    // Texture lays separators out BEFORE the sticky posts, so a separator can't yet
-    // confirm its neighbours are stickies (the set is empty) — the neighbour approach
-    // loses the race and the breaker visibly shrinks afterwards. But the separator
-    // DOES know its row. Stickied posts are always first, so row 0 is the 1st sticky
-    // and ROW 1 is its trailing breaker — exactly the orphaned one to drop in the
-    // common 2-sticky feed. Collapsing row 1 by index is race-free (no dependency on
-    // the posts laying out), so it's correct from the very first frame. For a rare
-    // single-sticky sub row 1 is the real breaker, so it's simply absent below the
-    // carousel (the carousel's own bottom gap stands in); no shrink either way.
-    if (r == 1) return YES;
-    // r >= 3 (a 3rd+ sticky, very rare): only if confirmed between two recorded stickies.
     id owning = ApolloHLOwningTableNode(sepNode);
-    if (!owning) return NO;
-    @synchronized(owning) {
-        NSMutableSet *set = ApolloHLHiddenRowsSet(owning, NO);
-        return set && [set containsObject:@(r - 1)] && [set containsObject:@(r + 1)];
+    // Race-free exact rule when the inline-sticky count N is known (warm loads):
+    // stickies occupy rows 0..2N-1; their separators are the odd rows 1,3,…,2N-1; the
+    // breaker is the LAST one (row 2N-1). Collapse every separator before it. This is
+    // correct for any N from the FIRST measure — including N==1 (2N-1==1, so r<1 is
+    // false and the lone separator is kept as the breaker).
+    NSNumber *n = owning ? objc_getAssociatedObject(owning, &kApolloHLStickyCountKey) : nil;
+    if (n) {
+        NSInteger N = n.integerValue;
+        return N >= 1 && r < (2 * N - 1);
     }
+    // N not known yet (cold first load, before the REST fetch lands). Fall back to the
+    // common 2-sticky case: collapse the first orphan (row 1) race-free. The reactive
+    // pass + the post-fetch re-install fix any other count once N is known.
+    return r == 1;
 }
 
 static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
@@ -1669,9 +1724,32 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 // de-duped (flag set by ApolloHLCollapseOrphanSeparators), so the carousel→feed
 // breaker matches the single post→post one instead of doubling up.
 %hook _TtC6Apollo22ThickSeparatorCellNode
+// Zero the fixed style.height BEFORE the measure runs — setting it inside
+// layoutSpecThatFits is too late (the first measure already used the built-in 8pt,
+// so the breaker only shrank on a later re-measure/scroll).
+- (id)calculateLayoutThatFits:(struct ApolloHLSizeRange)constrainedSize {
+    if (!ApolloHLSeparatorShouldCollapse(self)) return %orig;
+    ApolloHLZeroNodeHeight(self);
+    id layout = %orig;
+    // DEFINITIVE collapse: the node's measured size IS whatever calculateLayoutThatFits
+    // returns, so override it directly. style/spec zeroing alone is ignored by
+    // ThickSeparatorCellNode (it bakes in its 8pt height), so returning a 0-height
+    // ASLayout for the same element is the only thing that genuinely collapses the cell.
+    if (layout) {
+        CGSize s = ((CGSize (*)(id, SEL))objc_msgSend)(layout, @selector(size));
+        if (s.height > 0.0) {
+            Class ASLayoutCls = objc_getClass("ASLayout");
+            if (ASLayoutCls) {
+                id zero = ((id (*)(id, SEL, id, CGSize))objc_msgSend)(ASLayoutCls, @selector(layoutWithLayoutElement:size:), self, CGSizeMake(s.width, 0.0));
+                if (zero) return zero;
+            }
+        }
+    }
+    return layout;
+}
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
     if (ApolloHLSeparatorShouldCollapse(self)) {
-        ApolloHLZeroNodeHeight(self); // collapse on first layout (no thick-then-thin flash)
+        ApolloHLZeroNodeHeight(self);
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
