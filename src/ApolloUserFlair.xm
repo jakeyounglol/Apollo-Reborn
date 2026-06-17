@@ -7,6 +7,15 @@ static char kApolloUserFlairEditorPresentedKey;
 static char kApolloUserFlairCapturedOptionsKey;
 static char kApolloUserFlairCollapseModelKey;
 static char kApolloUserFlairCurrentFlairKey;
+static char kApolloUserFlairCssByTemplateKey;   // template_id -> css_class (trimmed)
+static char kApolloUserFlairSpriteMapKey;        // css_class -> @{url,x,y,w,h,round}
+static char kApolloUserFlairSpriteFetchedKey;    // @YES once sprite-data fetch started
+// Per-option PERSISTENT display flairs for old-reddit css-class templates. Unlike
+// the thread-local override below, this is read by Apollo's async ASDK layout pass
+// (which runs after the node block returns, when the thread-local is gone), so the
+// sprite/name actually renders. Only `flairs` is overridden — textRepresentation is
+// left as the template's real (empty) text so committing the selection is unchanged.
+static char kApolloUserFlairOptionDisplayFlairsKey;
 
 static const NSUInteger kApolloUserFlairMaxLength = 64;
 
@@ -1201,7 +1210,17 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairCollapseModelFor(UIViewContr
     ApolloUserFlairCollapseModel *cached = objc_getAssociatedObject(controller, &kApolloUserFlairCollapseModelKey);
     if (cached && cached.sourcePtr == (__bridge const void *)options) return cached;
 
-    ApolloUserFlairCollapseModel *model = ApolloUserFlairBuildCollapseModel(options);
+    ApolloUserFlairCollapseModel *model;
+    NSDictionary *cssByTemplate = objc_getAssociatedObject(controller, &kApolloUserFlairCssByTemplateKey);
+    if ([cssByTemplate isKindOfClass:[NSDictionary class]] && cssByTemplate.count > 0) {
+        // These are real old-reddit flairs (rendered via css_class sprites/names) —
+        // show every one as its own row instead of collapsing to a "custom" row.
+        model = [ApolloUserFlairCollapseModel new];
+        model.customRealRow = NSNotFound;
+        model.active = NO;
+    } else {
+        model = ApolloUserFlairBuildCollapseModel(options);
+    }
     model.sourcePtr = (__bridge const void *)options;
     objc_setAssociatedObject(controller, &kApolloUserFlairCollapseModelKey, model, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (model.active) {
@@ -1348,6 +1367,260 @@ static NSString *ApolloUserFlairCurrentFlairTextForOption(UIViewController *cont
     return ApolloUserFlairOptionIsBlankEditable(option) ? text : nil;
 }
 
+#pragma mark - Old-Reddit CSS Sprite Flairs
+//
+// Subreddits like r/nintendo keep their "real" flairs in the old-reddit stylesheet:
+// each template carries a flair_css_class whose image is a region of a sprite sheet
+// defined in CSS. New Reddit / Apollo drop the css_class + sprite, so these come back
+// as blank "custom" templates. We recover them: fetch flairselector (template_id ->
+// css_class) and the stylesheet, parse the common single-sheet sprite pattern, crop
+// each flair's region, and render the real avatar in the selector. Subreddits whose
+// CSS we can't safely parse (e.g. r/dbz's multi-sheet attribute selectors) fall back
+// to the prettified css_class name; genuinely-empty subs keep the collapse behaviour.
+
+static NSString *ApolloUserFlairRegexSub(NSString *s, NSString *pattern, NSString *tmpl) {
+    if (s.length == 0) return s;
+    return [s stringByReplacingOccurrencesOfString:pattern withString:tmpl
+              options:NSRegularExpressionSearch range:NSMakeRange(0, s.length)];
+}
+
+// Prettify a css_class for display: drop a trailing numeric variant, split camelCase
+// and separators, title-case. "princessPeach"->"Princess Peach", "Beerus-001"->"Beerus".
+static NSString *ApolloUserFlairPrettifyClass(NSString *cssClass) {
+    NSString *s = [cssClass stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (s.length == 0) return nil;
+    s = ApolloUserFlairRegexSub(s, @"[-_]?[0-9]{1,4}$", @"");
+    s = ApolloUserFlairRegexSub(s, @"[-_]+", @" ");
+    s = ApolloUserFlairRegexSub(s, @"([a-z])([A-Z])", @"$1 $2");
+    s = ApolloUserFlairRegexSub(s, @"([A-Za-z])([0-9])", @"$1 $2");
+    s = ApolloUserFlairRegexSub(s, @"([0-9])([A-Za-z])", @"$1 $2");
+    s = ApolloUserFlairRegexSub(s, @"\\s+", @" ");
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (s.length == 0) return nil;
+    return [s capitalizedString];
+}
+
+static NSCache<NSString *, UIImage *> *ApolloUserFlairSheetCache(void) {
+    static NSCache *c = nil; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = [NSCache new]; c.countLimit = 8; });
+    return c;
+}
+
+// css_class -> cropped sprite file:// URL (so the native flair cell can load it).
+static NSMutableDictionary<NSString *, NSString *> *ApolloUserFlairSpriteFileCache(void) {
+    static NSMutableDictionary *d = nil; static dispatch_once_t o;
+    dispatch_once(&o, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// Filename prefix that marks our locally-cropped sprite files, recognised by the
+// ASNetworkImageNode hook below (its HTTP-only downloader can't load file:// URLs,
+// so we intercept and set the in-memory cropped UIImage directly).
+static NSString *const kApolloUserFlairSpriteFilePrefix = @"apolloflair_";
+
+// file path -> cropped UIImage, so the image-node hook serves the exact crop
+// without re-decoding from disk (and at the right scale).
+static NSMutableDictionary<NSString *, UIImage *> *ApolloUserFlairSpriteImageByPath(void) {
+    static NSMutableDictionary *d = nil; static dispatch_once_t o;
+    dispatch_once(&o, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+static NSString *ApolloUserFlairFirstGroup(NSString *str, NSString *pattern) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:NULL];
+    NSTextCheckingResult *m = [re firstMatchInString:str options:0 range:NSMakeRange(0, str.length)];
+    return (m && m.numberOfRanges > 1) ? [str substringWithRange:[m rangeAtIndex:1]] : nil;
+}
+
+// Parse the common single-sprite-sheet pattern. Returns css_class -> @{url,x,y,w,h,round}
+// or nil when the stylesheet uses a layout we can't safely map (multiple sheets,
+// attribute selectors, etc.) so callers fall back to names.
+static NSDictionary *ApolloUserFlairParseSpriteCSS(NSString *css, NSArray *images) {
+    if (css.length == 0) return nil;
+    NSMutableDictionary *imgURL = [NSMutableDictionary dictionary];
+    for (NSDictionary *im in images) {
+        if ([im[@"name"] isKindOfClass:[NSString class]] && [im[@"url"] isKindOfClass:[NSString class]]) imgURL[im[@"name"]] = im[@"url"];
+    }
+
+    NSRegularExpression *ruleRe = [NSRegularExpression regularExpressionWithPattern:@"([^{}]*)\\{([^{}]*)\\}" options:0 error:NULL];
+    NSArray *rules = [ruleRe matchesInString:css options:0 range:NSMakeRange(0, css.length)];
+
+    // Base rule: a plain `.flair` / `.flair:before` (NOT .flair-x, NOT .flair[attr])
+    // with background-image url + width + height. Reject subs with >1 distinct flair
+    // sheet (multi-sheet) — too ambiguous to map by class alone.
+    NSString *sheetURL = nil; CGFloat W = 0, H = 0; BOOL round = NO;
+    NSMutableSet *flairSheets = [NSMutableSet set];
+    for (NSTextCheckingResult *m in rules) {
+        NSString *sel = [css substringWithRange:[m rangeAtIndex:1]];
+        NSString *body = [css substringWithRange:[m rangeAtIndex:2]];
+        if ([body rangeOfString:@"background-image"].location == NSNotFound) continue;
+        if ([body rangeOfString:@"background-position"].location != NSNotFound) continue;
+        // does this rule target flairs (a bare .flair token)?
+        if ([sel rangeOfString:@"\\.flair(?![\\w\\[-])" options:NSRegularExpressionSearch].location == NSNotFound) continue;
+        NSString *nm = ApolloUserFlairFirstGroup(body, @"background-image\\s*:\\s*url\\(\\s*[\"']?%%([^%]+)%%");
+        NSString *resolved = nm ? imgURL[nm] : nil;
+        if (!resolved) {
+            NSString *direct = ApolloUserFlairFirstGroup(body, @"background-image\\s*:\\s*url\\(\\s*[\"']?(https?://[^\"')]+)");
+            if (direct) resolved = direct;
+        }
+        if (!resolved) continue;
+        [flairSheets addObject:resolved];
+        if (!sheetURL) {
+            NSString *ws = ApolloUserFlairFirstGroup(body, @"width\\s*:\\s*([0-9.]+)px");
+            NSString *hs = ApolloUserFlairFirstGroup(body, @"height\\s*:\\s*([0-9.]+)px");
+            if (ws.doubleValue > 0 && hs.doubleValue > 0) {
+                sheetURL = resolved; W = ws.doubleValue; H = hs.doubleValue;
+                round = ([body rangeOfString:@"border-radius"].location != NSNotFound);
+            }
+        }
+    }
+    if (!sheetURL || flairSheets.count != 1) return nil; // unparseable / multi-sheet
+
+    NSRegularExpression *clsRe = [NSRegularExpression regularExpressionWithPattern:@"\\.flair-([A-Za-z0-9_-]+)" options:0 error:NULL];
+    NSRegularExpression *posRe = [NSRegularExpression regularExpressionWithPattern:@"background-position\\s*:\\s*(-?[0-9.]+)(?:px)?\\s+(-?[0-9.]+)(?:px)?" options:0 error:NULL];
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *m in rules) {
+        NSString *sel = [css substringWithRange:[m rangeAtIndex:1]];
+        NSString *body = [css substringWithRange:[m rangeAtIndex:2]];
+        NSTextCheckingResult *bp = [posRe firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+        if (!bp) continue;
+        CGFloat bx = [[body substringWithRange:[bp rangeAtIndex:1]] doubleValue];
+        CGFloat by = [[body substringWithRange:[bp rangeAtIndex:2]] doubleValue];
+        CGFloat w = W, h = H;
+        NSString *ws = ApolloUserFlairFirstGroup(body, @"width\\s*:\\s*([0-9.]+)px");
+        NSString *hs = ApolloUserFlairFirstGroup(body, @"height\\s*:\\s*([0-9.]+)px");
+        if (ws.doubleValue > 0) w = ws.doubleValue;
+        if (hs.doubleValue > 0) h = hs.doubleValue;
+        for (NSTextCheckingResult *cm in [clsRe matchesInString:sel options:0 range:NSMakeRange(0, sel.length)]) {
+            NSString *cls = [sel substringWithRange:[cm rangeAtIndex:1]];
+            if (map[cls]) continue;
+            map[cls] = @{ @"url": sheetURL, @"x": @(-bx), @"y": @(-by), @"w": @(w), @"h": @(h), @"round": @(round) };
+        }
+    }
+    return map.count ? map : nil;
+}
+
+// Crop css_class's sprite from its (already-downloaded) sheet, write a temp PNG, and
+// return a file:// URL. nil if the sheet isn't cached yet or the region is invalid.
+static NSString *ApolloUserFlairSpriteFileForClass(UIViewController *controller, NSString *cssClass) {
+    if (cssClass.length == 0) return nil;
+    NSString *cached;
+    @synchronized (ApolloUserFlairSpriteFileCache()) { cached = ApolloUserFlairSpriteFileCache()[cssClass]; }
+    if (cached) return cached;
+    NSDictionary *spriteMap = objc_getAssociatedObject(controller, &kApolloUserFlairSpriteMapKey);
+    NSDictionary *region = spriteMap[cssClass];
+    if (![region isKindOfClass:[NSDictionary class]]) return nil;
+    UIImage *sheet = [ApolloUserFlairSheetCache() objectForKey:region[@"url"]];
+    if (!sheet || !sheet.CGImage) return nil;
+    CGFloat scale = sheet.scale > 0 ? sheet.scale : 1.0;
+    CGRect r = CGRectMake([region[@"x"] doubleValue] * scale, [region[@"y"] doubleValue] * scale,
+                          [region[@"w"] doubleValue] * scale, [region[@"h"] doubleValue] * scale);
+    size_t sw = CGImageGetWidth(sheet.CGImage), sh = CGImageGetHeight(sheet.CGImage);
+    if (r.size.width <= 0 || r.size.height <= 0 || r.origin.x < 0 || r.origin.y < 0 ||
+        CGRectGetMaxX(r) > sw + 1 || CGRectGetMaxY(r) > sh + 1) return nil;
+    CGImageRef crop = CGImageCreateWithImageInRect(sheet.CGImage, r);
+    if (!crop) return nil;
+    UIImage *img = [UIImage imageWithCGImage:crop scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(crop);
+    NSData *png = UIImagePNGRepresentation(img);
+    if (!png) return nil;
+    NSString *safe = [cssClass stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet alphanumericCharacterSet]] ?: @"f";
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@%@.png", kApolloUserFlairSpriteFilePrefix, safe]];
+    if (![png writeToFile:path atomically:YES]) return nil;
+    // Keep the exact crop in memory so the ASNetworkImageNode hook can serve it
+    // directly (its HTTP downloader can't load file:// URLs).
+    @synchronized (ApolloUserFlairSpriteImageByPath()) { ApolloUserFlairSpriteImageByPath()[path] = img; }
+    NSString *fileURL = [[NSURL fileURLWithPath:path] absoluteString];
+    @synchronized (ApolloUserFlairSpriteFileCache()) { ApolloUserFlairSpriteFileCache()[cssClass] = fileURL; }
+    return fileURL;
+}
+
+// css_class for an option (via the template_id -> css_class map). nil if none.
+static NSString *ApolloUserFlairCssClassForOption(UIViewController *controller, id option) {
+    NSDictionary *byTemplate = objc_getAssociatedObject(controller, &kApolloUserFlairCssByTemplateKey);
+    if (![byTemplate isKindOfClass:[NSDictionary class]] || byTemplate.count == 0) return nil;
+    NSString *tid = ApolloUserFlairOptionIdentifier(option);
+    NSString *css = tid ? byTemplate[tid] : nil;
+    return css.length ? css : nil;
+}
+
+// Fetch flairselector (css_class per template) + the stylesheet (sprite sheets), then
+// reload so rows can render real sprites/names. One-shot per controller.
+static void ApolloUserFlairFetchSpriteData(UIViewController *controller, NSString *subreddit) {
+    if (!controller || subreddit.length == 0) return;
+    if (objc_getAssociatedObject(controller, &kApolloUserFlairSpriteFetchedKey)) return;
+    objc_setAssociatedObject(controller, &kApolloUserFlairSpriteFetchedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *token = [sLatestRedditBearerToken copy];
+    if (token.length == 0) return;
+    NSString *enc = [subreddit stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: subreddit;
+    __weak UIViewController *wc = controller;
+
+    void (^reload)(void) = ^{
+        UIViewController *c = wc; if (!c) return;
+        // Drop the cached collapse model so it rebuilds (css-class subs stop collapsing).
+        objc_setAssociatedObject(c, &kApolloUserFlairCollapseModelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        id tableNode = ApolloUserFlairRawObjectIvar(c, @"tableNode");
+        if ([tableNode respondsToSelector:@selector(reloadData)]) ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
+    };
+
+    NSMutableURLRequest *fs = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://oauth.reddit.com/r/%@/api/flairselector?raw_json=1", enc]]];
+    fs.HTTPMethod = @"POST"; fs.HTTPBody = [NSData data];
+    [fs setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [fs setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+    [fs setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:fs completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+        id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        NSArray *choices = [j isKindOfClass:[NSDictionary class]] ? j[@"choices"] : nil;
+        NSMutableDictionary *byTemplate = [NSMutableDictionary dictionary];
+        for (NSDictionary *ch in (choices ?: @[])) {
+            NSString *tid = ch[@"flair_template_id"];
+            NSString *css = ch[@"flair_css_class"];
+            if ([tid isKindOfClass:[NSString class]] && [css isKindOfClass:[NSString class]]) {
+                NSString *trimmed = [css stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (trimmed.length) byTemplate[tid] = trimmed;
+            }
+        }
+        if (byTemplate.count == 0) return; // no css-class flairs — leave default behaviour
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *c = wc; if (!c) return;
+            objc_setAssociatedObject(c, &kApolloUserFlairCssByTemplateKey, byTemplate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            ApolloLog(@"[UserFlair] css-class flairs: %lu templates", (unsigned long)byTemplate.count);
+            reload(); // show prettified names immediately
+
+            // Now fetch the stylesheet + parse + download sprite sheets.
+            NSMutableURLRequest *ss = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://oauth.reddit.com/r/%@/about/stylesheet?raw_json=1", enc]]];
+            [ss setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+            [ss setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+            [[[NSURLSession sharedSession] dataTaskWithRequest:ss completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2) {
+                id j2 = d2 ? [NSJSONSerialization JSONObjectWithData:d2 options:0 error:NULL] : nil;
+                NSDictionary *dd = [j2 isKindOfClass:[NSDictionary class]] ? j2[@"data"] : nil;
+                NSString *cssStr = [dd[@"stylesheet"] isKindOfClass:[NSString class]] ? dd[@"stylesheet"] : nil;
+                NSArray *imgs = [dd[@"images"] isKindOfClass:[NSArray class]] ? dd[@"images"] : @[];
+                NSDictionary *spriteMap = cssStr ? ApolloUserFlairParseSpriteCSS(cssStr, imgs) : nil;
+                if (spriteMap.count == 0) { ApolloLog(@"[UserFlair] sprite CSS not parseable — using names"); return; }
+                NSSet *sheetURLs = [NSSet setWithArray:[spriteMap.allValues valueForKeyPath:@"url"]];
+                ApolloLog(@"[UserFlair] sprite map: %lu classes, %lu sheet(s)", (unsigned long)spriteMap.count, (unsigned long)sheetURLs.count);
+                dispatch_group_t grp = dispatch_group_create();
+                for (NSString *u in sheetURLs) {
+                    if ([ApolloUserFlairSheetCache() objectForKey:u]) continue;
+                    NSURL *url = [NSURL URLWithString:u]; if (!url) continue;
+                    dispatch_group_enter(grp);
+                    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *id_, NSURLResponse *ir, NSError *ie) {
+                        UIImage *im = id_ ? [UIImage imageWithData:id_] : nil;
+                        if (im) [ApolloUserFlairSheetCache() setObject:im forKey:u];
+                        dispatch_group_leave(grp);
+                    }] resume];
+                }
+                dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
+                    UIViewController *c2 = wc; if (!c2) return;
+                    objc_setAssociatedObject(c2, &kApolloUserFlairSpriteMapKey, spriteMap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    reload(); // now sprites can crop+render
+                });
+            }] resume];
+        });
+    }] resume];
+}
+
 // YES when the presenter chain contains Apollo's flair selector. Used to scope
 // alert suppression to that screen. NOTE: Apollo presents this alert *before* it
 // stores self.flairOptions (verified in the binary), so the collapse model is not
@@ -1403,6 +1676,7 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
     if (section == kApolloUserFlairOptionsSection) {
         NSString *sub = ApolloUserFlairCleanSubredditName(ApolloUserFlairSubredditNameFromObject((UIViewController *)self, 0));
         ApolloUserFlairFetchCurrentFlair((UIViewController *)self, sub);
+        ApolloUserFlairFetchSpriteData((UIViewController *)self, sub);
         ApolloUserFlairCollapseModel *model = ApolloUserFlairCollapseModelFor((UIViewController *)self);
         if (model.active) return (NSInteger)model.realRows.count;
     }
@@ -1452,34 +1726,74 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
             }
         } else if (realRow >= 0 && realRow < (NSInteger)options.count) {
             id opt = options[realRow];
-            NSString *currentText = ApolloUserFlairCurrentFlairTextForOption((UIViewController *)self, opt);
-            // When templates are collapsed into one representative row, the current
-            // flair may live on a different (hidden) empty template — they're all
-            // equivalent, so show it on the representative regardless of which one.
-            if (currentText.length == 0 && isCustomRow) {
-                NSDictionary *cur = objc_getAssociatedObject((UIViewController *)self, &kApolloUserFlairCurrentFlairKey);
-                NSString *t = cur[@"text"];
-                if ([t isKindOfClass:[NSString class]] && t.length > 0) currentText = t;
-            }
-            BOOL blankEditable = ApolloUserFlairOptionIsBlankEditable(opt);
-            if (currentText.length > 0) {
-                NSString *sub = ApolloUserFlairCleanSubredditName(ApolloUserFlairSubredditNameFromObject((UIViewController *)self, 0));
-                NSArray *pieces = ApolloUserFlairPiecesFromFlairText(currentText, sub.lowercaseString);
+
+            // Old-reddit CSS-class flair: show the prettified class name as the row
+            // label, plus the real cropped sprite (when the stylesheet parsed) as an
+            // image alongside it. Both are persisted on the option so Apollo's async
+            // layout pass renders them (the thread-locals are cleared by then);
+            // textRepresentation drives the label, `flairs` the sprite image. The
+            // committed selection is the bare template (we never touch the model).
+            NSString *cssClass = ApolloUserFlairCssClassForOption((UIViewController *)self, opt);
+            if (cssClass) {
+                NSString *name = ApolloUserFlairPrettifyClass(cssClass);
+                NSString *spriteFile = ApolloUserFlairSpriteFileForClass((UIViewController *)self, cssClass);
+                // The selector cell renders an option's `flairs` pieces (it ignores
+                // textRepresentation), so build the row from pieces: the real cropped
+                // sprite (when the stylesheet parsed) followed by the prettified class
+                // name, so near-identical sprites (e.g. the many Marios) stay legible.
+                // When the sheet can't be parsed we fall back to the name alone.
+                NSMutableArray *pieces = [NSMutableArray array];
+                if (spriteFile) {
+                    id sprite = ApolloUserFlairMakeEmojiFlair(cssClass, spriteFile);
+                    if (sprite) [pieces addObject:sprite];
+                }
+                if (name.length) {
+                    NSString *label = pieces.count ? [@" " stringByAppendingString:name] : name;
+                    id text = ApolloUserFlairMakeTextFlair(label);
+                    if (text) [pieces addObject:text];
+                }
                 if (pieces.count) {
+                    // Persist on the option so Apollo's async layout pass renders it
+                    // (the thread-local override below is cleared by then). Only
+                    // `flairs` is overridden — textRepresentation is left as the
+                    // template's real (empty) text, so committing selects the bare
+                    // template, never our synthetic display text.
+                    objc_setAssociatedObject(opt, &kApolloUserFlairOptionDisplayFlairsKey, pieces, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                     customRowOption = opt;
                     customRowFlairs = pieces;
-                    customRowText = currentText;
+                }
+            }
+
+            if (!customRowOption) {
+                NSString *currentText = ApolloUserFlairCurrentFlairTextForOption((UIViewController *)self, opt);
+                // When templates are collapsed into one representative row, the current
+                // flair may live on a different (hidden) empty template — they're all
+                // equivalent, so show it on the representative regardless of which one.
+                if (currentText.length == 0 && isCustomRow) {
+                    NSDictionary *cur = objc_getAssociatedObject((UIViewController *)self, &kApolloUserFlairCurrentFlairKey);
+                    NSString *t = cur[@"text"];
+                    if ([t isKindOfClass:[NSString class]] && t.length > 0) currentText = t;
+                }
+                BOOL blankEditable = ApolloUserFlairOptionIsBlankEditable(opt);
+                if (currentText.length > 0) {
+                    NSString *sub = ApolloUserFlairCleanSubredditName(ApolloUserFlairSubredditNameFromObject((UIViewController *)self, 0));
+                    NSArray *pieces = ApolloUserFlairPiecesFromFlairText(currentText, sub.lowercaseString);
+                    if (pieces.count) {
+                        customRowOption = opt;
+                        customRowFlairs = pieces;
+                        customRowText = currentText;
+                    } else if (blankEditable) {
+                        // Have a current flair but couldn't build pieces (e.g. RDKFlair
+                        // unavailable) — don't leave a blank row; show the placeholder.
+                        customRowOption = opt;
+                        customRowFlairs = ApolloUserFlairPlaceholderFlairs();
+                        customRowText = kApolloUserFlairCustomRowText;
+                    }
                 } else if (blankEditable) {
-                    // Have a current flair but couldn't build pieces (e.g. RDKFlair
-                    // unavailable) — don't leave a blank row; show the placeholder.
                     customRowOption = opt;
                     customRowFlairs = ApolloUserFlairPlaceholderFlairs();
                     customRowText = kApolloUserFlairCustomRowText;
                 }
-            } else if (blankEditable) {
-                customRowOption = opt;
-                customRowFlairs = ApolloUserFlairPlaceholderFlairs();
-                customRowText = kApolloUserFlairCustomRowText;
             }
         }
     }
@@ -1551,6 +1865,14 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
         ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
     }
 
+    // Old-reddit css-class flairs are preset character templates, not free-text:
+    // selecting one is the whole interaction (Update then commits the bare
+    // template). Don't pop the text editor for these — only for genuinely
+    // editable/custom rows.
+    if (tappedOption && objc_getAssociatedObject(tappedOption, &kApolloUserFlairOptionDisplayFlairsKey)) {
+        return;
+    }
+
     __weak UIViewController *weakController = (UIViewController *)self;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *strongController = weakController;
@@ -1590,7 +1912,44 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
     if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self && tApolloUserFlairCustomRowFlairs) {
         return tApolloUserFlairCustomRowFlairs;
     }
+    // Persistent css-class sprite/name override (read by the async layout pass).
+    NSArray *display = objc_getAssociatedObject(self, &kApolloUserFlairOptionDisplayFlairsKey);
+    if ([display isKindOfClass:[NSArray class]] && display.count) return display;
     return flairs;
+}
+
+%end
+
+// Our cropped old-reddit sprites live on disk as file:// URLs, but Apollo's flair
+// emoji images load through ASNetworkImageNode's HTTP-only downloader, which can't
+// fetch file:// (the request silently produces no image — blank rows). Intercept the
+// URL setter: when it's one of our sprite files, set the cached cropped UIImage
+// directly and skip the network path entirely. Real (https) emoji URLs are untouched.
+static BOOL ApolloUserFlairTrySetSpriteImage(id imageNode, NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]] || !url.isFileURL) return NO;
+    NSString *path = url.path;
+    if (![[path lastPathComponent] hasPrefix:kApolloUserFlairSpriteFilePrefix]) return NO;
+    UIImage *img = nil;
+    @synchronized (ApolloUserFlairSpriteImageByPath()) { img = ApolloUserFlairSpriteImageByPath()[path]; }
+    if (!img) img = [UIImage imageWithContentsOfFile:path];
+    if (!img) return NO;
+    if ([imageNode respondsToSelector:@selector(setImage:)]) {
+        ((void (*)(id, SEL, UIImage *))objc_msgSend)(imageNode, @selector(setImage:), img);
+        return YES;
+    }
+    return NO;
+}
+
+%hook ASNetworkImageNode
+
+- (void)setURL:(NSURL *)URL {
+    if (ApolloUserFlairTrySetSpriteImage(self, URL)) return;
+    %orig;
+}
+
+- (void)setURL:(NSURL *)URL resetToDefault:(BOOL)reset {
+    if (ApolloUserFlairTrySetSpriteImage(self, URL)) return;
+    %orig;
 }
 
 %end
