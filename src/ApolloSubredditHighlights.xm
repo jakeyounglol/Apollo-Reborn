@@ -73,6 +73,12 @@ static CGFloat const kApolloHLTopPadding = 6.0;
 // spacing — the cards relate to the breaker exactly like a post does.
 static CGFloat const kApolloHLBottomPadding = 13.0;
 static NSInteger const kApolloHLFetchLimit = 15;
+// Freshness window: a cached carousel is reused as-is for this long. Returning to a
+// subreddit after the window elapses kicks a quiet background re-poll (stale-while-
+// revalidate) that rebuilds ONLY if the pinned set actually changed. Keeps navigation
+// cheap (no refetch on every visit) while picking up a mod's pin change on its own;
+// pull-to-refresh always forces an immediate refresh regardless of this window.
+static NSTimeInterval const kApolloHLCacheTTL = 120.0;
 
 #pragma mark - Associated-object keys
 
@@ -268,6 +274,20 @@ static NSMutableSet<NSString *> *ApolloHLDidCollapseSubs(void) {
 // so the separators can keep exactly the LAST orphan as the single breaker without
 // racing the cell layout. Survives across the web upgrade.
 static NSMutableDictionary<NSString *, NSNumber *> *ApolloHLStickyCount(void) {
+    static NSMutableDictionary *d; static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// subreddit -> NSDate of the last successful REST fetch (freshness TTL), and the
+// content signature of that REST result (to detect when the pinned set changes so a
+// background re-poll only rebuilds on a real change). Both keyed lowercased.
+static NSMutableDictionary<NSString *, NSDate *> *ApolloHLFetchTime(void) {
+    static NSMutableDictionary *d; static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+static NSMutableDictionary<NSString *, NSString *> *ApolloHLRestSig(void) {
     static NSMutableDictionary *d; static dispatch_once_t once;
     dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
     return d;
@@ -486,15 +506,21 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 - (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {}
 @end
 
+static NSString *ApolloHLItemsContentSig(NSArray<ApolloHLItem *> *items); // defined with ApolloHLSignature
+
 // Fetches the subreddit's stickied posts and calls completion on the main queue
 // with the (possibly empty) item array. Caches the result. completion may be nil
 // (warm the cache only).
-static void ApolloHLFetchHighlights(NSString *subredditName, void (^completion)(NSArray<ApolloHLItem *> *items)) {
+static void ApolloHLFetchHighlights(NSString *subredditName, BOOL force, void (^completion)(NSArray<ApolloHLItem *> *items)) {
     NSString *key = subredditName.lowercaseString;
     if (key.length == 0) { if (completion) completion(@[]); return; }
 
-    NSArray<ApolloHLItem *> *cached = ApolloHLCache()[key];
-    if (cached) { if (completion) completion(cached); return; }
+    // force = bypass the cache hit (a freshness re-poll) but still de-dupe against an
+    // in-flight request so concurrent triggers don't stack network calls.
+    if (!force) {
+        NSArray<ApolloHLItem *> *cached = ApolloHLCache()[key];
+        if (cached) { if (completion) completion(cached); return; }
+    }
     if ([ApolloHLInFlight() containsObject:key]) { if (completion) completion(nil); return; }
     [ApolloHLInFlight() addObject:key];
 
@@ -521,9 +547,18 @@ static void ApolloHLFetchHighlights(NSString *subredditName, void (^completion)(
             [ApolloHLInFlight() removeObject:key];
             // Only cache a successful response (200 / parsed). On error, leave it
             // uncached so a later layout pass can retry.
-            if (status == 200 || items.count > 0) ApolloHLCache()[key] = items;
-            // Record the inline-sticky count (REST only) for the breaker rule.
-            if (status == 200) ApolloHLStickyCount()[key] = @(items.count);
+            // A non-force fetch populates the displayed cache. A force fetch (freshness
+            // re-poll) must NOT overwrite it — the cache holds the possibly web-upgraded
+            // set on display; the refresh caller rebuilds via ApplyItems only on a real
+            // change, so a failed web re-run can't silently downgrade the carousel.
+            if (!force && (status == 200 || items.count > 0)) ApolloHLCache()[key] = items;
+            // Record the inline-sticky count (REST only) for the breaker rule + the
+            // freshness timestamp/signature for the stale-while-revalidate re-poll.
+            if (status == 200) {
+                ApolloHLStickyCount()[key] = @(items.count);
+                ApolloHLFetchTime()[key] = [NSDate date];
+                ApolloHLRestSig()[key] = ApolloHLItemsContentSig(items);
+            }
             if (completion) completion(items);
         });
     }] resume];
@@ -875,6 +910,15 @@ static NSString *ApolloHLSignature(NSString *sub, NSArray<ApolloHLItem *> *items
     return [state stringByAppendingString:[ids componentsJoinedByString:@"|"]];
 }
 
+// Content-only signature (no collapse-state prefix) used to detect when a subreddit's
+// pinned set actually changes between fetches — so a background re-poll rebuilds only
+// on a real change, not on every poll.
+static NSString *ApolloHLItemsContentSig(NSArray<ApolloHLItem *> *items) {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (ApolloHLItem *it in items) [ids addObject:(it.fullName ?: it.permalink ?: @"?")];
+    return [ids componentsJoinedByString:@"|"];
+}
+
 static CGFloat ApolloHLCarouselHeight(void) {
     return kApolloHLTitleRowHeight + kApolloHLTopPadding + kApolloHLCardHeight + kApolloHLBottomPadding;
 }
@@ -1028,7 +1072,7 @@ UIView *ApolloHLHeaderOriginalSubstitute(NSString *subreddit, UIViewController *
         [container installCarousel:ApolloHLBuildCarousel(sub, items, width)];
     } else if (items == nil) {
         CGFloat fetchWidth = width;
-        ApolloHLFetchHighlights(sub, ^(NSArray<ApolloHLItem *> *fetched) {
+        ApolloHLFetchHighlights(sub, NO, ^(NSArray<ApolloHLItem *> *fetched) {
             if (fetched == nil) return;
             if (fetched.count == 0) { ApolloHLClearDeDup(sub); return; }
             // Populate any live containers for this sub, then re-measure the
@@ -1333,16 +1377,88 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
         [ApolloHLWebFetchers() removeObjectForKey:sub];
         [ApolloHLWebDone() addObject:sub];
         NSArray<ApolloHLItem *> *apiItems = ApolloHLCache()[sub];
-        if (items.count <= apiItems.count) return; // web found no more than the API
+        if (items.count == 0) return; // web found nothing
         // Enrich the web list with reliable /api/info thumbnails before applying.
         ApolloHLEnrichViaInfo(items, apiItems, ^(NSArray<ApolloHLItem *> *enriched) {
             NSArray<ApolloHLItem *> *cur = ApolloHLCache()[sub];
-            if (enriched.count > cur.count) {
+            // Apply when the web set adds to OR differs from what's shown — the latter
+            // matters on a refresh where a highlight was swapped (same count, new posts).
+            BOOL grew = enriched.count > cur.count;
+            BOOL differs = ![ApolloHLItemsContentSig(enriched) isEqualToString:ApolloHLItemsContentSig(cur)];
+            if (grew || differs) {
                 ApolloLog(@"[Highlights] web upgrade r/%@: %lu → %lu", sub, (unsigned long)cur.count, (unsigned long)enriched.count);
                 ApolloHLApplyItems(sub, enriched);
             }
         });
     }];
+}
+
+// Re-fetch a subreddit's highlights and update the carousel ONLY when the pinned set
+// actually changed. Cheap REST re-poll; rebuilds on a content change; re-runs the heavy
+// web upgrade when the set changed (or always, for an explicit pull-to-refresh). If a
+// mod removed every highlight, tears the carousel down. `alwaysWeb` = an explicit
+// refresh (re-harvest the web set even if the REST stickies are unchanged).
+static void ApolloHLRefreshSub(NSString *subreddit, BOOL alwaysWeb) {
+    if (!sCommunityHighlights) return;
+    NSString *key = subreddit.lowercaseString;
+    if (key.length == 0) return;
+    NSString *oldSig = ApolloHLRestSig()[key];
+    ApolloHLFetchHighlights(subreddit, YES, ^(NSArray<ApolloHLItem *> *freshREST) {
+        if (freshREST == nil) return; // an in-flight request is already refreshing this sub
+        BOOL changed = oldSig && ![ApolloHLItemsContentSig(freshREST) isEqualToString:oldSig];
+
+        if (freshREST.count == 0) {
+            // All highlights unpinned — remove the carousel (both placement modes) and
+            // stop de-duping (the inline stickies, if any, return).
+            if (!changed) return;
+            ApolloLog(@"[Highlights] r/%@ all highlights removed → tearing down carousel", subreddit);
+            ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+                if (![ApolloHLSubredditName(postsVC) isEqualToString:key]) return;
+                if (!sShowSubredditHeaders) {
+                    UITableView *tv = ApolloHLFindTableView(postsVC);
+                    if (tv) ApolloHLInstallCarousel(postsVC, tv, @[], subreddit); // tears down our header
+                } else {
+                    ApolloHLHeaderContainerView *c = objc_getAssociatedObject(postsVC, kApolloHLContainerKey);
+                    if (![c isKindOfClass:[ApolloHLHeaderContainerView class]]) return;
+                    [c installCarousel:nil];
+                    UIView *wrapper = c.superview;
+                    UITableView *tv = ApolloHLFindTableView(postsVC);
+                    if (wrapper && tv && tv.tableHeaderView == wrapper) {
+                        CGRect wf = wrapper.frame; wf.size.height = CGRectGetMaxY(c.frame); wrapper.frame = wf;
+                        [tv setTableHeaderView:wrapper];
+                    }
+                }
+            });
+            ApolloHLClearDeDup(subreddit);
+            return;
+        }
+
+        if (changed) {
+            ApolloLog(@"[Highlights] r/%@ pinned set changed on refresh → rebuild", subreddit);
+            ApolloHLApplyItems(subreddit, freshREST); // cache := fresh REST + rebuild (both modes)
+        }
+        if (sCommunityHighlightsWeb && (changed || alwaysWeb)) {
+            // Re-harvest the full web set; it re-applies if it differs from what's shown.
+            [ApolloHLWebDone() removeObject:key];
+            [ApolloHLWebFetchers() removeObjectForKey:key];
+            ApolloHLMaybeWebUpgrade(subreddit);
+        }
+    });
+}
+
+// If the cached highlights for `subreddit` have aged past the freshness window, kick a
+// quiet background re-poll (stale-while-revalidate). Called from ApolloHLInstall with an
+// already-resolved sub (viewWillAppear is too early — the sub isn't set yet). Bounded to
+// one refetch per window: the refetch stamps a fresh time, so it won't re-trigger until
+// the window elapses again — so revisiting OR sitting on a sub stays cheap.
+static void ApolloHLMaybeRefreshStale(NSString *subreddit) {
+    NSString *key = subreddit.lowercaseString;
+    if (!ApolloHLCache()[key]) return; // nothing cached yet → the normal fetch path handles it
+    NSDate *ft = ApolloHLFetchTime()[key];
+    if (ft && [[NSDate date] timeIntervalSinceDate:ft] > kApolloHLCacheTTL) {
+        ApolloLog(@"[Highlights] r/%@ cache stale (>%.0fs) → background refresh", subreddit, kApolloHLCacheTTL);
+        ApolloHLRefreshSub(subreddit, NO);
+    }
 }
 
 static char kApolloHLSepScheduledKey; // per-VC guard: which sub we've scheduled separator passes for
@@ -1398,6 +1514,10 @@ static void ApolloHLInstall(UIViewController *vc) {
     // known yet; the separators fall back to the common-case rule and the reactive
     // pass + post-fetch re-install correct them (masked by the carousel popping in).
     ApolloHLApplyStickyCountToTable(vc, subreddit);
+
+    // Freshness: if the cached carousel has aged out, quietly re-poll in the background
+    // (rebuilds only if the pinned set actually changed). Runs in both placement modes.
+    ApolloHLMaybeRefreshStale(subreddit);
 
     // De-dup collapses the leading stickied posts but leaves their trailing
     // separators, doubling the breaker below the carousel. Collapse the orphaned
@@ -1461,7 +1581,7 @@ static void ApolloHLInstall(UIViewController *vc) {
     // No data yet — fetch once, then install on whichever PostsViewController is
     // currently showing this subreddit (the VC that kicked the fetch may have
     // been replaced, and layout may have settled, so don't rely on it).
-    ApolloHLFetchHighlights(subreddit, ^(NSArray<ApolloHLItem *> *items) {
+    ApolloHLFetchHighlights(subreddit, NO, ^(NSArray<ApolloHLItem *> *items) {
         if (items == nil) return; // an in-flight dedupe call, ignore
         if (!sCommunityHighlights || sShowSubredditHeaders) return;
         if (items.count == 0) { ApolloHLClearDeDup(subreddit); return; }
@@ -1766,12 +1886,25 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig(animated);
-    ApolloHLInstall((UIViewController *)self);
+    ApolloHLInstall((UIViewController *)self); // also runs the stale-cache freshness check
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
     ApolloHLInstall((UIViewController *)self);
+}
+
+// Pull-to-refresh: always force a fresh fetch of the highlights (REST + re-harvest the
+// web set), so an explicit refresh updates the carousel immediately — matching the feed
+// the user just pulled to reload.
+- (void)refreshControlActivatedWithSender:(id)sender {
+    %orig;
+    if (!sCommunityHighlights) return;
+    NSString *sub = ApolloHLSubredditName((UIViewController *)self);
+    if (sub.length) {
+        ApolloLog(@"[Highlights] r/%@ pull-to-refresh → force refresh", sub);
+        ApolloHLRefreshSub(sub, YES);
+    }
 }
 
 - (void)viewDidLayoutSubviews {
