@@ -67,11 +67,12 @@ static CGFloat const kApolloHLCardSpacing = 10.0;
 static CGFloat const kApolloHLSidePadding = 16.0;
 static CGFloat const kApolloHLTitleRowHeight = 26.0;
 static CGFloat const kApolloHLTopPadding = 6.0;
-// Gap between the cards and the kept ThickSeparator below. Matched to a feed post's
-// own bottom content inset (measured 13pt: a post's last content sits 13pt above its
-// separator), so the carousel→separator spacing equals the feed's post→separator
-// spacing — the cards relate to the breaker exactly like a post does.
-static CGFloat const kApolloHLBottomPadding = 13.0;
+// Small gap between the cards and the kept ThickSeparator below — just enough to lift
+// the cards off the breaker (at 0 they look almost glued to it). Kept small on purpose:
+// unlike a post's internal bottom inset (which is opaque, part of the post block), this
+// gap is empty space, so a large value reads as a fat band/"line" rather than breathing
+// room. Mirrors the carousel's top padding for symmetry.
+static CGFloat const kApolloHLBottomPadding = 6.0;
 static NSInteger const kApolloHLFetchLimit = 15;
 // Freshness window: a cached carousel is reused as-is for this long. Returning to a
 // subreddit after the window elapses kicks a quiet background re-poll (stale-while-
