@@ -50,6 +50,10 @@ static const void *kApolloProfileTabOriginalImageKey = &kApolloProfileTabOrigina
 static const void *kApolloProfileTabOriginalSelectedImageKey = &kApolloProfileTabOriginalSelectedImageKey;
 static const void *kApolloProfileTabAppliedUsernameKey = &kApolloProfileTabAppliedUsernameKey;
 static const void *kApolloProfileTabAppliedImageKey = &kApolloProfileTabAppliedImageKey;
+// Marker stamped on every rendered profile-tab avatar UIImage so the UIImageView
+// monochromatic-treatment clamp can recognise our avatar regardless of which tab
+// view class hosts it.
+static const void *kApolloProfileTabAvatarImageMarkerKey = &kApolloProfileTabAvatarImageMarkerKey;
 
 @interface ApolloProfileHeaderView : UIView
 @property(nonatomic, strong) UIImageView *bannerImageView;
@@ -1722,7 +1726,38 @@ static void ApolloProfileRestoreTabAvatarItem(UITabBarItem *item) {
 
 static UIImage *ApolloProfileTabAvatarImage(UIImage *sourceImage) {
     UIImage *avatar = ApolloCircularAvatarImage(sourceImage, ApolloProfileTabAvatarDiameter);
-    return [avatar imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    avatar = [avatar imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    objc_setAssociatedObject(avatar, kApolloProfileTabAvatarImageMarkerKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return avatar;
+}
+
+// YES when this image view is currently displaying one of our rendered profile-tab
+// avatars (as image or highlightedImage). Used to clamp iOS 26's monochromatic tab
+// treatment so the avatar never renders as a grey silhouette.
+static BOOL ApolloProfileImageViewShowsTabAvatar(UIImageView *imageView) {
+    if (![imageView isKindOfClass:[UIImageView class]]) return NO;
+    if ([objc_getAssociatedObject(imageView.image, kApolloProfileTabAvatarImageMarkerKey) boolValue]) return YES;
+    if ([objc_getAssociatedObject(imageView.highlightedImage, kApolloProfileTabAvatarImageMarkerKey) boolValue]) return YES;
+    return NO;
+}
+
+static BOOL ApolloProfileImageIsTabAvatar(UIImage *image) {
+    return [objc_getAssociatedObject(image, kApolloProfileTabAvatarImageMarkerKey) boolValue];
+}
+
+// Force iOS 26's monochromatic tab treatment off on an image view. Called both when
+// the OS toggles the treatment (the setter hooks) and when our avatar image is first
+// assigned (setImage:), so the clamp wins regardless of the order the OS configures
+// the button in.
+static BOOL sApolloClampingTabTreatment = NO;
+static void ApolloProfileForceTabAvatarColour(UIImageView *imageView) {
+    if (sApolloClampingTabTreatment || ![imageView isKindOfClass:[UIImageView class]]) return;
+    sApolloClampingTabTreatment = YES;
+    SEL eSel = NSSelectorFromString(@"_setEnableMonochromaticTreatment:");
+    SEL mSel = NSSelectorFromString(@"_setMonochromaticTreatment:");
+    if ([imageView respondsToSelector:mSel]) ((void (*)(id, SEL, int64_t))objc_msgSend)(imageView, mSel, 0);
+    if ([imageView respondsToSelector:eSel]) ((void (*)(id, SEL, BOOL))objc_msgSend)(imageView, eSel, NO);
+    sApolloClampingTabTreatment = NO;
 }
 
 static UIImage *ApolloProfileTabOriginalRenderingImage(UIImage *image) {
@@ -1772,6 +1807,46 @@ static UITabBarItem *ApolloProfileTabItemFromFloatingItem(id item) {
         if ([linkedItem isKindOfClass:[UITabBarItem class]]) return linkedItem;
     }
     return nil;
+}
+
+// Resolve the UITabBarItem that owns a tab-icon UIImageView by walking up to its
+// host tab-button / item view. Used by the monochromatic clamp so the decision is
+// keyed on the long-lived item (and its apollo_profileTabAvatarIconActive flag),
+// NOT on the avatar UIImage's associated-object marker — which iOS 26 strips when it
+// re-derives the displayed image on trait/selection cycles (issue #407).
+static UITabBarItem *ApolloProfileTabItemForIconImageView(UIImageView *imageView) {
+    if (![imageView isKindOfClass:[UIImageView class]]) return nil;
+    UIView *cur = imageView;
+    for (int depth = 0; cur && depth < 9; depth++, cur = cur.superview) {
+        NSString *cn = NSStringFromClass([cur class]);
+        if ([cn containsString:@"TabButton"]) {
+            // Primary (platter) button: matched against tabBar.items via _tabBarButton.
+            UITabBarItem *item = ApolloProfileTabItemForTabBarButton(cur);
+            if (item) return item;
+            // Secondary buttons (e.g. the selected-content overlay) aren't registered
+            // as the item's _tabBarButton — fall back to the button's own item ivar.
+            Ivar ivar = class_getInstanceVariable([cur class], "_item") ?: class_getInstanceVariable([cur class], "item");
+            if (ivar) {
+                id maybe = object_getIvar(cur, ivar);
+                if ([maybe isKindOfClass:[UITabBarItem class]]) return (UITabBarItem *)maybe;
+            }
+        } else if ([cn containsString:@"FloatingTabBarItemView"]) {
+            if ([cur respondsToSelector:@selector(item)]) {
+                id floatingItem = ((id (*)(id, SEL))objc_msgSend)(cur, @selector(item));
+                UITabBarItem *item = ApolloProfileTabItemFromFloatingItem(floatingItem);
+                if (item) return item;
+            }
+        }
+    }
+    return nil;
+}
+
+// YES when this image view is the profile tab's avatar slot. Marker fast-path first
+// (covers the freshly-stamped image), then the durable structural lookup.
+static BOOL ApolloProfileImageViewIsProfileTabAvatarSlot(UIImageView *imageView) {
+    if (ApolloProfileImageViewShowsTabAvatar(imageView)) return YES;
+    UITabBarItem *item = ApolloProfileTabItemForIconImageView(imageView);
+    return item && [objc_getAssociatedObject(item, ApolloProfileTabAvatarActiveKey()) boolValue];
 }
 
 static void ApolloProfileSyncLegacyTabButtonAvatar(id button) {
@@ -2322,6 +2397,63 @@ static void ApolloAvatarApplySubredditIconToSharePreview(id postInfo, NSString *
 - (void)setCurrentImage {
     %orig;
     ApolloProfileSyncLegacyTabButtonAvatar(((UIView *)self).superview);
+}
+
+%end
+
+// iOS 26's tab bar applies a "monochromatic treatment" to the unselected tab icons
+// (grey silhouette). On the floating/platter tab bar the profile avatar is hosted by
+// plain UIImageViews under _UITabButton, which none of the tab-button-specific hooks
+// above reach — so the avatar would render as a grey blob whenever the OS's coloured
+// "selected content" overlay stops covering it (e.g. after returning from a DM chat
+// room — issue #407). Detect the profile slot structurally (image view -> _UITabButton
+// -> UITabBarItem -> apollo_profileTabAvatarIconActive), which survives the image
+// re-derivation that strips our UIImage marker, then clamp the treatment off and
+// restore our coloured avatar if iOS baked the grey into the derived pixels.
+%hook UIImageView
+
+- (void)setImage:(UIImage *)image {
+    %orig(image);
+    if (sApolloClampingTabTreatment || sApolloProfileTabSyncingView) return;   // ignore our own writes
+    if (!ApolloProfileImageViewIsProfileTabAvatarSlot(self)) return;
+    // iOS 26 sometimes hands the slot a derived copy of our avatar with the
+    // monochrome treatment baked into the pixels (marker stripped). Clamping the
+    // treatment flag can't recolour baked-in grey, so restore our stored colour
+    // avatar whenever the installed image isn't ours.
+    if (!ApolloProfileImageIsTabAvatar(self.image)) {
+        UITabBarItem *item = ApolloProfileTabItemForIconImageView(self);
+        UIImage *avatar = ApolloProfileTabAppliedAvatarForItem(item);
+        if (avatar) {
+            sApolloProfileTabSyncingView = YES;
+            self.image = avatar;
+            self.highlightedImage = avatar;
+            sApolloProfileTabSyncingView = NO;
+        }
+    }
+    ApolloProfileForceTabAvatarColour(self);
+}
+
+- (void)setHighlightedImage:(UIImage *)image {
+    %orig(image);
+    if (!sApolloClampingTabTreatment && ApolloProfileImageViewIsProfileTabAvatarSlot(self)) {
+        ApolloProfileForceTabAvatarColour(self);
+    }
+}
+
+- (void)_setEnableMonochromaticTreatment:(BOOL)enable {
+    if (enable && !sApolloClampingTabTreatment && ApolloProfileImageViewIsProfileTabAvatarSlot(self)) {
+        %orig(NO);
+        return;
+    }
+    %orig(enable);
+}
+
+- (void)_setMonochromaticTreatment:(int64_t)treatment {
+    if (treatment != 0 && !sApolloClampingTabTreatment && ApolloProfileImageViewIsProfileTabAvatarSlot(self)) {
+        %orig(0);
+        return;
+    }
+    %orig(treatment);
 }
 
 %end

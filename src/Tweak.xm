@@ -12,6 +12,7 @@
 #import "ApolloRedditMediaUpload.h"
 #import "ApolloDeletedCommentsData.h"
 #import "ApolloImageUploadHost.h"
+#import "ApolloImgChestUpload.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloState.h"
 #import "Tweak.h"
@@ -20,6 +21,8 @@
 #import "Defaults.h"
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloWebAuthViewController.h"
+#import "ApolloWebJSON.h"
+#import "ApolloWebSessionLoginViewController.h"
 
 // MARK: - Sideload Fixes
 
@@ -586,10 +589,26 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 
 %hook NSURLSession
 
+// Async image loaders (PINRemoteImage etc.) send no User-Agent on imgchest
+// requests, which its CDN rejects with 403; add one across every
+// task-creation entry point.
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua) : %orig;
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua, completionHandler) : %orig;
+}
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:");
     ApolloDeletedCommentsInstallDelegateTransformerIfNeeded((NSURLSession *)self, request);
+
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest);
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -697,6 +716,9 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
 
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest, completionHandler);
+
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
         void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -731,6 +753,29 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
         };
         return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
+    }
+
+    // ImgChest host: combine the member uploads into one multi-image ImgChest
+    // post and answer the Imgur album creation with its link.
+    ApolloImgChestAlbumResponder imgChestAlbumResponder = nil;
+    if (sImageUploadProvider == ImageUploadProviderImgChest) {
+        imgChestAlbumResponder = ApolloImgChestAlbumCreationResponderForRequest(request);
+    }
+    if (completionHandler && imgChestAlbumResponder) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            imgChestAlbumResponder(completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-imgchest-album"), wrappedHandler);
+    }
+
+    // Manage Uploads (issue #414): deletes of uploads this tweak created are
+    // routed to their real provider (ImgChest server-side delete; Reddit and
+    // merged interim entries acknowledged so they leave Apollo's list).
+    if (completionHandler && ApolloUploadRegistryShouldInterceptDelete(request)) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            ApolloUploadRegistryHandleImgurDelete(request, completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-upload-registry-delete"), wrappedHandler);
     }
 
     if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
@@ -968,6 +1013,18 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             [self setValue:mutableRequest forKey:@"_currentRequest"];
         }
     } else if ([requestURL.host isEqualToString:@"oauth.reddit.com"] || [requestURL.host isEqualToString:@"www.reddit.com"]) {
+        // Web JSON spike: when the flag is on, whitelisted listing reads are
+        // re-pointed at cookie-authenticated www.reddit.com/...json instead of
+        // the oauth host (see ApolloWebJSON.m). Returns nil when off/not
+        // applicable, leaving the existing oauth behavior untouched.
+        NSURLRequest *webJSONRequest = ApolloWebJSONRewriteRequest(request);
+        if (webJSONRequest) {
+            [self setValue:webJSONRequest forKey:@"_originalRequest"];
+            [self setValue:webJSONRequest forKey:@"_currentRequest"];
+            %orig;
+            return;
+        }
+
         NSMutableURLRequest *mutableRequest = [request mutableCopy];
         NSString *customUA = [sUserAgent length] > 0 ? sUserAgent : defaultUserAgent;
         [mutableRequest setValue:customUA forHTTPHeaderField:@"User-Agent"];
@@ -1010,6 +1067,20 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
         ApolloLog(@"[ImgurProxy] Proxying %@ via DuckDuckGo", requestString);
     }
 
+    %orig;
+}
+
+// Response-side observation for Web JSON session-expiry detection. Every task's
+// completion passes through here; ApolloWebJSONNoteResponse only reacts when Web
+// JSON mode is on and a cookie-authed www.reddit.com request came back as
+// Reddit's 403 HTML block page (signalling the harvested cookie expired). It's a
+// cheap predicate when the flag is off, so this is safe on the hot path.
+- (void)_onqueue_didFinishWithError:(id)error {
+    if (sWebJSONEnabled) {
+        NSURLSessionTask *task = (NSURLSessionTask *)self;
+        NSURLRequest *finished = task.currentRequest ?: task.originalRequest;
+        ApolloWebJSONNoteResponse(finished, task.response);
+    }
     %orig;
 }
 
@@ -1227,6 +1298,7 @@ static void initializeRandomSources() {
                                     UDKeyTagFilterNSFW: @YES,
                                     UDKeyTagFilterSpoiler: @YES,
                                     UDKeyTagFilterSubredditOverrides: @{},
+                                    UDKeyWebJSONEnabled: @NO,
                                     UDKeyNotificationBackendURL: @"",
                                     UDKeyNotificationBackendRegistrationToken: @"",
                                     UDKeyRedditClientSecret: @""};
@@ -1340,6 +1412,20 @@ static void initializeRandomSources() {
         }
         sTranslationSkipLanguages = [clean copy];
     }
+
+    // Web JSON: read the flag here, but defer the keychain-backed
+    // cookie/modhash/username hydration until AFTER the SecItem fishhooks are
+    // installed below — in the simulator the keychain is virtualized by those
+    // hooks, so reading before they're in place returns nothing.
+    sWebJSONEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONEnabled];
+    // Surface a revoked/expired cookie (detected response-side in
+    // ApolloWebJSONNoteResponse) as a re-login prompt wherever the user is.
+    [[NSNotificationCenter defaultCenter] addObserverForName:ApolloWebJSONSessionExpiredNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        [ApolloWebSessionLoginViewController presentExpiredSessionPrompt];
+    }];
 
     // Tag filter feature hydration.
     sTagFilterEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTagFilterEnabled];
@@ -1461,8 +1547,33 @@ static void initializeRandomSources() {
 
     initializeRandomSources();
 
-    // Redirect user to Custom API settings if no API credentials are set
-    if ([sRedditClientId length] == 0) {
+    // Web JSON keychain hydration — must run after the SecItem fishhooks above so
+    // the simulator's virtualized keychain is in place (see the deferral note
+    // where sWebJSONEnabled is read). Migrates any legacy NSUserDefaults cookie.
+    ApolloWebJSONLoadPersistedCredentials();
+    if (sWebJSONEnabled) {
+        ApolloLog(@"[WebJSON] enabled at launch, session cookie %@, modhash %@, user %@",
+                  sWebSessionCookieHeader ? @"present" : @"absent",
+                  sWebSessionModhash.length > 0 ? @"present" : @"absent",
+                  sWebSessionUsername ?: @"(none)");
+    }
+
+    // Cold-start identity: when a usable Web JSON session exists but no signed-in
+    // account is loaded, synthesize one now. This runs in %ctor (after the SecItem
+    // keychain hooks above) and therefore before AccountManager reads its accounts
+    // on this launch, so the account tab + write actions (vote/comment) work
+    // without an OAuth account. No-op when an account already exists.
+    if (ApolloWebJSONHasUsableSession()) {
+        @try { ApolloWebJSONSynthesizeSignedInAccount(); }
+        @catch (NSException *e) { ApolloLog(@"[WebJSON][identity] launch synthesis failed: %@", e); }
+    }
+    // This launch loads accounts fresh, so any "restart to activate" state left
+    // over from a mid-session web login is now resolved — clear the indicator.
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestart];
+
+    // Redirect user to Custom API settings if no API credentials are set — but not
+    // when a Web JSON cookie session is driving things (no API key is expected).
+    if ([sRedditClientId length] == 0 && !ApolloWebJSONHasUsableSession()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIWindow *mainWindow = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).windows.firstObject;
             UITabBarController *tabBarController = (UITabBarController *)mainWindow.rootViewController;

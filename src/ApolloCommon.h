@@ -45,4 +45,7 @@ BOOL ApolloIsSystemShareComposeController(UIViewController *controller);
 // the name it is a generic viewer, not ImageChest-specific. Returns NO when
 // items is empty or no presenter could be found from sourceView.
 BOOL ApolloPresentImageChestItems(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex);
+// As above, but albumURL is the album's page URL when known — it enables the
+// viewer's "Share Album Link" action; pass nil otherwise.
+BOOL ApolloPresentImageChestItemsWithAlbumURL(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex, NSURL *albumURL);
 __END_DECLS

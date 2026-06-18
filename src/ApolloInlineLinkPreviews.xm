@@ -1275,7 +1275,11 @@ static BOOL ApolloLPSetTextNodeAttributedTextIfChanged(ASTextNode *textNode, NSA
 
 static NSString *ApolloLPCleanDisplayText(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
-    NSString *clean = [text stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
+    // Decode HTML entities FIRST (named + numeric, incl. « » ° €) — the fetcher
+    // decodes freshly-stored metadata, but cached and *translated* card text reach
+    // this render choke point raw and would otherwise show literal "&laquo;".
+    // Decoding before tag-stripping also lets an encoded "&lt;b&gt;" collapse out.
+    NSString *clean = ApolloLinkPreviewDecodeEntities(text) ?: text;
     NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
     clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
     NSRegularExpression *whitespace = [NSRegularExpression regularExpressionWithPattern:@"\\s+" options:0 error:nil];
@@ -1290,7 +1294,9 @@ static NSString *ApolloLPCleanDisplayText(NSString *text) {
 // a multi-paragraph post into one run-on blob.
 static NSString *ApolloLPCleanMultilineDisplayText(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
-    NSString *clean = [text stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
+    // Decode entities first (see ApolloLPCleanDisplayText) — keeps numeric/named
+    // entities out of cached/translated multiline bodies (e.g. Bluesky posts).
+    NSString *clean = ApolloLinkPreviewDecodeEntities(text) ?: text;
     NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
     clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
     // \x0B (vertical tab), NOT \v: in ICU regex \v is a class shorthand for
