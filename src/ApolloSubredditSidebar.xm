@@ -1125,11 +1125,16 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
     NSDictionary *items = [root[@"items"] isKindOfClass:[NSDictionary class]] ? root[@"items"] : nil;
     NSDictionary *layout = [root[@"layout"] isKindOfClass:[NSDictionary class]] ? root[@"layout"] : nil;
 
-    // ---- Stats: Subscribers (custom id-card label when present) + Created date. ----
+    // ---- Stats: Subscribers (custom id-card label when present) + weekly Visitors/Contributions. ----
     NSString *idCardID = ApolloSBString(layout[@"idCardWidget"]);
     NSDictionary *idCard = [items[idCardID] isKindOfClass:[NSDictionary class]] ? items[idCardID] : nil;
     long long idCardSubs = idCard ? ApolloSBLongLong(idCard[@"subscribersCount"]) : -1;
-    long long rdkSubs = rdkSub ? (long long)((unsigned long long(*)(id, SEL))objc_msgSend)(rdkSub, sel_registerName("totalSubscribers")) : -1;
+    // Guard the dynamic send: if `subreddit` ever isn't an RDKSubreddit, an unguarded
+    // -totalSubscribers would doesNotRecognizeSelector-crash the sidebar (per review).
+    long long rdkSubs = -1;
+    SEL totalSubsSel = sel_registerName("totalSubscribers");
+    if ([rdkSub respondsToSelector:totalSubsSel])
+        rdkSubs = (long long)((unsigned long long(*)(id, SEL))objc_msgSend)(rdkSub, totalSubsSel);
     long long subsCount = idCardSubs > 0 ? idCardSubs : MAX(rdkSubs, 0LL);
     NSString *subsLabel = ApolloSBString(idCard[@"subscribersText"]);
     if (subsLabel.length == 0) subsLabel = @"Subscribers";
