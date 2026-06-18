@@ -441,13 +441,20 @@ static UIViewController *ApolloUserFlairPresenterForController(UIViewController 
 }
 
 // First http(s) URL embedded in a string (NSDataDetector handles "Go to <url> ..."
-// instruction text). nil when there's no link.
-static NSURL *ApolloUserFlairFirstURL(NSString *text) {
+// instruction text, and promotes bare domains like "flair.x.com" to http). nil when
+// there's no web link. The http/https-only filter is deliberate — it rejects
+// mailto:/custom-scheme deeplinks that a malicious flair could otherwise smuggle
+// into the in-app browser. outRange (optional) receives the matched URL's range.
+static NSURL *ApolloUserFlairFirstURL(NSString *text, NSRange *outRange) {
+    if (outRange) *outRange = NSMakeRange(NSNotFound, 0);
     if (text.length == 0) return nil;
     NSDataDetector *det = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:NULL];
     NSTextCheckingResult *m = [det firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
     NSURL *url = m.URL;
-    if (url && ([url.scheme isEqualToString:@"http"] || [url.scheme isEqualToString:@"https"])) return url;
+    if (url && ([url.scheme isEqualToString:@"http"] || [url.scheme isEqualToString:@"https"])) {
+        if (outRange) *outRange = m.range;
+        return url;
+    }
     return nil;
 }
 
@@ -467,6 +474,53 @@ static void ApolloUserFlairOpenURLInApp(UIViewController *controller, NSURL *url
     if ([[UIApplication sharedApplication] respondsToSelector:@selector(openURL:options:completionHandler:)]) {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
     }
+}
+
+// YES when a flair row is really an "external flair tool" link — an instruction
+// whose text is essentially just a URL (e.g. r/anime "Go to https://flair.r-anime.moe
+// to get your flair!", r/CFB "More flair options at https://flair.redditcfb.com!") —
+// rather than a selectable flair. We then open it in-app instead of committing it.
+// Deliberately independent of editability: some subs mark the tool row editable, and
+// the old non-editable gate let users commit the instruction text as their flair.
+// Never hijacks a real flair: bails on image/emoji flairs, and only fires when the
+// URL dominates the text (or there's explicit flair-tool phrasing / a known tool host).
+static BOOL ApolloUserFlairOptionIsLinkInstruction(id option, NSURL **outURL) {
+    if (outURL) *outURL = nil;
+    if (!option) return NO;
+    // A real badge/sprite/emoji flair that merely mentions a URL must NOT be hijacked.
+    for (id f in ApolloUserFlairObjectArray(option, @[@"flairs"])) {
+        if (ApolloUserFlairObjectString(f, @[@"imageURL"]).length > 0) return NO;
+    }
+    NSString *text = ApolloUserFlairOptionText(option);
+    if (text.length == 0) return NO;
+    NSRange r = NSMakeRange(NSNotFound, 0);
+    NSURL *url = ApolloUserFlairFirstURL(text, &r);
+    if (!url) return NO;
+
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // (a) The URL dominates: it's basically the whole text, or only a short
+    //     instruction wraps it ("Go to <url> to get your flair!").
+    NSUInteger urlLen = (r.location == NSNotFound) ? 0 : r.length;
+    NSString *remainder = (r.location != NSNotFound) ? [text stringByReplacingCharactersInRange:r withString:@""] : text;
+    NSMutableCharacterSet *strip = [[NSCharacterSet whitespaceAndNewlineCharacterSet] mutableCopy];
+    [strip formUnionWithCharacterSet:[NSCharacterSet punctuationCharacterSet]];
+    [strip formUnionWithCharacterSet:[NSCharacterSet symbolCharacterSet]];
+    remainder = [remainder stringByTrimmingCharactersInSet:strip];
+    BOOL dominant = (urlLen >= trimmed.length) || (remainder.length <= 40);
+    // (b) Explicit flair-tool phrasing (covers longer instructions on other subs).
+    BOOL keyword = NO;
+    NSString *low = text.lowercaseString;
+    for (NSString *kw in @[@"get your flair", @"set your flair", @"more flair", @"flair options", @"flair tool", @"flair page", @"your flair"]) {
+        if ([low containsString:kw]) { keyword = YES; break; }
+    }
+    // (c) Known external flair-tool hosts (a "flair"-prefixed subdomain, or flairwizard).
+    NSString *host = url.host.lowercaseString;
+    NSString *firstLabel = [[host componentsSeparatedByString:@"."] firstObject];
+    BOOL knownDomain = host && ([firstLabel containsString:@"flair"] ||
+                                [host rangeOfString:@"flairwizard"].location != NSNotFound);
+    if (!(dominant || keyword || knownDomain)) return NO;
+    if (outURL) *outURL = url;
+    return YES;
 }
 
 @implementation ApolloUserFlairSelectorAdapter
@@ -1908,16 +1962,18 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
         return;
     }
 
-    // Some subreddits expose a single NON-editable template whose "text" is just an
-    // instruction to use an external flair tool (e.g. r/anime: "Go to
-    // https://flair.r-anime.moe to get your flair!"). There's nothing to apply, so
-    // open the link in an in-app browser instead of selecting/committing it.
+    // Some subreddits surface their flair through an EXTERNAL tool, exposing a row
+    // whose "text" is just an instruction with a link (e.g. r/anime: "Go to
+    // https://flair.r-anime.moe to get your flair!", r/CFB: "More flair options at
+    // https://flair.redditcfb.com!"). There's nothing to apply, so open the link in
+    // an in-app browser instead of selecting/committing it. ApolloUserFlairOptionIsLinkInstruction
+    // works regardless of whether the row is editable (an editable tool row would
+    // otherwise pop the editor pre-filled with the instruction string) and won't
+    // hijack real image/text flairs.
     {
         id opt = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, effectiveIndexPath);
-        BOOL editableKnown = NO;
-        BOOL editable = ApolloUserFlairOptionIsEditable(opt, &editableKnown);
-        NSURL *link = ApolloUserFlairFirstURL(ApolloUserFlairOptionText(opt));
-        if (link && editableKnown && !editable) {
+        NSURL *link = nil;
+        if (ApolloUserFlairOptionIsLinkInstruction(opt, &link) && link) {
             if ([tableNode respondsToSelector:@selector(deselectRowAtIndexPath:animated:)]) {
                 ((void (*)(id, SEL, NSIndexPath *, BOOL))objc_msgSend)(tableNode, @selector(deselectRowAtIndexPath:animated:), indexPath, NO);
             }
