@@ -269,6 +269,47 @@ static NSMutableSet<NSString *> *ApolloHLDidCollapseSubs(void) {
     return set;
 }
 
+// THREAD SAFETY: both sets above are touched from the MAIN thread (ApolloHLInstall /
+// Teardown / ClearDeDup / header substitute) AND from Texture's background layout queue
+// (ApolloHLShouldHideCell + ApolloHLSeparatorShouldCollapse run inside the cell-node
+// layoutSpecThatFits:/calculateLayoutThatFits: hooks). Plain NSMutableSet is not
+// thread-safe, so EVERY read/mutate of these two globals must go through the locked
+// accessors below — never touch ApolloHLHideSubs()/ApolloHLDidCollapseSubs() directly.
+// One shared lock guards both (they're only ever touched independently, so a single lock
+// can't deadlock; @synchronized is recursive, and these helpers acquire no other lock).
+static id ApolloHLDeDupLock(void) {
+    static id token; static dispatch_once_t once;
+    dispatch_once(&once, ^{ token = [NSObject new]; });
+    return token;
+}
+static BOOL ApolloHLHideSubsContains(NSString *sub) {
+    if (sub.length == 0) return NO;
+    @synchronized(ApolloHLDeDupLock()) { return [ApolloHLHideSubs() containsObject:sub]; }
+}
+static BOOL ApolloHLHideSubsIsEmpty(void) {
+    @synchronized(ApolloHLDeDupLock()) { return ApolloHLHideSubs().count == 0; }
+}
+static void ApolloHLHideSubsAdd(NSString *sub) {
+    if (sub.length == 0) return;
+    @synchronized(ApolloHLDeDupLock()) { [ApolloHLHideSubs() addObject:sub]; }
+}
+static void ApolloHLHideSubsRemove(NSString *sub) {
+    if (sub.length == 0) return;
+    @synchronized(ApolloHLDeDupLock()) { [ApolloHLHideSubs() removeObject:sub]; }
+}
+static BOOL ApolloHLDidCollapseContains(NSString *sub) {
+    if (sub.length == 0) return NO;
+    @synchronized(ApolloHLDeDupLock()) { return [ApolloHLDidCollapseSubs() containsObject:sub]; }
+}
+static void ApolloHLDidCollapseAdd(NSString *sub) {
+    if (sub.length == 0) return;
+    @synchronized(ApolloHLDeDupLock()) { [ApolloHLDidCollapseSubs() addObject:sub]; }
+}
+static void ApolloHLDidCollapseRemove(NSString *sub) {
+    if (sub.length == 0) return;
+    @synchronized(ApolloHLDeDupLock()) { [ApolloHLDidCollapseSubs() removeObject:sub]; }
+}
+
 // Lowercased subreddit -> number of leading stickied posts the REST `hot` fetch
 // returned (= the number of inline cells we de-dup). Set ONLY from the REST parse
 // (never the web upgrade, which inflates the carousel beyond the inline stickies),
@@ -995,10 +1036,14 @@ static void ApolloHLForEachPostsVC(void (^block)(UIViewController *postsVC)); //
 // reload the feed to restore them.
 static void ApolloHLClearDeDup(NSString *subreddit) {
     NSString *sub = subreddit.lowercaseString;
-    if (![ApolloHLHideSubs() containsObject:sub]) return;
-    [ApolloHLHideSubs() removeObject:sub];
-    if ([ApolloHLDidCollapseSubs() containsObject:sub]) {
-        [ApolloHLDidCollapseSubs() removeObject:sub];
+    if (!ApolloHLHideSubsContains(sub)) return;
+    ApolloHLHideSubsRemove(sub);
+    // Best-effort corrective reload: restore the inline stickies only if we actually
+    // collapsed any. Each set op is individually locked (no corruption), but the
+    // contains-then-remove isn't atomic across calls, so a rare main/background interleave
+    // could skip this one reload — harmless, the next relayout/teardown self-heals it.
+    if (ApolloHLDidCollapseContains(sub)) {
+        ApolloHLDidCollapseRemove(sub);
         ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
             if ([ApolloHLSubredditName(postsVC) isEqualToString:sub]) ApolloHLReloadFeed(postsVC);
         });
@@ -1052,7 +1097,7 @@ UIView *ApolloHLHeaderOriginalSubstitute(NSString *subreddit, UIViewController *
     if (width <= 0) width = UIScreen.mainScreen.bounds.size.width;
 
     // De-dup membership now (the header installs before cells render).
-    [ApolloHLHideSubs() addObject:sub];
+    ApolloHLHideSubsAdd(sub);
     if (hostVC) objc_setAssociatedObject(hostVC, kApolloHLActiveSubKey, sub, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
     // Don't nest containers across rebuilds — recover the true original.
@@ -1151,8 +1196,8 @@ static void ApolloHLTeardown(UIViewController *vc, BOOL restoreNativeHeader) {
     // Stop de-duplicating this VC's subreddit.
     NSString *activeSub = objc_getAssociatedObject(vc, kApolloHLActiveSubKey);
     if (activeSub.length) {
-        [ApolloHLHideSubs() removeObject:activeSub];
-        [ApolloHLDidCollapseSubs() removeObject:activeSub];
+        ApolloHLHideSubsRemove(activeSub);
+        ApolloHLDidCollapseRemove(activeSub);
         objc_setAssociatedObject(vc, kApolloHLActiveSubKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
     }
     objc_setAssociatedObject(vc, kApolloHLContainerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1557,7 +1602,7 @@ static void ApolloHLInstall(UIViewController *vc) {
     // its cells lay out), so the pinned posts collapse on first layout instead of
     // flashing then collapsing once the async carousel data lands. Done in BOTH
     // placement modes (standalone tableHeaderView, or hosted in the headers wrapper).
-    [ApolloHLHideSubs() addObject:subreddit];
+    ApolloHLHideSubsAdd(subreddit);
     objc_setAssociatedObject(vc, kApolloHLActiveSubKey, subreddit, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
     // Opt-in: harvest the full highlights set (>2) via a hidden WebView, once per
@@ -1622,12 +1667,12 @@ static BOOL ApolloHLShouldBlockOffset(UITableView *tableView, CGPoint newOffset)
 // synchronous (no async carousel dependency) → cells collapse on first layout.
 static BOOL ApolloHLShouldHideCell(id cellNode) {
     if (!sCommunityHighlights) return NO;
-    if (ApolloHLHideSubs().count == 0) return NO;
+    if (ApolloHLHideSubsIsEmpty()) return NO;
     RDKLinkLite *link = (RDKLinkLite *)ApolloHLTypedIvar(cellNode, @"link", objc_getClass("RDKLink"));
     if (!link || ![link respondsToSelector:@selector(stickied)] || !link.stickied) return NO;
     NSString *sub = link.subreddit.lowercaseString;
-    if (sub.length == 0 || ![ApolloHLHideSubs() containsObject:sub]) return NO;
-    [ApolloHLDidCollapseSubs() addObject:sub];
+    if (sub.length == 0 || !ApolloHLHideSubsContains(sub)) return NO;
+    ApolloHLDidCollapseAdd(sub);
     return YES;
 }
 
@@ -1707,7 +1752,7 @@ static void ApolloHLRecordHiddenStickyRow(id postNode) {
 }
 static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
     if ([objc_getAssociatedObject(sepNode, &kApolloHLSepCollapseKey) boolValue]) return YES; // reactive pass
-    if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return NO;
+    if (!sCommunityHighlights || ApolloHLHideSubsIsEmpty()) return NO;
     NSInteger r = ApolloHLNodeRow(sepNode);
     if (r < 1) return NO;
     id owning = ApolloHLOwningTableNode(sepNode);
@@ -1728,7 +1773,7 @@ static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
 }
 
 static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
-    if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return;
+    if (!sCommunityHighlights || ApolloHLHideSubsIsEmpty()) return;
     UITableView *tv = ApolloHLFindTableView(vc);
     if (!tv) return;
     NSArray<UITableViewCell *> *cells = [tv.visibleCells sortedArrayUsingComparator:^NSComparisonResult(UITableViewCell *a, UITableViewCell *b) {
