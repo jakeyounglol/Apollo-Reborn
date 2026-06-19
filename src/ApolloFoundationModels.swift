@@ -133,7 +133,7 @@ public final class ApolloFoundationModels: NSObject {
                     session = LanguageModelSession(instructions: instructions)
                 }
                 let options = GenerationOptions(
-                    samplingMode: .greedy,
+                    sampling: .greedy,
                     maximumResponseTokens: maximumResponseTokens > 0 ? maximumResponseTokens : nil
                 )
                 var latest = ""
@@ -148,10 +148,6 @@ public final class ApolloFoundationModels: NSObject {
                     onPartial(latest)
                 }
                 aiLog.debug("completed \(identifier, privacy: .public) after \(String(describing: ContinuousClock.now - startedAt), privacy: .public)")
-                if #available(iOS 27.0, *) {
-                    let usage = session.usage
-                    aiLog.debug("tokens \(identifier, privacy: .public) input=\(usage.input.totalTokenCount) cached=\(usage.input.cachedTokenCount) output=\(usage.output.totalTokenCount) reasoning=\(usage.output.reasoningTokenCount)")
-                }
                 onComplete(latest, nil)
             } catch {
                 preparedSessions.removeValue(forKey: identifier)
@@ -178,10 +174,19 @@ public final class ApolloFoundationModels: NSObject {
 
     /// Map a thrown FoundationModels error to a stable integer code the ObjC
     /// side branches on (see `ApolloAIFriendlyError` / the transient-retry path
-    /// in ApolloAISummary.xm). Classifying here, against the typed error enums,
+    /// in ApolloAISummary.xm). Classifying here, against the typed error enum,
     /// is robust across OS locales — the previous English substring matching on
     /// `localizedDescription` broke under localization. The original
     /// description is preserved for logging.
+    ///
+    /// We deliberately match only `LanguageModelSession.GenerationError`, the
+    /// error type in the iOS 26 SDK we build against. iOS 27 introduced new
+    /// types (`LanguageModelError`, `LanguageModelSession.Error`), but those do
+    /// not exist in the build SDK, so referencing them fails to compile (a
+    /// `#available` runtime check does not gate compile-time symbol lookup).
+    /// `GenerationError` is deprecated-not-removed on iOS 27, so it still
+    /// classifies there; anything unmatched falls through to code 5 and the
+    /// ObjC side's generic message.
     ///   6  = cancelled            7  = guardrail / refusal
     ///   8  = context window full  9  = rate limited / concurrent (transient)
     ///   10 = unsupported language  2 = assets unavailable / model not ready
@@ -189,23 +194,7 @@ public final class ApolloFoundationModels: NSObject {
     private static func classify(_ error: Error) -> NSError {
         var code = 5
         #if canImport(FoundationModels)
-        if #available(iOS 27.0, *) {
-            if let e = error as? LanguageModelError {
-                switch e {
-                case .guardrailViolation, .refusal:  code = 7
-                case .contextSizeExceeded:           code = 8
-                case .rateLimited:                   code = 9
-                case .unsupportedLanguageOrLocale:   code = 10
-                default:                             code = 5
-                }
-            } else if let e = error as? LanguageModelSession.Error {
-                switch e {
-                case .concurrentRequests:            code = 9
-                default:                             code = 5
-                }
-            }
-        }
-        if code == 5, #available(iOS 26.0, *), let e = error as? LanguageModelSession.GenerationError {
+        if #available(iOS 26.0, *), let e = error as? LanguageModelSession.GenerationError {
             switch e {
             case .guardrailViolation, .refusal:      code = 7
             case .exceededContextWindowSize:         code = 8
