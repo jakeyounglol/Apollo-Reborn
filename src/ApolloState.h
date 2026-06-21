@@ -33,6 +33,15 @@ extern BOOL sUseProfileAvatarTabIcon;
 // See ApolloProfileSocialLinks.{h,m}.
 extern BOOL sSocialLinksInProfile;
 extern BOOL sShowSubredditHeaders;
+// When ON, a horizontally-scrolling "Community Highlights" carousel of the
+// subreddit's pinned/stickied posts is shown at the top of the feed (mirrors
+// new-Reddit / the official app). See ApolloSubredditHighlights.xm.
+extern BOOL sCommunityHighlights;
+// When ON (and sCommunityHighlights ON), a hidden WKWebView loads the subreddit's
+// new-Reddit page to harvest the FULL highlights set (up to 6), beyond the 2 the
+// REST API exposes. Heavier (loads the web page per sub); opt-in. See
+// ApolloSubredditHighlights.xm (ApolloHLWebFetch).
+extern BOOL sCommunityHighlightsWeb;
 extern BOOL sAutoHideTabBarShowOnIdle;
 // When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
 // dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;

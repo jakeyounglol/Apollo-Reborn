@@ -666,7 +666,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // the "Tap to Show Deleted Comments" row when Show Deleted Comments is off.
         case SectionGeneral: return sShowDeletedComments ? 12 : 11;
         case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
-        case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
+        case SectionSubreddits: return 10 - (sSubredditListEnhancements ? 0 : 1) - (sCommunityHighlights ? 0 : 1);
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
@@ -1254,8 +1254,17 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (UITableViewCell *)subredditCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
-    // Modern Dividers row (logical 1) is hidden when the master toggle is off.
-    NSInteger logicalRow = (row >= 1 && !sSubredditListEnhancements) ? row + 1 : row;
+    // Sub-options are hidden when their parent toggle is off: Modern Dividers (logical 1)
+    // under "Subreddit List Enhancements", and "Load All Highlights (Web)" (logical 4)
+    // under "Community Highlights". Map the display row to its logical case by walking the
+    // logical rows in order and skipping any that are currently hidden.
+    BOOL hideDividers = !sSubredditListEnhancements;
+    BOOL hideWeb = !sCommunityHighlights;
+    NSInteger logicalRow = -1;
+    for (NSInteger visible = -1; visible < row; ) {
+        logicalRow++;
+        if (!((logicalRow == 1 && hideDividers) || (logicalRow == 4 && hideWeb))) visible++;
+    }
     switch (logicalRow) {
         case 0:
             return [self switchCellWithIdentifier:@"Cell_Sub_Enhancements"
@@ -1273,30 +1282,40 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders]
                                            action:@selector(subredditHeadersSwitchToggled:)];
         case 3:
+            return [self switchCellWithIdentifier:@"Cell_Sub_Highlights"
+                                            label:@"Community Highlights"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights]
+                                           action:@selector(communityHighlightsSwitchToggled:)];
+        case 4:
+            return [self switchCellWithIdentifier:@"Cell_Sub_HighlightsWeb"
+                                            label:@"Load All Highlights (Web)"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb]
+                                           action:@selector(communityHighlightsWebSwitchToggled:)];
+        case 5:
             return [self textFieldCellWithIdentifier:@"Cell_Sub_TrendLimit"
                                                label:@"Trending Subreddits Limit"
                                          placeholder:@"(unlimited)"
                                                 text:sTrendingSubredditsLimit
                                                  tag:TagTrendingLimit
                                            numerical:YES];
-        case 4:
+        case 6:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Trending"
                                                       label:@"Trending Source"
                                                 placeholder:defaultTrendingSubredditsSource
                                                        text:sTrendingSubredditsSource
                                                         tag:TagTrendingSubredditsSource];
-        case 5:
+        case 7:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Random"
                                                       label:@"Random Source"
                                                 placeholder:defaultRandomSubredditsSource
                                                        text:sRandomSubredditsSource
                                                         tag:TagRandomSubredditsSource];
-        case 6:
+        case 8:
             return [self switchCellWithIdentifier:@"Cell_Sub_RandNSFW"
                                             label:@"Show RandNSFW in Search"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRandNsfw]
                                            action:@selector(randNsfwSwitchToggled:)];
-        case 7:
+        case 9:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_RandNSFW_Source"
                                                       label:@"RandNSFW Source"
                                                 placeholder:@"(empty)"
@@ -2166,6 +2185,30 @@ typedef NS_ENUM(NSInteger, Tag) {
     sShowSubredditHeaders = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowSubredditHeaders forKey:UDKeyShowSubredditHeaders];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloSubredditHeaderToggleChangedNotification" object:nil];
+}
+
+- (void)communityHighlightsSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sCommunityHighlights;
+    sCommunityHighlights = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sCommunityHighlights forKey:UDKeyCommunityHighlights];
+    if (sCommunityHighlights != wasOn) {
+        // The "Load All Highlights (Web)" sub-row (logical 4) only exists while this master
+        // toggle is on; its display index drops by 1 when the Modern Dividers row (logical 1)
+        // is itself hidden (enhancements off). Mirrors the Enhancements toggle's row anim.
+        NSArray<NSIndexPath *> *webPaths = @[[NSIndexPath indexPathForRow:(sSubredditListEnhancements ? 4 : 3) inSection:SectionSubreddits]];
+        if (sCommunityHighlights) {
+            [self.tableView insertRowsAtIndexPaths:webPaths withRowAnimation:UITableViewRowAnimationFade];
+        } else {
+            [self.tableView deleteRowsAtIndexPaths:webPaths withRowAnimation:UITableViewRowAnimationFade];
+        }
+    }
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloCommunityHighlightsToggleChangedNotification" object:nil];
+}
+
+- (void)communityHighlightsWebSwitchToggled:(UISwitch *)sender {
+    sCommunityHighlightsWeb = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sCommunityHighlightsWeb forKey:UDKeyCommunityHighlightsWeb];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloCommunityHighlightsToggleChangedNotification" object:nil];
 }
 
 - (void)textPostThumbnailsSwitchToggled:(UISwitch *)sender {

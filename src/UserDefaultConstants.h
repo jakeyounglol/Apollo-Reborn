@@ -45,6 +45,8 @@ static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
 static NSString *const UDKeySocialLinksInProfile = @"SocialLinksInProfile";
 static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
+static NSString *const UDKeyCommunityHighlights = @"CommunityHighlights";
+static NSString *const UDKeyCommunityHighlightsWeb = @"CommunityHighlightsWeb";
 static NSString *const UDKeyAutoHideTabBarShowOnIdle = @"AutoHideTabBarShowOnIdle";
 // When ON, focusing the main feed / subreddit search keeps the nav bar and the search
 // field in place (results populate the feed below the field) instead of Apollo's stock

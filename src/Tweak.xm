@@ -1283,6 +1283,8 @@ static void initializeRandomSources() {
                                     UDKeyUseProfileAvatarTabIcon: @NO,
                                     UDKeySocialLinksInProfile: @YES,
                                     UDKeyShowSubredditHeaders: @NO,
+                                    UDKeyCommunityHighlights: @NO,
+                                    UDKeyCommunityHighlightsWeb: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyEnableBulkTranslation: @NO,
@@ -1359,6 +1361,8 @@ static void initializeRandomSources() {
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
     sSocialLinksInProfile = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile];
     sShowSubredditHeaders = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders];
+    sCommunityHighlights = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights];
+    sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];
