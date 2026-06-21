@@ -48,6 +48,11 @@ static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
 static NSString *const UDKeyCommunityHighlights = @"CommunityHighlights";
 static NSString *const UDKeyCommunityHighlightsWeb = @"CommunityHighlightsWeb";
 static NSString *const UDKeyAutoHideTabBarShowOnIdle = @"AutoHideTabBarShowOnIdle";
+// When ON, focusing the main feed / subreddit search keeps the nav bar and the search
+// field in place (results populate the feed below the field) instead of Apollo's stock
+// "search takeover" (nav slides away + fades, field docks to the top and grows). Mutually
+// exclusive with the default nav-hide mode. Liquid Glass only. Default NO. See ApolloSearchInPlace.xm.
+static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
 // Render image URLs (i.redd.it, preview.redd.it, i.imgur.com, generic .png/.jpg/.jpeg/.webp)
 // inline within post selftext and comments instead of leaving them as plain text links.
 static NSString *const UDKeyEnableInlineImages = @"EnableInlineImages";
@@ -64,7 +69,7 @@ static NSString *const UDKeyEnableBulkTranslation = @"EnableBulkTranslation";
 static NSString *const UDKeyAutoTranslateOnAppear = @"AutoTranslateOnAppear";
 static NSString *const UDKeyTranslatePostTitles = @"TranslatePostTitles";
 static NSString *const UDKeyTranslationTargetLanguage = @"TranslationTargetLanguage";
-static NSString *const UDKeyTranslationProvider = @"TranslationProvider"; // google | libre
+static NSString *const UDKeyTranslationProvider = @"TranslationProvider"; // google | libre | apple
 static NSString *const UDKeyTranslationProviderUserSelected = @"TranslationProviderUserSelected";
 static NSString *const UDKeyLibreTranslateURL = @"LibreTranslateURL";
 static NSString *const UDKeyLibreTranslateAPIKey = @"LibreTranslateAPIKey";

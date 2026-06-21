@@ -1286,6 +1286,7 @@ static void initializeRandomSources() {
                                     UDKeyCommunityHighlights: @NO,
                                     UDKeyCommunityHighlightsWeb: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
+                                    UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,
                                     UDKeyTranslatePostTitles: @NO,
@@ -1363,6 +1364,7 @@ static void initializeRandomSources() {
     sCommunityHighlights = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights];
     sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
+    sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];
     sSubredditListEnhancements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySubredditListEnhancements];
     sEnableFlairColors = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
@@ -1373,8 +1375,8 @@ static void initializeRandomSources() {
     NSString *targetLanguage = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyTranslationTargetLanguage];
     sTranslationTargetLanguage = [targetLanguage length] > 0 ? [targetLanguage copy] : nil;
 
-    // Provider: only "google" or "libre" are supported. Migrate any older
-    // "apple" value to "google" so existing users land on a working provider.
+    // Provider: "google", "libre", or "apple" (on-device, iOS 18+). "apple" on an
+    // older system can't run, so migrate it to Google for those users.
     id providerValue = [persistentDomain objectForKey:UDKeyTranslationProvider];
     NSString *provider = [providerValue isKindOfClass:[NSString class]] ? (NSString *)providerValue : nil;
 
@@ -1382,8 +1384,10 @@ static void initializeRandomSources() {
         sTranslationProvider = @"libre";
     } else if ([provider isEqualToString:@"google"]) {
         sTranslationProvider = @"google";
+    } else if ([provider isEqualToString:@"apple"] && IsAppleTranslationSupported()) {
+        sTranslationProvider = @"apple";
     } else {
-        // Unset, unrecognized, or legacy "apple" — default to Google.
+        // Unset, unrecognized, or "apple" on an unsupported OS — default to Google.
         sTranslationProvider = @"google";
         [standardDefaults setObject:sTranslationProvider forKey:UDKeyTranslationProvider];
         [standardDefaults setBool:NO forKey:UDKeyTranslationProviderUserSelected];

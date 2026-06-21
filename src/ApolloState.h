@@ -43,6 +43,10 @@ extern BOOL sCommunityHighlights;
 // ApolloSubredditHighlights.xm (ApolloHLWebFetch).
 extern BOOL sCommunityHighlightsWeb;
 extern BOOL sAutoHideTabBarShowOnIdle;
+// When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
+// dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;
+// mutually exclusive with the default nav-hide mode. See ApolloSearchInPlace.xm.
+extern BOOL sKeepSearchBarInPlace;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;
@@ -130,11 +134,21 @@ extern BOOL sEnableBulkTranslation;
 extern BOOL sAutoTranslateOnAppear;
 extern BOOL sTranslatePostTitles;
 extern NSString *sTranslationTargetLanguage;
-extern NSString *sTranslationProvider;
+extern NSString *sTranslationProvider; // @"google", @"libre", or @"apple"
 extern NSString *sLibreTranslateURL;
 extern NSString *sLibreTranslateAPIKey;
 // Lowercased 2-letter language codes the user has opted out of translating.
 extern NSArray<NSString *> *sTranslationSkipLanguages;
+
+#ifdef __OBJC__
+// Whether the on-device Apple translation backend (ApolloAppleTranslation.swift,
+// Translation.framework) can run on this OS. iOS 18.0+. Used to gate the "apple"
+// provider in Settings and during settings hydration.
+static inline BOOL IsAppleTranslationSupported(void) {
+    if (@available(iOS 18.0, *)) return YES;
+    return NO;
+}
+#endif
 
 // Web JSON spike (see ApolloWebJSON.m): when enabled, whitelisted subreddit
 // listing reads are re-pointed from oauth.reddit.com to www.reddit.com/...json,

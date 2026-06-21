@@ -11,6 +11,16 @@
 #import "ApolloTranslation.h"
 #import "Tweak.h"
 
+// Generated umbrella header for the Swift compilation unit (ApolloAppleTranslation.swift),
+// which vends the @objc ApolloAppleTranslator used by the on-device "apple" provider.
+// Guarded with __has_include so the file still builds if Swift output isn't present.
+#if __has_include("ApolloReborn-Swift.h")
+#import "ApolloReborn-Swift.h"
+#define APOLLO_HAS_APPLE_TRANSLATE 1
+#else
+#define APOLLO_HAS_APPLE_TRANSLATE 0
+#endif
+
 #ifndef APOLLO_TRANSLATION_VERBOSE_LOGS
 #define APOLLO_TRANSLATION_VERBOSE_LOGS 0
 #endif
@@ -160,6 +170,7 @@ static RDKComment *ApolloCommentFromCellNode(id commentCellNode);
 static void ApolloRegisterOwnedTextNode(id textNode);
 static void ApolloRestoreAllOwnedTextNodes(void);
 static void ApolloRescanTitleNodesForController(UIViewController *vc);
+static void ApolloMaybeTranslateFeedPostBodyNode(id feedCellNode, id excludeTitleNode);
 static UIViewController *ApolloEnclosingViewControllerForNode(id node);
 static BOOL ApolloClassLooksLikeCommentsViewController(Class cls);
 static BOOL ApolloFeedTitlesShouldShowTranslated(UIViewController *feedVC);
@@ -2061,6 +2072,121 @@ static void ApolloTranslateViaLibre(NSString *text,
     [task resume];
 }
 
+// MARK: - Script-composition guard (mixed-language detection)
+//
+// NLLanguageRecognizer scores only its top hypotheses and gives disproportionate
+// weight to a unique writing system. One foreign-script word deliberately embedded in
+// an otherwise-Latin sentence (e.g. someone explaining how a word is *written* in
+// Japanese: "you spell it さん") can pull the dominant guess to Japanese, so the whole
+// string gets translated and the embedded word — the entire point of the comment — is
+// mangled. We can't tell Apple/Google to skip part of a string, so the lever is
+// detection: when the writing system is overwhelmingly Latin, don't let a stray
+// non-Latin token flip the detected language.
+
+typedef NS_ENUM(NSInteger, ApolloScriptBucket) {
+    ApolloScriptNeutral = 0,   // whitespace/digits/punctuation/emoji/symbols — excluded
+    ApolloScriptLatin,
+    ApolloScriptHan,
+    ApolloScriptHiragana,
+    ApolloScriptKatakana,
+    ApolloScriptHangul,
+    ApolloScriptCyrillic,
+    ApolloScriptArabic,
+    ApolloScriptGreek,
+    ApolloScriptThai,
+    ApolloScriptHebrew,
+    ApolloScriptDevanagari,
+    ApolloScriptBucketCount
+};
+
+static ApolloScriptBucket ApolloScriptBucketForCodepoint(UTF32Char c) {
+    if ((c >= 0x0041 && c <= 0x005A) || (c >= 0x0061 && c <= 0x007A) ||
+        (c >= 0x00C0 && c <= 0x024F) || (c >= 0x1E00 && c <= 0x1EFF)) return ApolloScriptLatin;
+    if (c >= 0x3040 && c <= 0x309F) return ApolloScriptHiragana;
+    if (c >= 0x30A0 && c <= 0x30FF) return ApolloScriptKatakana;
+    if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) ||
+        (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x2A6DF)) return ApolloScriptHan;
+    if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) ||
+        (c >= 0x3130 && c <= 0x318F)) return ApolloScriptHangul;
+    if (c >= 0x0400 && c <= 0x052F) return ApolloScriptCyrillic;
+    if ((c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F)) return ApolloScriptArabic;
+    if ((c >= 0x0370 && c <= 0x03FF) || (c >= 0x1F00 && c <= 0x1FFF)) return ApolloScriptGreek;
+    if (c >= 0x0E00 && c <= 0x0E7F) return ApolloScriptThai;
+    if (c >= 0x0590 && c <= 0x05FF) return ApolloScriptHebrew;
+    if (c >= 0x0900 && c <= 0x097F) return ApolloScriptDevanagari;
+    // Everything else (digits, punctuation, whitespace, emoji, symbols, and scripts
+    // we don't explicitly bucket) is treated as script-neutral and excluded from the
+    // denominator so it can't skew the fraction.
+    return ApolloScriptNeutral;
+}
+
+// Fraction (0..1) of script-bearing characters belonging to the single most common
+// writing system; writes that bucket and the script-bearing char count to the outs.
+static double ApolloDominantScriptFraction(NSString *text, ApolloScriptBucket *outBucket, NSUInteger *outScriptChars) {
+    if (outBucket) *outBucket = ApolloScriptNeutral;
+    if (outScriptChars) *outScriptChars = 0;
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return 0.0;
+
+    NSUInteger counts[ApolloScriptBucketCount];
+    memset(counts, 0, sizeof(counts));
+    NSUInteger total = 0;
+    NSUInteger len = text.length;
+    for (NSUInteger i = 0; i < len; ) {
+        unichar hi = [text characterAtIndex:i];
+        UTF32Char c = hi;
+        NSUInteger step = 1;
+        if (CFStringIsSurrogateHighCharacter(hi) && (i + 1) < len) {
+            unichar lo = [text characterAtIndex:(i + 1)];
+            if (CFStringIsSurrogateLowCharacter(lo)) {
+                c = CFStringGetLongCharacterForSurrogatePair(hi, lo);
+                step = 2;
+            }
+        }
+        i += step;
+        ApolloScriptBucket b = ApolloScriptBucketForCodepoint(c);
+        if (b == ApolloScriptNeutral) continue;
+        counts[b]++;
+        total++;
+    }
+    if (total == 0) return 0.0;
+    ApolloScriptBucket best = ApolloScriptNeutral;
+    NSUInteger bestN = 0;
+    for (NSInteger b = 1; b < ApolloScriptBucketCount; b++) {
+        if (counts[b] > bestN) { bestN = counts[b]; best = (ApolloScriptBucket)b; }
+    }
+    if (outBucket) *outBucket = best;
+    if (outScriptChars) *outScriptChars = total;
+    return (double)bestN / (double)total;
+}
+
+// Whether a (normalized) language code is written in the Latin alphabet. Used so the
+// script guard can drop a non-Latin hypothesis for overwhelmingly-Latin text. Listed
+// the other way (deny non-Latin) so unknown codes default to Latin (the common case).
+static BOOL ApolloLanguageUsesLatinScript(NSString *code) {
+    NSString *norm = ApolloNormalizeLanguageCode(code) ?: [code lowercaseString];
+    if (norm.length == 0) return NO;
+    static NSSet<NSString *> *nonLatin;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        nonLatin = [NSSet setWithArray:@[
+            @"ja", @"zh", @"ko", @"ru", @"uk", @"bg", @"sr", @"mk", @"be", @"mn",
+            @"ar", @"fa", @"ur", @"ps", @"he", @"yi", @"el", @"th", @"lo", @"my", @"km",
+            @"hi", @"bn", @"ta", @"te", @"kn", @"ml", @"mr", @"gu", @"pa", @"ne", @"si",
+            @"ka", @"am", @"hy"
+        ]];
+    });
+    return ![nonLatin containsObject:norm];
+}
+
+// YES when `text` is overwhelmingly Latin script (so we should ignore a stray non-Latin
+// top hypothesis). 12-char floor avoids over-triggering on tiny strings.
+static BOOL ApolloTextIsOverwhelminglyLatin(NSString *text) {
+    ApolloScriptBucket bucket = ApolloScriptNeutral;
+    NSUInteger scriptChars = 0;
+    double frac = ApolloDominantScriptFraction(text, &bucket, &scriptChars);
+    return (bucket == ApolloScriptLatin && frac >= 0.85 && scriptChars >= 12);
+}
+
 static NSString *ApolloDetectDominantLanguage(NSString *text) {
     if (![text isKindOfClass:[NSString class]]) return nil;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2069,10 +2195,14 @@ static NSString *ApolloDetectDominantLanguage(NSString *text) {
     if (@available(iOS 12.0, *)) {
         NLLanguageRecognizer *recognizer = [[NLLanguageRecognizer alloc] init];
         [recognizer processString:trimmed];
-        NSDictionary<NLLanguage, NSNumber *> *hyps = [recognizer languageHypothesesWithMaximum:1];
+        // Top 3 (not 1) so the script guard can fall back to the best Latin hypothesis
+        // when a stray non-Latin token would otherwise win.
+        NSDictionary<NLLanguage, NSNumber *> *hyps = [recognizer languageHypothesesWithMaximum:3];
+        BOOL latinDominant = ApolloTextIsOverwhelminglyLatin(trimmed);
         NSString *dominant = nil;
         double bestProb = 0.0;
         for (NLLanguage lang in hyps) {
+            if (latinDominant && !ApolloLanguageUsesLatinScript((NSString *)lang)) continue;
             double p = hyps[lang].doubleValue;
             if (p > bestProb) { bestProb = p; dominant = (NSString *)lang; }
         }
@@ -2103,6 +2233,101 @@ static BOOL ApolloShouldSkipTranslationForText(NSString *text, NSString *targetL
     return NO;
 }
 
+// Strict source-language detector for the Apple backend. Apple needs an EXPLICIT
+// source, and a wrong guess is actively harmful: it spins up a bogus session and
+// makes Apple prompt to download the wrong language (e.g. short Portuguese/Italian
+// text misread as Indonesian/Danish), which then fails and starves the real
+// languages of their model downloads. So we only accept a CONFIDENT, UNAMBIGUOUS
+// top guess — high probability AND a clear margin over the runner-up. Distinct-script
+// languages (Japanese/Chinese/Korean) score ~0.99 with a negligible runner-up and
+// pass trivially; ambiguous short Romance text is left untranslated rather than
+// mis-assigned. (No context "remember the last language" fallback — one bad guess
+// would poison every short snippet after it.)
+static NSString *ApolloDetectSourceLanguageForApple(NSString *text) {
+    if (![text isKindOfClass:[NSString class]]) return nil;
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // Low length floor so short CJK comments (e.g. "こんにちわ") still detect — those
+    // are unique-script and score very high. The confidence + margin guards below keep
+    // short ambiguous Latin text from being mis-assigned.
+    if (trimmed.length < 4) return nil;
+    if (@available(iOS 12.0, *)) {
+        NLLanguageRecognizer *recognizer = [[NLLanguageRecognizer alloc] init];
+        [recognizer processString:trimmed];
+        NSDictionary<NLLanguage, NSNumber *> *hyps = [recognizer languageHypothesesWithMaximum:3];
+        // Script-composition guard (see ApolloDetectDominantLanguage): never pick a
+        // non-Latin SOURCE for overwhelmingly-Latin text, so a stray hiragana/CJK token
+        // can't make Apple translate an English sentence as Japanese (mangling the very
+        // word the author wrote in that script). CJK-dominant text is unaffected.
+        BOOL latinDominant = ApolloTextIsOverwhelminglyLatin(trimmed);
+        NSString *best = nil;
+        double bestProb = 0.0, secondProb = 0.0;
+        for (NLLanguage lang in hyps) {
+            if (latinDominant && !ApolloLanguageUsesLatinScript((NSString *)lang)) continue;
+            double p = hyps[lang].doubleValue;
+            if (p > bestProb) { secondProb = bestProb; bestProb = p; best = (NSString *)lang; }
+            else if (p > secondProb) { secondProb = p; }
+        }
+        // Confident (>=0.62) AND a clear winner (runner-up negligible, or top at least
+        // ~1.8x the runner-up). This rejects the ambiguous guesses that produced the
+        // bogus id/da sessions while still accepting real sentences in any language.
+        if (best.length > 0 && bestProb >= 0.62 &&
+            (secondProb <= 0.0001 || bestProb >= secondProb * 1.8)) {
+            return ApolloNormalizeLanguageCode(best);
+        }
+    }
+    return nil;
+}
+
+// On-device translation via Apple's Translation framework (iOS 18.0+), bridged
+// through the @objc ApolloAppleTranslator Swift shim. Same block contract as the
+// Google/Libre providers, with two Apple-specific behaviors:
+//
+//   1. We detect the SOURCE language client-side (NLLanguageRecognizer) and pass it
+//      explicitly. Apple's `source: nil` auto-detect, on failure, silently presents
+//      a system "select a language" picker and suspends the call — which would block
+//      every queued translation behind it. An explicit source avoids that entirely.
+//      If we can't confidently detect the source, we skip (leave original) rather
+//      than hand Apple ambiguous text.
+//   2. No cross-provider fallback: if Apple is selected it stays Apple. On a missing
+//      language model the shim drives Apple's one-time system download sheet; on any
+//      hard failure the original text is left intact.
+static void ApolloTranslateViaApple(NSString *text,
+                                    NSString *targetLanguage,
+                                    void (^completion)(NSString *translated, NSError *error)) {
+#if APOLLO_HAS_APPLE_TRANSLATE
+    NSString *source = ApolloDetectSourceLanguageForApple(text);
+    if (source.length == 0) {
+        // Couldn't confidently fingerprint this snippet — don't guess (a wrong source
+        // makes Apple prompt for the wrong language and fail). Leave the original text.
+        NSError *err = [NSError errorWithDomain:@"ApolloTranslation" code:301
+            userInfo:@{NSLocalizedDescriptionKey: @"Apple: source language undetected"}];
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, err); });
+        return;
+    }
+
+    NSString *normTarget = ApolloNormalizeLanguageCode(targetLanguage) ?: targetLanguage;
+    if ([source isEqualToString:[normTarget lowercaseString]]) {
+        // Already in the target language — no-op success (Apple can't translate X->X).
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(text, nil); });
+        return;
+    }
+
+    [ApolloAppleTranslator translate:text
+                                from:source
+                                  to:targetLanguage
+                          completion:^(NSString *translated, NSError *error) {
+        // The Swift shim already delivers on the main thread.
+        if (completion) completion(translated, error);
+    }];
+#else
+    NSError *error = [NSError errorWithDomain:@"ApolloTranslation" code:300
+        userInfo:@{NSLocalizedDescriptionKey: @"Apple translation backend unavailable in this build"}];
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, error); });
+    }
+#endif
+}
+
 static void ApolloTranslateTextWithFallback(NSString *text,
                                             NSString *targetLanguage,
                                             void (^completion)(NSString *translated, NSError *error)) {
@@ -2114,6 +2339,16 @@ static void ApolloTranslateTextWithFallback(NSString *text,
         if (completion) {
             dispatch_async(dispatch_get_main_queue(), ^{ completion(text, nil); });
         }
+        return;
+    }
+
+    // Apple is on-device and deliberately has NO cross-provider fallback: if the
+    // user picked Apple, translation stays Apple (we'd rather prompt to download a
+    // language model than silently substitute Google output). On failure the error
+    // propagates and the caller leaves the original text. (A future opt-in fallback
+    // could be added here.)
+    if ([sTranslationProvider isEqualToString:@"apple"]) {
+        ApolloTranslateViaApple(text, targetLanguage, completion);
         return;
     }
 
@@ -4270,6 +4505,9 @@ static void ApolloRescanTitleNodesInTree(id object, NSInteger depth, NSHashTable
     if (isDisplayNode) {
         const char *clsName = class_getName([object class]);
         if (clsName && (strstr(clsName, "PostTitleNode") || strstr(clsName, "PostTitleURLNode"))) {
+            // Translating the title also walks up to the enclosing post cell and
+            // translates its body preview (see ApolloMaybeTranslatePostTitleNode), so
+            // a globe-toggle rescan updates both title and body for visible cells.
             ApolloMaybeTranslatePostTitleNode(object);
             // Don't return — title nodes might contain other PostTitleNodes
             // (e.g. crossposts), but practically we can stop descending.
@@ -4518,6 +4756,29 @@ static void ApolloMaybeTranslatePostTitleNode(id titleNode) {
     id textNode = ApolloTitleTextNodeFromTitleNode(titleNode);
     if (!textNode) return;
 
+    // Feed body-preview translation is driven from HERE, not from a cell-class hook:
+    // the body preview node has no dedicated node hook, and hooking the post cell class
+    // directly proved unreliable (its RDKLink ivar isn't readable, so the body could
+    // never be located that way). The PostTitleNode hooks fire reliably for every
+    // visible post, so we walk up to the enclosing post cell and translate its body,
+    // passing this title's text node so the body-finder never mistakes the title for
+    // the body. The owned-node guards make this a cheap no-op once applied.
+    {
+        id sn = titleNode;
+        id cellNode = nil;
+        int hops = 0;
+        SEL supernodeSel = NSSelectorFromString(@"supernode");
+        while (sn && hops < 10) {
+            const char *cn = class_getName([sn class]);
+            if (cn && strstr(cn, "PostCellNode")) { cellNode = sn; break; }
+            if (![sn respondsToSelector:supernodeSel]) break;
+            @try { sn = ((id (*)(id, SEL))objc_msgSend)(sn, supernodeSel); }
+            @catch (__unused NSException *e) { break; }
+            hops++;
+        }
+        if (cellNode) ApolloMaybeTranslateFeedPostBodyNode(cellNode, textNode);
+    }
+
     NSString *titleText = ApolloVisibleTextFromNode(textNode);
     if (!titleText || titleText.length < 3) return;
 
@@ -4607,6 +4868,122 @@ static void ApolloMaybeTranslatePostTitleNode(id titleNode) {
                 return;
             }
             ApolloApplyTranslationToTitleNode(strongTitleNode, strongTextNode, titleText, translated);
+        });
+    });
+}
+
+// Feed post-body preview translation. Historically the feed only translated post
+// TITLES; the selftext snippet shown under the title in the feed list stayed in the
+// original language for every provider (Google/Libre/Apple). This reuses the title
+// path's ownership / vote-resilience / restore machinery (ApolloApplyTranslationToTitleNode
+// registers the node in the global owned set + sets kApolloTitleOwnedTextNodeKey), so it
+// follows the same feed-globe + sTranslatePostTitles gate and restores on toggle-off.
+//
+// Triggered from ApolloMaybeTranslatePostTitleNode (NOT a cell-class hook): the feed
+// cell's runtime class varies and its RDKLink ivar is NOT reliably readable
+// (object_getIvar never returns it for LargePostCellNode — confirmed on device), so we
+// locate the body preview node WITHOUT the link: walk the cell's text nodes and take the
+// longest that isn't the title (excludeTitleNode) and isn't short metadata (author /
+// score / timestamp / flair / source label). We translate the *displayed* (truncated)
+// preview text, so the cell layout is unchanged.
+static void ApolloMaybeTranslateFeedPostBodyNode(id feedCellNode, id excludeTitleNode) {
+    if (!feedCellNode) return;
+    if (!sEnableBulkTranslation || !sTranslatePostTitles) return;
+
+    NSMutableArray *candidates = [NSMutableArray array];
+    NSHashTable *visited = [[NSHashTable alloc] initWithOptions:NSHashTableObjectPointerPersonality capacity:64];
+    ApolloCollectAttributedTextNodes(feedCellNode, 6, visited, candidates);
+
+    id textNode = nil;
+    NSUInteger bestLen = 0;
+    for (id n in candidates) {
+        if (excludeTitleNode && n == excludeTitleNode) continue;   // never the title node
+        NSString *t = ApolloVisibleTextFromNode(n);
+        if (t.length < 25) continue;                               // metadata / author / score are short
+        if (ApolloPostTextLooksLikeMetadata(t, nil)) continue;
+        if (t.length > bestLen) { bestLen = t.length; textNode = n; }
+    }
+    if (!textNode) return;
+
+    NSString *previewText = ApolloVisibleTextFromNode(textNode);
+    if (previewText.length < 3) return;
+    // The node holds the FULL selftext (the display is line-clamped, but attributedText
+    // is the whole string). For a feed PREVIEW we only need roughly what's visible, so
+    // cap the translated text — otherwise long posts (e.g. 1200+ char Japanese selftext)
+    // flood the serial on-device translation session and stall everything behind them.
+    // The full body still translates in-thread. Cap on a composed-character boundary so
+    // we never split a surrogate pair / combining sequence.
+    const NSUInteger kFeedBodyPreviewCap = 400;
+    if (previewText.length > kFeedBodyPreviewCap) {
+        NSRange r = [previewText rangeOfComposedCharacterSequenceAtIndex:kFeedBodyPreviewCap];
+        previewText = [previewText substringToIndex:r.location];
+    }
+
+    // Per-VC translated-mode gate (same as titles). When the feed globe is off,
+    // restore any previously-translated preview and bail.
+    UIViewController *enclosingVC = ApolloEnclosingViewControllerForNode(feedCellNode);
+    if (!ApolloTitleOwnedNodeShouldShowTranslated(enclosingVC)) {
+        if ([objc_getAssociatedObject(textNode, kApolloTitleOwnedTextNodeKey) boolValue]) {
+            NSAttributedString *original = objc_getAssociatedObject(textNode, kApolloOriginalAttributedTextKey);
+            ApolloClearTranslationOwnershipForTextNode(textNode);
+            if ([original isKindOfClass:[NSAttributedString class]]) {
+                @try { ((void (*)(id, SEL, id))objc_msgSend)(textNode, @selector(setAttributedText:), original); }
+                @catch (__unused NSException *e) {}
+            }
+        }
+        return;
+    }
+
+    // Already-owned node: reapply cached translation (no network) or no-op if it's
+    // already showing it. Drop ownership if the cell was recycled to a new post.
+    if ([objc_getAssociatedObject(textNode, kApolloTitleOwnedTextNodeKey) boolValue]) {
+        NSString *ownedTranslated = objc_getAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey);
+        NSString *ownedSource = objc_getAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey);
+        NSString *currentNorm = ApolloNormalizeTextForCompare(previewText);
+        NSString *ownedSourceNorm = ApolloNormalizeTextForCompare(ownedSource);
+        NSString *ownedTranslatedNorm = ApolloNormalizeTextForCompare(ownedTranslated);
+        if ([ownedTranslated isKindOfClass:[NSString class]] && ownedTranslated.length > 0 &&
+            ownedTranslatedNorm.length > 0 && [currentNorm isEqualToString:ownedTranslatedNorm]) {
+            return;
+        }
+        if ([ownedSource isKindOfClass:[NSString class]] && ownedSource.length > 0 &&
+            [ownedTranslated isKindOfClass:[NSString class]] && ownedTranslated.length > 0 &&
+            ownedSourceNorm.length > 0 && [currentNorm isEqualToString:ownedSourceNorm]) {
+            ApolloApplyTranslationToTitleNode(textNode, textNode, ownedSource, ownedTranslated);
+            return;
+        }
+        ApolloClearTranslationOwnershipForTextNode(textNode);
+    }
+
+    NSString *targetLanguage = ApolloResolvedTargetLanguageCode();
+    if (targetLanguage.length == 0) return;
+
+    NSString *detectionText = ApolloProtectTranslationLinks(previewText, NULL);
+    NSString *detected = ApolloDetectDominantLanguage(detectionText);
+    if ([detected isEqualToString:targetLanguage]) return;
+
+    ApolloLog(@"[FeedBodyDBG] body translate (len=%lu)", (unsigned long)previewText.length);
+    NSString *cacheKey = ApolloTranslationCacheKey(previewText, targetLanguage);
+    __weak id weakTextNode = textNode;
+    ApolloRequestTranslation(cacheKey, previewText, targetLanguage, ^(NSString *translated, NSError *error) {
+        if (![translated isKindOfClass:[NSString class]] || translated.length == 0) {
+            if (error) ApolloLog(@"[Translation] Feed body translate failed: %@", error.localizedDescription ?: @"unknown");
+            return;
+        }
+        if (!sEnableBulkTranslation || !sTranslatePostTitles) return;
+        id strongTextNode = weakTextNode;
+        if (!strongTextNode) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Re-check the visible feed mode after the async translate — the user may
+            // have toggled the globe off mid-flight.
+            UIViewController *enclosing = ApolloEnclosingViewControllerForNode(strongTextNode);
+            UIViewController *vc = ApolloClassLooksLikeCommentsViewController([enclosing class]) ? enclosing : ApolloFindTopmostVisibleFeedVC();
+            if (ApolloClassLooksLikeCommentsViewController([vc class])) {
+                if (!ApolloControllerIsInTranslatedMode(vc)) return;
+            } else if (!ApolloFeedTitlesShouldShowTranslated(vc)) {
+                return;
+            }
+            ApolloApplyTranslationToTitleNode(strongTextNode, strongTextNode, previewText, translated);
         });
     });
 }

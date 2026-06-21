@@ -1581,16 +1581,13 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
     UIView *wrappedHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey);
     UIView *originalHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey);
 
-    if (!sShowUserAvatars) {
-        if (wrappedHeader && tableView.tableHeaderView == wrappedHeader) {
-            tableView.tableHeaderView = originalHeader;
-            ApolloLog(@"[UserAvatars] Profile header restored native header class=%@ vc=%p", className, viewControllerObject);
-        }
-        objc_setAssociatedObject(viewControllerObject, kApolloProfileHeaderViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return;
-    }
+    // The custom profile header (avatar + banner + bio + social links) is the
+    // profile page's OWN content, not one of the inline avatars the
+    // "Show User Profile Pictures" toggle governs. It must stay visible
+    // regardless of that toggle — a profile always shows the stuff in it.
+    // (Inline comment/feed/chat/mod-list avatars stay gated on sShowUserAvatars;
+    // the gate is intentionally absent here so toggling the feature off leaves
+    // profile avatars/banners alone and intact.)
 
     NSString *username = ApolloUsernameFromProfileViewController(viewController);
     if (username.length == 0) {
@@ -2335,7 +2332,8 @@ static void ApolloAvatarApplySubredditIconToSharePreview(id postInfo, NSString *
 
 - (void)refreshControlActivatedWithSender:(id)sender {
     %orig;
-    if (!sShowUserAvatars) return;
+    // Profile avatar/banner always refresh on pull-to-refresh, independent of the
+    // inline-avatars toggle (the profile header is always shown — see above).
     NSString *username = ApolloUsernameFromProfileViewController((UIViewController *)self);
     if (username.length == 0) return;
     ApolloProfileHeaderView *header = objc_getAssociatedObject(self, kApolloProfileHeaderViewKey);

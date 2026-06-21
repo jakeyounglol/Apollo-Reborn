@@ -30,6 +30,7 @@ BOOL sShowSubredditHeaders = NO;
 BOOL sCommunityHighlights = NO;
 BOOL sCommunityHighlightsWeb = NO;
 BOOL sAutoHideTabBarShowOnIdle = NO;
+BOOL sKeepSearchBarInPlace = NO;
 BOOL sModernSubredditDividers = YES;
 BOOL sSubredditListEnhancements = YES;
 BOOL sEnableFlairColors = NO;
