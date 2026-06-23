@@ -89,6 +89,14 @@ extern NSString *const ApolloWebJSONSessionExpiredNotification;
 // capture path must ignore it to avoid poisoning sLatestRedditBearerToken.
 extern NSString *const ApolloWebJSONSyntheticBearerToken;
 
+// Request header marking a request the Web JSON layer issued itself: the
+// /api/me.json session-verification probe and the keyless image-upload lease
+// (ApolloRedditMediaUpload.m). Both the rewrite (ApolloWebJSONRewriteRequest)
+// and the block-page expiry counter (ApolloWebJSONNoteResponse) bail when it's
+// present, so a request that already carries the cookie isn't re-pointed or
+// counted circularly. Value: "X-Apollo-WebJSON-Probe".
+extern NSString *const ApolloWebJSONProbeHeader;
+
 #ifdef __cplusplus
 }
 #endif

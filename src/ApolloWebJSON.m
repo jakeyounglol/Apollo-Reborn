@@ -9,10 +9,13 @@
 NSString *const ApolloWebJSONSessionExpiredNotification = @"ApolloWebJSONSessionExpiredNotification";
 NSString *const ApolloWebJSONSyntheticBearerToken = @"apollo-webjson-cookie-session";
 
-// Marks our own /api/me.json session-verification probe so it bypasses the
-// request rewrite and the block-page expiry counter (it already targets
-// www.reddit.com with the cookie, and counting its response would be circular).
-static NSString *const kApolloWebJSONProbeHeader = @"X-Apollo-WebJSON-Probe";
+// Marks a request the Web JSON layer issued itself (the /api/me.json
+// session-verification probe, and the keyless image-upload lease in
+// ApolloRedditMediaUpload.m) so it bypasses the request rewrite and the
+// block-page expiry counter — it already targets www.reddit.com with the
+// cookie, and re-pointing/counting its response would be circular. Declared in
+// ApolloWebJSON.h so other TUs (the upload module) can tag their own requests.
+NSString *const ApolloWebJSONProbeHeader = @"X-Apollo-WebJSON-Probe";
 
 #pragma mark - Keychain-backed credential storage (item 4)
 
@@ -180,16 +183,20 @@ static BOOL ApolloWebJSONWritePathIsRoutable(NSString *path) {
     if ([path hasPrefix:@"/api/v1/revoke_token"]) return NO;
     if ([path hasPrefix:@"/api/v1/authorize"]) return NO;
     // Native media uploads POST a lease to oauth.reddit.com/api/media/asset.json
-    // with a bearer token, and the lease ALWAYS stays on the oauth path. With real
-    // API keys the bearer authenticates it there; in the keyless escape hatch there
-    // is no real bearer, so the upload host short-circuits to the Imgur path and
-    // never issues this lease (a spike confirmed www.reddit.com/api/media/asset.json
-    // returns Reddit's 403 block page for cookie+modhash auth — it requires real
-    // OAuth, so routing the lease to www would only break it, including for a
-    // real-account user who also has Web JSON Mode enabled). The big multipart PUT
-    // goes to AWS S3 (self-authenticating) and is untouched either way.
+    // with a bearer token, and that lease ALWAYS stays on the oauth path. With real
+    // API keys the bearer authenticates it there; routing it to www would break it
+    // (www.reddit.com/api/media/asset.json returns Reddit's 403 block page for
+    // cookie+modhash auth — it requires real OAuth). The big multipart PUT goes to
+    // AWS S3 (self-authenticating) and is untouched either way.
     if ([path hasPrefix:@"/api/media/"]) return NO;
     if ([path isEqualToString:@"/api/v1/media/asset.json"]) return NO;
+    // Keyless image uploads use the old-reddit web lease www.reddit.com/api/
+    // image_upload_s3.json, which the upload host (ApolloRedditMediaUpload.m)
+    // builds and authenticates itself (cookie + X-Modhash, tagged with
+    // ApolloWebJSONProbeHeader). Leave it alone so the chokepoint doesn't
+    // double-process it — the probe header already makes the rewrite bail above,
+    // but exclude it here too as a belt-and-suspenders guard.
+    if ([path isEqualToString:@"/api/image_upload_s3.json"]) return NO;
     return YES;
 }
 
@@ -200,7 +207,7 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
 
     // Our own session-verification probe already targets www.reddit.com with the
     // cookie set; leave it untouched so we don't recurse through the rewrite.
-    if ([request valueForHTTPHeaderField:kApolloWebJSONProbeHeader].length > 0) return nil;
+    if ([request valueForHTTPHeaderField:ApolloWebJSONProbeHeader].length > 0) return nil;
 
     // No session → leave the oauth path untouched. Without the cookie the web
     // host serves its 403 block page, which is strictly worse than oauth.
@@ -324,7 +331,7 @@ static void ApolloWebJSONVerifySessionThenAnnounce(void) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://www.reddit.com/api/me.json"]];
     [req setValue:cookie forHTTPHeaderField:@"Cookie"];
     [req setValue:([sUserAgent length] > 0 ? sUserAgent : defaultUserAgent) forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"1" forHTTPHeaderField:kApolloWebJSONProbeHeader];
+    [req setValue:@"1" forHTTPHeaderField:ApolloWebJSONProbeHeader];
     req.HTTPShouldHandleCookies = NO;
     req.timeoutInterval = 15.0;
 
@@ -361,7 +368,7 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     if (sSessionExpiredAnnounced) return;
     if (![response isKindOfClass:[NSHTTPURLResponse class]]) return;
     // Our verification probe must not feed its own result back into the counter.
-    if ([request valueForHTTPHeaderField:kApolloWebJSONProbeHeader].length > 0) return;
+    if ([request valueForHTTPHeaderField:ApolloWebJSONProbeHeader].length > 0) return;
 
     NSURL *url = request.URL;
     if (![url.host.lowercaseString isEqualToString:@"www.reddit.com"]) return;
@@ -434,7 +441,7 @@ static NSDictionary *ApolloWebJSONFetchModernThingData(NSString *fullname) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
     [req setValue:cookie forHTTPHeaderField:@"Cookie"];
     [req setValue:([sUserAgent length] > 0 ? sUserAgent : defaultUserAgent) forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"1" forHTTPHeaderField:kApolloWebJSONProbeHeader];
+    [req setValue:@"1" forHTTPHeaderField:ApolloWebJSONProbeHeader];
     req.HTTPShouldHandleCookies = NO;
     req.timeoutInterval = 15.0;
 
