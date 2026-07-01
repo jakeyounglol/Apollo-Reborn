@@ -547,6 +547,16 @@ BOOL ApolloWebJSONSynthesizeSignedInAccount(NSString *username) {
                 ApolloLog(@"[WebJSON] Stubbed empty invited-moderators list (no cookie-compatible endpoint)");
             }
         } @catch (NSException *e) { ApolloLog(@"[WebJSON] invited-moderators stub failed: %@", e); }
+        // Flair-template lists are OAuth-only (www 404s for cookie auth) — see
+        // ApolloWebJSONShouldStubFlairList. Empty list = no flair options in
+        // the composer, instead of a hung Submit drawer.
+        @try {
+            if (ApolloWebJSONShouldStubFlairList(response)) {
+                obj = @[];
+                if (error) *error = nil;
+                ApolloLog(@"[WebJSON] Stubbed empty flair list for %@ (OAuth-only endpoint)", ((NSHTTPURLResponse *)response).URL.path);
+            }
+        } @catch (NSException *e) { ApolloLog(@"[WebJSON] flair-list stub failed: %@", e); }
     }
     return obj;
 }

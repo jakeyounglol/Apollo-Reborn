@@ -28,6 +28,7 @@ void ApolloChatClearImageUpload(void);
 }
 #endif
 #import "ApolloWebJSON.h"
+#import "ApolloWebSessionStore.h"
 #import "Defaults.h"
 #import "fishhook.h"
 
@@ -2717,7 +2718,9 @@ static BOOL ApolloShouldUseCookieRedditUpload(NSURLRequest *request) {
     if (!ApolloIsImgurImageUploadRequest(request)) return NO;
     if (![ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken]) return NO;
     if (!ApolloWebJSONHasUsableSession()) return NO;
-    if (sWebSessionModhash.length == 0) return NO;
+    // Per-account session (#505) — the legacy sWebSessionModhash global is
+    // migration scratch and stays empty for post-refactor logins.
+    if (ApolloActiveWebSession().modhash.length == 0) return NO;
     NSString *mimeType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
     if (ApolloMediaMIMETypeIsVideo(mimeType)) return NO;
     if (ApolloMediaComposerRecentlyHadSelectedVideoContextForUpload()) return NO;
@@ -2831,13 +2834,24 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         if (videoContext) ApolloMediaComposerCompleteVideoUploadContext(videoContext, YES, @"media-upload-success");
         completeSyntheticUpload();
     };
+    // Resolve the active account's per-account session once so the cookie and
+    // modhash can't come from two different accounts if a switch races the
+    // upload. A nil entry (account switched away mid-flight) fails fast rather
+    // than making a doomed request with the synthetic bearer.
+    ApolloWebSessionEntry *webSession = cookieMode ? ApolloActiveWebSession() : nil;
+    if (cookieMode && webSession.cookieHeader.length == 0) {
+        ApolloLog(@"[RedditUpload] Cookie mode requested but no active web session — aborting upload");
+        completionHandler(nil, nil, [NSError errorWithDomain:@"ApolloRedditMediaUpload" code:54
+            userInfo:@{NSLocalizedDescriptionKey: @"No active web session for the posting account — try again after switching back to it"}]);
+        return;
+    }
     if (mediaFileURL) {
         attempt.mediaOperation = cookieMode
-            ? ApolloUploadMediaFileToRedditViaCookieCancellable(mediaFileURL, filename, mimeType, sWebSessionCookieHeader, sWebSessionModhash, userAgent, progressHandler, mediaCompletion)
+            ? ApolloUploadMediaFileToRedditViaCookieCancellable(mediaFileURL, filename, mimeType, webSession.cookieHeader, webSession.modhash, userAgent, progressHandler, mediaCompletion)
             : ApolloUploadMediaFileToRedditCancellable(mediaFileURL, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
     } else {
         attempt.mediaOperation = cookieMode
-            ? ApolloUploadMediaDataToRedditViaCookieCancellable(mediaData, filename, mimeType, sWebSessionCookieHeader, sWebSessionModhash, userAgent, progressHandler, mediaCompletion)
+            ? ApolloUploadMediaDataToRedditViaCookieCancellable(mediaData, filename, mimeType, webSession.cookieHeader, webSession.modhash, userAgent, progressHandler, mediaCompletion)
             : ApolloUploadMediaDataToRedditCancellable(mediaData, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
     }
 }
