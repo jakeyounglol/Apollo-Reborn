@@ -1585,6 +1585,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         NSString *barkTail = ApolloPushNotificationsSupported()
             ? @" instead; toggling flips the delivery transport immediately, and native push resumes when turned off. Note: notification content passes through the Bark relay unencrypted."
             : @", copy its push URL, and notifications arrive via Bark with a tap-through back into Apollo (after setup, open Apollo's Notifications settings once to finish registering). Note: notification content passes through the Bark relay unencrypted.";
+        barkTail = [barkTail stringByAppendingString:@" Notifications show your selected app icon automatically; to also hear Apollo's notification sounds, import the matching .caf from the project's assets/bark-sounds into the Bark app's sound settings."];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkLead attributes:plainAttrs]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
             attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];

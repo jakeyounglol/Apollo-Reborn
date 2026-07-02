@@ -66,6 +66,15 @@ NSString *ApolloBarkNotificationIconURLString(void);
 // launch-time capture in Tweak.xm.
 BOOL ApolloBarkNoteSelectedIconName(NSString *name);
 
+// The camelCase id of the notification sound picked in Apollo's Notifications
+// settings (group-defaults key "NotificationSound", e.g. diabolicalDoorbell),
+// or nil when unset/invalid. Passed verbatim as the push URL's ?sound=
+// parameter — the Bark app plays <id>.caf if the user imported it from
+// assets/bark-sounds/, and iOS falls back to the default alert sound
+// otherwise. Sound changes re-sync the device row automatically (defaults
+// observer in this module).
+NSString *ApolloBarkSelectedSoundName(void);
+
 // The persistent synthetic device token as a lowercase 64-hex string.
 // Generated on first use (32 bytes via SecRandomCopyBytes) and stored in
 // standard defaults. On unentitled builds this is the device's identity on

@@ -44,13 +44,67 @@ static void ApolloEnsureBarkCacheValid(void) {
     sBarkCacheValid = YES;
 }
 
+// MARK: - Notification sound passthrough
+//
+// Apollo's pushes always say sound=traloop.wav; the app's bundled
+// NotificationServiceExtension swaps in the sound the user picked in the
+// Notifications settings (group-defaults key "NotificationSound", a
+// camelCase id like diabolicalDoorbell). That extension never runs for Bark
+// deliveries, so the tweak pins ?sound=<id> on the push URL instead —
+// bark-server appends ".caf" and the Bark app plays <id>.caf if the user
+// imported it from assets/bark-sounds/ (falls back to the default alert
+// sound when not imported).
+
+static NSString *const kApolloBarkGroupSuiteName = @"group.com.christianselig.apollo";
+static NSString *const kApolloBarkNotificationSoundKey = @"NotificationSound";
+
+NSString *ApolloBarkSelectedSoundName(void) {
+    static NSUserDefaults *groupDefaults = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        groupDefaults = [[NSUserDefaults alloc] initWithSuiteName:kApolloBarkGroupSuiteName];
+    });
+    NSString *name = [groupDefaults stringForKey:kApolloBarkNotificationSoundKey];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) return nil;
+    // The ids are plain alphanumerics (camelCase enum cases); reject anything
+    // else rather than splicing surprises into a URL.
+    static NSCharacterSet *nonAlnum = nil;
+    static dispatch_once_t setToken;
+    dispatch_once(&setToken, ^{
+        nonAlnum = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    });
+    if ([name rangeOfCharacterFromSet:nonAlnum].location != NSNotFound) return nil;
+    return name;
+}
+
+// Re-sync the backend device row when the sound pick changes, so the next
+// notification already carries it. The picker writes the group defaults
+// in-process, which posts NSUserDefaultsDidChangeNotification for that suite
+// instance — compare against the last value we saw and only act on a real
+// change (the notification itself fires for every defaults write anywhere).
+static NSString *sLastSeenSoundName = nil;
+
+static void ApolloBarkSoundSelectionMaybeChanged(void) {
+    NSString *current = ApolloBarkSelectedSoundName();
+    if (current == sLastSeenSoundName || [current isEqualToString:sLastSeenSoundName]) return;
+    sLastSeenSoundName = [current copy];
+    ApolloLog(@"[Bark] Selected notification sound is now %@", current ?: @"(default)");
+    if (ApolloBarkModeActive()) {
+        ApolloBarkSyncBackendDeviceTransport();
+    }
+}
+
 __attribute__((constructor))
 static void ApolloBarkNotificationsInit(void) {
+    // Seed the last-seen sound BEFORE observing, so the first defaults write
+    // after launch doesn't read as a selection change.
+    sLastSeenSoundName = [ApolloBarkSelectedSoundName() copy];
     [[NSNotificationCenter defaultCenter] addObserverForName:NSUserDefaultsDidChangeNotification
                                                       object:nil
                                                        queue:nil
                                                   usingBlock:^(NSNotification * _Nonnull __unused note) {
         ApolloInvalidateBarkCache();
+        ApolloBarkSoundSelectionMaybeChanged();
     }];
 }
 
@@ -106,20 +160,35 @@ NSURL *ApolloBarkEffectivePushURL(void) {
     // query parameters override the JSON body on bark-server, so pinning the
     // default here would also stomp the per-post thumbnail icons the backend
     // sends. Stock-icon users get thumbnails when available and the backend's
-    // default-icon fallback otherwise.
-    NSString *name = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSelectedIconName];
-    if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+    // default-icon fallback otherwise. Same logic for the sound: no pick, no
+    // pin — the backend's body-level default (traloop) applies.
+    NSString *iconName = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSelectedIconName];
+    if (![iconName isKindOfClass:[NSString class]] || iconName.length == 0) {
+        iconName = nil;
+    }
+    NSString *soundName = ApolloBarkSelectedSoundName();
+    if (!iconName && !soundName) {
         return pushURL;
     }
 
     NSURLComponents *components = [NSURLComponents componentsWithURL:pushURL resolvingAgainstBaseURL:NO];
     if (!components) return pushURL;
     NSMutableArray<NSURLQueryItem *> *items = [components.queryItems mutableCopy] ?: [NSMutableArray array];
-    // Drop any stale icon param (e.g. hand-added by the user) before pinning.
+    // Drop stale icon/sound params (e.g. hand-added by the user) before
+    // pinning the current values.
     [items filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSURLQueryItem *item, NSDictionary * __unused bindings) {
-        return ![item.name isEqualToString:@"icon"];
+        if (iconName && [item.name isEqualToString:@"icon"]) return NO;
+        if (soundName && [item.name isEqualToString:@"sound"]) return NO;
+        return YES;
     }]];
-    [items addObject:[[NSURLQueryItem alloc] initWithName:@"icon" value:ApolloBarkNotificationIconURLString()]];
+    if (iconName) {
+        [items addObject:[[NSURLQueryItem alloc] initWithName:@"icon" value:ApolloBarkNotificationIconURLString()]];
+    }
+    if (soundName) {
+        // Verbatim NotificationSound id; bark-server appends ".caf", which
+        // matches the assets/bark-sounds/<id>.caf naming.
+        [items addObject:[[NSURLQueryItem alloc] initWithName:@"sound" value:soundName]];
+    }
     components.queryItems = items;
     return components.URL ?: pushURL;
 }
@@ -194,9 +263,11 @@ void ApolloBarkSendTestNotification(void (^completion)(BOOL ok, NSString *messag
         @"body": @"Bark delivery works! Notifications from your backend will arrive like this one.",
         @"url": @"apollo://reborn/settings",
         @"group": @"apollo",
-        // Selected app icon, or Apollo's stock icon — so the test previews
-        // the icon real notifications will carry.
+        // Selected app icon and sound, matching what real notifications will
+        // carry (sound falls back to Apollo's signature traloop, same as the
+        // backend's body-level default).
         @"icon": ApolloBarkNotificationIconURLString(),
+        @"sound": ApolloBarkSelectedSoundName() ?: @"traloop",
     };
     NSData *json = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
