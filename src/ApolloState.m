@@ -57,6 +57,10 @@ NSString *sLatestRedditBearerToken = nil;
 
 BOOL sEnableBulkTranslation = NO;
 BOOL sAutoTranslateOnAppear = YES;
+BOOL sTapToTranslate = NO;   // per-item "tap to translate" mode; overrides auto-translate display
+BOOL sShowTranslationDetails = YES;   // comments + post-header marker; default ON via registerDefaults
+BOOL sShowTranslationTitleDetails = YES;   // feed-title compact marker; default ON via registerDefaults
+BOOL sTranslationMarkerUseThemeColor = NO;   // NO = green marker; YES = follow app/theme tint
 BOOL sTranslatePostTitles = NO;
 NSString *sTranslationTargetLanguage = nil;
 NSString *sTranslationProvider = nil;

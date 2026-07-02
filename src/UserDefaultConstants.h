@@ -92,6 +92,17 @@ static NSString *const UDKeyAutoplayInlineGIFs = @"AutoplayInlineGIFs";
 // Bulk translation feature
 static NSString *const UDKeyEnableBulkTranslation = @"EnableBulkTranslation";
 static NSString *const UDKeyAutoTranslateOnAppear = @"AutoTranslateOnAppear";
+// Tap to Translate: everything stays in its original language with per-item tap
+// affordances ("Translate" under comments, a language marker next to post
+// stats); tapping translates just that item. Default OFF via registerDefaults.
+static NSString *const UDKeyTapToTranslate = @"TapToTranslate";
+// Per-item translation details: "Translated from ..." lines under comments/the
+// post header, and the compact language marker on feed post stats. Both default
+// ON via registerDefaults. Match App Colour tints the markers with the app
+// accent instead of green (default OFF).
+static NSString *const UDKeyShowTranslationDetails = @"ShowTranslationDetails";
+static NSString *const UDKeyShowTranslationTitleDetails = @"ShowTranslationTitleDetails";
+static NSString *const UDKeyTranslationMarkerUseThemeColor = @"TranslationMarkerUseThemeColor";
 static NSString *const UDKeyTranslatePostTitles = @"TranslatePostTitles";
 static NSString *const UDKeyTranslationTargetLanguage = @"TranslationTargetLanguage";
 static NSString *const UDKeyTranslationProvider = @"TranslationProvider"; // google | libre | apple
