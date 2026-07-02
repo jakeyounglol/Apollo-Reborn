@@ -1488,6 +1488,10 @@ static void initializeRandomSources() {
                                     UDKeyLiveCommentsFollow: @YES,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,
+                                    UDKeyTapToTranslate: @NO,
+                                    UDKeyShowTranslationDetails: @YES,
+                                    UDKeyShowTranslationTitleDetails: @YES,
+                                    UDKeyTranslationMarkerUseThemeColor: @NO,
                                     UDKeyTranslatePostTitles: @NO,
                                     UDKeyTranslationTargetLanguage: @"",
                                     UDKeyTranslationProviderUserSelected: @NO,
@@ -1602,6 +1606,10 @@ static void initializeRandomSources() {
     sEnableFlairColors = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
     sEnableBulkTranslation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableBulkTranslation];
     sAutoTranslateOnAppear = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoTranslateOnAppear];
+    sTapToTranslate = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTapToTranslate];
+    sShowTranslationDetails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowTranslationDetails];
+    sShowTranslationTitleDetails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowTranslationTitleDetails];
+    sTranslationMarkerUseThemeColor = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTranslationMarkerUseThemeColor];
     sTranslatePostTitles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTranslatePostTitles];
 
     NSString *targetLanguage = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyTranslationTargetLanguage];

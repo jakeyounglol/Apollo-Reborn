@@ -171,6 +171,9 @@ ifeq ($(APOLLO_SIM_BUILD),1)
 # MobileSubstrate generator does, so force-include it for the MSHookIvar template
 # (a pure ObjC-runtime helper with no CydiaSubstrate link dependency).
 ApolloReborn_CFLAGS += -DAPOLLO_SIM_BUILD=1 -include substrate.h
+# Swift sources gate sim-only test plumbing (e.g. the host Apple-translation
+# bridge in ApolloAppleTranslation.swift) on the same flag.
+ApolloReborn_SWIFTFLAGS += -DAPOLLO_SIM_BUILD
 # Xcode 27 sim builds raise DEPLOY_MIN to 15.0 (older targets fail libc++'s
 # "no longer supported" check), which turns UIApplication.windows deprecation
 # warnings into -Werror failures. Silence them rather than rewriting working

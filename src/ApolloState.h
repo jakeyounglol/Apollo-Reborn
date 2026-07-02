@@ -207,6 +207,10 @@ extern NSString *sLatestRedditBearerToken;
 
 extern BOOL sEnableBulkTranslation;
 extern BOOL sAutoTranslateOnAppear;
+extern BOOL sTapToTranslate;
+extern BOOL sShowTranslationDetails;
+extern BOOL sShowTranslationTitleDetails;
+extern BOOL sTranslationMarkerUseThemeColor;
 extern BOOL sTranslatePostTitles;
 extern NSString *sTranslationTargetLanguage;
 extern NSString *sTranslationProvider; // @"google", @"libre", or @"apple"

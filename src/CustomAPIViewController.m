@@ -2866,6 +2866,10 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
     ApolloSetLinkPreviewCardColorHex(restoredCardColorHex);
     sEnableBulkTranslation = [defaults boolForKey:UDKeyEnableBulkTranslation];
     sAutoTranslateOnAppear = [defaults boolForKey:UDKeyAutoTranslateOnAppear];
+    sTapToTranslate = [defaults boolForKey:UDKeyTapToTranslate];
+    sShowTranslationDetails = [defaults boolForKey:UDKeyShowTranslationDetails];
+    sShowTranslationTitleDetails = [defaults boolForKey:UDKeyShowTranslationTitleDetails];
+    sTranslationMarkerUseThemeColor = [defaults boolForKey:UDKeyTranslationMarkerUseThemeColor];
 
     NSString *targetLanguage = [defaults stringForKey:UDKeyTranslationTargetLanguage];
     sTranslationTargetLanguage = targetLanguage.length > 0 ? targetLanguage : nil;
