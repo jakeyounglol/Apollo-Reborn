@@ -1195,6 +1195,53 @@ static NSURLRequest *ApolloRedditGallerySubmitRequestFromForm(NSURLRequest *requ
 
 // MARK: - Request rewriting (submit)
 
+// ImgChest album submit fix (issue #552). Our album responder combines the member
+// uploads into one ImgChest post and hands Apollo a synthetic Imgur album response
+// whose id is the ImgChest post id. Apollo's createAlbum then rebuilds the post link
+// as https://imgur.com/a/<id> — keeping our ImgChest post id but swapping the host to
+// imgur.com, so the submitted link is a dead Imgur album. Rewrite the submit's `url`
+// field back to the real imgchest.com/p/<id> post (and inject composer body text if
+// supplied, mirroring the Imgur path). Single-image ImgChest posts submit the CDN link
+// directly, so ApolloImgurAlbumIDFromURLString returns nil for them and they pass
+// through untouched. Returns nil when nothing applied.
+static NSURLRequest *ApolloImgChestRewriteSubmitRequest(NSURLRequest *request, NSArray<NSString *> *pairs, NSString *bodyTextToInject) {
+    NSMutableArray<NSString *> *rewrittenPairs = [NSMutableArray arrayWithCapacity:pairs.count + 1];
+    BOOL changed = NO;
+    BOOL wroteText = NO;
+    NSString *rewrittenURL = nil;
+    for (NSString *pair in pairs) {
+        NSRange equals = [pair rangeOfString:@"="];
+        NSString *key = ApolloFormDecodeComponent(equals.location == NSNotFound ? pair : [pair substringToIndex:equals.location]);
+        NSString *value = ApolloFormDecodeComponent(equals.location == NSNotFound ? @"" : [pair substringFromIndex:equals.location + 1]);
+        if ([key isEqualToString:@"url"]) {
+            NSString *albumID = ApolloImgurAlbumIDFromURLString(value);
+            NSURL *imgChestURL = albumID.length > 0 ? ApolloImgChestPostURLForAlbumID(albumID) : nil;
+            if (imgChestURL.absoluteString.length > 0 && ![imgChestURL.absoluteString isEqualToString:value]) {
+                value = imgChestURL.absoluteString;
+                rewrittenURL = value;
+                changed = YES;
+            }
+        } else if ([key isEqualToString:@"text"] && bodyTextToInject.length > 0 && ApolloTrimmedString(value).length == 0) {
+            value = bodyTextToInject;
+            wroteText = YES;
+            changed = YES;
+        }
+        [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(key), ApolloFormEncodeComponent(value)]];
+    }
+    if (bodyTextToInject.length > 0 && !wroteText) {
+        [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"text"), ApolloFormEncodeComponent(bodyTextToInject)]];
+        changed = YES;
+    }
+    if (!changed) return nil;
+
+    NSMutableURLRequest *modified = [request mutableCopy];
+    NSData *newBody = [[rewrittenPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
+    modified.HTTPBody = newBody;
+    [modified setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length] forHTTPHeaderField:@"Content-Length"];
+    if (rewrittenURL.length > 0) ApolloLog(@"[ImgChestUpload] Rewrote multi-image submit url to ImgChest album %@", rewrittenURL);
+    return modified;
+}
+
 NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request) {
     if (!ApolloIsRedditLegacySubmitRequest(request)) return nil;
 
@@ -1224,6 +1271,16 @@ NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request) {
     else if (hasExistingRichTextJSON) preflightSkipReason = @"existing-richtext";
     else if (!hostedMediaForm) preflightSkipReason = @"not-hosted-media-form";
     ApolloMediaPostBodyLogSubmitDecision(@"preflight", formValues, composerBodyText, hostedMediaForm, preflightSkipReason);
+
+    if (sImageUploadProvider == ImageUploadProviderImgChest) {
+        // #552: fix the imgur.com/a/<id> -> imgchest.com/p/<id> album link, and
+        // inject composer body text in the same rebuild if applicable.
+        NSURLRequest *imgChestRequest = ApolloImgChestRewriteSubmitRequest(request, pairs, shouldInjectComposerBodyText ? composerBodyText : nil);
+        if (imgChestRequest) {
+            ApolloLog(@"[MediaPostBody] Rewrote ImgChest submit (album url fix + body=%@)", shouldInjectComposerBodyText ? @"yes" : @"no");
+        }
+        return imgChestRequest;
+    }
 
     if (sImageUploadProvider != ImageUploadProviderReddit) {
         if (!shouldInjectComposerBodyText) return nil;

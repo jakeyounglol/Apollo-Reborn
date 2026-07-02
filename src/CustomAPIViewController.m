@@ -552,10 +552,11 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place (effectiveRow 11) and
-        // follow-live-comments (effectiveRow 12) toggles, minus the conditional
-        // "Tap to Show Deleted Comments" row.
-        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
+        // General base rows + the search-in-place (effectiveRow 11),
+        // follow-live-comments (effectiveRow 12), iPad-tab-bar-bottom
+        // (effectiveRow 13) and icon-row-magnifier (effectiveRow 14) toggles,
+        // minus the conditional "Tap to Show Deleted Comments" row.
+        case SectionGeneral: return sShowDeletedComments ? 15 : 14;
         case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
@@ -1033,6 +1034,27 @@ typedef NS_ENUM(NSInteger, Tag) {
                                            detail:@"During Live Update comment sort, keep the newest at the top and show a jump button when you've scrolled down."
                                                on:[defaults boolForKey:UDKeyLiveCommentsFollow]
                                            action:@selector(liveCommentsFollowSwitchToggled:)];
+        case 13: {
+            // Temporary iPad stopgap (#387): dock the floating tab bar at the
+            // bottom instead of the top-center pill that overlaps the search bar.
+            BOOL supported = (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) && IsLiquidGlass();
+            UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_IPadTabBarBottom"
+                                                             label:@"Move Tab Bar to Bottom"
+                                                            detail:@"iPad only. Docks the tab bar at the bottom instead of the top."
+                                                                on:supported && [defaults boolForKey:UDKeyIPadTabBarBottom]
+                                                            action:@selector(iPadTabBarBottomSwitchToggled:)];
+            UISwitch *toggleSwitch = [cell.accessoryView isKindOfClass:[UISwitch class]] ? (UISwitch *)cell.accessoryView : nil;
+            toggleSwitch.enabled = supported;
+            cell.textLabel.enabled = supported;
+            cell.detailTextLabel.enabled = supported;
+            return cell;
+        }
+        case 14:
+            return [self switchCellWithIdentifier:@"Cell_Gen_IconRowMagnifier"
+                                            label:@"Magnify Info Row on Hold"
+                                           detail:@"Press and hold a post's info row (score, comments, time…) to magnify the icons and slide to the one you want."
+                                               on:[defaults boolForKey:UDKeyIconRowMagnifier]
+                                           action:@selector(iconRowMagnifierSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2137,8 +2159,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:4 inSection:SectionGeneral]];
     if (sShowDeletedComments) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-        [self showAlertWithTitle:@"Show Deleted Comments"
-                          message:@"This feature uses Arctic Shift to recover deleted comments. When Arctic Shift is slow or rate-limited, comments may load more slowly or recovered comments may not appear."];
+        [self showAlertWithTitle:@"⚠️ WARNING"
+                          message:@"This feature can slow down comment loading. If you notice comments loading slowly, turn this feature off."];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }
@@ -2165,6 +2187,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     sAutoHideTabBarShowOnIdle = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sAutoHideTabBarShowOnIdle forKey:UDKeyAutoHideTabBarShowOnIdle];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloAutoHideTabBarShowOnIdleChangedNotification" object:nil];
+}
+
+- (void)iPadTabBarBottomSwitchToggled:(UISwitch *)sender {
+    sIPadTabBarBottom = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sIPadTabBarBottom forKey:UDKeyIPadTabBarBottom];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
 }
 
 - (void)proxyImgurDDGSwitchToggled:(UISwitch *)sender {
@@ -2210,6 +2238,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
     sKeepSearchBarInPlace = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
+}
+
+- (void)iconRowMagnifierSwitchToggled:(UISwitch *)sender {
+    sIconRowMagnifier = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sIconRowMagnifier forKey:UDKeyIconRowMagnifier];
 }
 
 - (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {

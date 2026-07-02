@@ -41,6 +41,24 @@
 //       actually COMPLETED (cancelling the activity sheet leaves the preview up so
 //       you can tweak options and try again).
 //
+//   #5  SHARE BUTTON OFF-SCREEN ON SHORT PHONES (#551). The view controller lays its
+//       whole UI out with absolute frames directly on its (non-scrolling) view: title,
+//       a preview snapshot, the option rows, then the Share button at the bottom — the
+//       button's Y is `maxY(lastRow) + spacing` and the preview's height is whatever
+//       the preview node measures with NO cap, and the view's own height is never
+//       consulted (confirmed by RE: there's no UIScrollView and no clamp in this VC).
+//       So when "Include Post Details" pulls a tall post (image/gallery) into the
+//       preview, the button's Y grows past the bottom edge and is clipped — with no
+//       scroll view to reach it. It only bites on short screens (e.g. iPhone SE 3,
+//       667pt): taller phones have the room, which is why it slipped through. Fix:
+//       after Apollo's native layout, if the Share button's bottom falls below the
+//       visible area, shrink the on-screen preview (proportionally, preserving aspect)
+//       by the overflow and slide the rows + button back up by the same amount, so the
+//       button is always reachable. A no-op when everything already fits (so taller
+//       devices are untouched). The EXPORTED image is unaffected: the share path reads
+//       `previewSnapshotImageView.image` (the full-resolution snapshot), and we only
+//       resize the image view's display frame, never its `image`.
+//
 // Pure ObjC-runtime access + public UIKit; no hardcoded binary addresses.
 //
 // MODULE ORDERING (Makefile ApolloReborn_FILES): this module is listed LAST of the
@@ -141,10 +159,86 @@ static void ApolloSIPFPollSnapshot(UIViewController *vc, int attempt, CGFloat pr
     });
 }
 
+// #5: keep the Share button on-screen on short phones. Runs after Apollo's native
+// layout (which positions everything top-down with absolute frames and never clamps to
+// the view height). If the button's bottom has been pushed below the visible area,
+// shrink the preview snapshot (proportionally, so the image's aspect is preserved) by
+// exactly the overflow and slide every element below the preview — the option rows,
+// separators, and the Share button — up by that same delta. Idempotent and self-
+// correcting: each native layout pass restores the full-height preview and we re-clamp
+// from scratch, and because we only move existing subviews' frames (never the VC view's
+// bounds/margins) this can't drive another layout pass, so there's no loop. A no-op
+// whenever the button already fits, leaving taller devices untouched.
+static void ApolloSIPFClampShareButtonOnScreen(UIViewController *vc) {
+    if (![vc isViewLoaded]) return;
+    UIView *root = vc.viewIfLoaded;
+    if (!root) return;
+
+    UIView *previewIV = (UIView *)ApolloSIPFIvarObject(vc, "previewSnapshotImageView");
+    UIView *shareBtn  = (UIView *)ApolloSIPFIvarObject(vc, "shareButton");
+    if (![previewIV isKindOfClass:[UIView class]] || ![shareBtn isKindOfClass:[UIView class]]) return;
+
+    // All content (preview, rows, button) is parented to the same container — the
+    // preview's superview (rootView.contentView). Operate within that coordinate space.
+    UIView *container = previewIV.superview;
+    if (!container) return;
+    UIView *dropShadow = (UIView *)ApolloSIPFIvarObject(vc, "previewDropShadowView");
+
+    CGRect pf = previewIV.frame;
+    if (pf.size.height < 1.0 || pf.size.width < 1.0) return;
+    CGFloat previewBottom = CGRectGetMaxY(pf);
+
+    // Measure against the WINDOW's visible bottom, NOT the sheet view's own bounds:
+    // Apollo's Sourdough sheet sizes the presented view to its content, so on a short
+    // screen that view is itself TALLER than the window (its lower edge sits off-screen)
+    // — clamping to root.bounds would leave the button below the visible area. Convert
+    // the button into window space and compare against the window's safe bottom instead.
+    // root↔window is a pure translation (no scaling), so a delta computed here applies
+    // 1:1 to the subview frames we move below.
+    UIWindow *win = root.window;
+    if (![win isKindOfClass:[UIWindow class]]) return;
+    CGFloat bottomGap = MAX(win.safeAreaInsets.bottom, 8.0) + 12.0; // breathing room below the button
+    CGFloat visibleBottom = win.bounds.size.height - bottomGap;
+    CGFloat buttonBottom = CGRectGetMaxY([shareBtn convertRect:shareBtn.bounds toView:win]);
+    if (buttonBottom <= visibleBottom + 0.5) return; // already fits — no-op
+
+    CGFloat overflow = buttonBottom - visibleBottom;
+    static const CGFloat kMinPreviewHeight = 60.0; // don't shrink the preview to nothing
+    CGFloat newHeight = MAX(pf.size.height - overflow, kMinPreviewHeight);
+    CGFloat delta = pf.size.height - newHeight; // actual reduction we can apply (>= 0)
+    if (delta < 1.0) return; // preview already at its floor — nothing more we can do
+
+    // Shrink the preview proportionally (aspect preserved) and re-center horizontally.
+    CGFloat scale = newHeight / pf.size.height;
+    CGFloat newWidth = pf.size.width * scale;
+    CGRect newPF = CGRectMake(pf.origin.x + (pf.size.width - newWidth) / 2.0,
+                              pf.origin.y, newWidth, newHeight);
+    previewIV.frame = newPF;
+    if ([dropShadow isKindOfClass:[UIView class]]) dropShadow.frame = newPF; // shadow tracks the card
+
+    // Slide everything that sits below the preview up by the reclaimed delta.
+    for (UIView *v in container.subviews) {
+        if (v == previewIV || v == dropShadow) continue;
+        CGRect f = v.frame;
+        if (f.origin.y >= previewBottom - 1.0) {
+            f.origin.y -= delta;
+            v.frame = f;
+        }
+    }
+
+    ApolloLog(@"[SharePreviewFix] clamped: preview %.0f->%.0f (delta %.0f), button bottom %.0f -> visible %.0fpt window",
+              pf.size.height, newHeight, delta, buttonBottom, win.bounds.size.height);
+}
+
 %hook _TtC6Apollo26ShareAsImageViewController
 
 - (void)viewDidLayoutSubviews {
     %orig;
+
+    // #5: every pass, after the native absolute-frame layout, keep the Share button
+    // on-screen on short phones (no-op when it already fits). Must run each pass since
+    // toggling options (Include Post Details, parent count) re-runs the native layout.
+    ApolloSIPFClampShareButtonOnScreen((UIViewController *)self);
 
     // Arm the snapshot poll once, on the first layout after present. It observes the
     // preview node's size and refreshes the snapshot as soon as any async comment/post

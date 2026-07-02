@@ -77,6 +77,17 @@ NSURL *ApolloImgChestPostURLForUploadedLink(NSURL *cdnLink) {
     return [NSURL URLWithString:[@"https://imgchest.com/p/" stringByAppendingString:postID]];
 }
 
+NSURL *ApolloImgChestPostURLForAlbumID(NSString *albumID) {
+    if (![albumID isKindOfClass:[NSString class]] || albumID.length == 0) return nil;
+    NSDictionary *entry = ApolloUploadRegistryEntry(albumID);
+    NSString *provider = [entry[@"provider"] isKindOfClass:[NSString class]] ? entry[@"provider"] : nil;
+    if (![provider isEqualToString:kProviderImgChest]) return nil;
+    NSString *link = [entry[@"link"] isKindOfClass:[NSString class]] ? entry[@"link"] : nil;
+    if (link.length > 0) return [NSURL URLWithString:link];
+    NSString *postID = [entry[@"post"] isKindOfClass:[NSString class]] ? entry[@"post"] : nil;
+    return postID.length > 0 ? [NSURL URLWithString:[@"https://imgchest.com/p/" stringByAppendingString:postID]] : nil;
+}
+
 void ApolloUploadRegistryRecordRedditUpload(NSURL *mediaURL) {
     NSString *token = mediaURL.lastPathComponent;
     if (token.length == 0) return;

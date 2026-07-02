@@ -3685,6 +3685,31 @@ static BOOL ApolloLinkButtonHasInlineHost(ASDisplayNode *linkButtonNode) {
     if (!urlString) return %orig;
 
     NSURL *url = [NSURL URLWithString:urlString];
+
+    // #552: an ImgChest album LINK POST (imgchest.com/p/<id>) has no MarkdownNode
+    // body to carry an inline replacement, so previously nothing rendered the
+    // album here and the LinkPreviews card was suppressed → blank. Render the
+    // album cover inline (tap → the same swipeable viewer as in-text links),
+    // reusing the resolver + per-host node cache. If the same album was already
+    // inlined in a text body, hide this card to avoid a duplicate cover.
+    if (ApolloImageChestIsPostURL(url)) {
+        BOOL alreadyInlined = ApolloLinkButtonHasInlineHost((ASDisplayNode *)self)
+                           || ApolloInlineSuppressionContainsURL(url);
+        if (alreadyInlined) {
+            Class layoutSpecCls = NSClassFromString(@"ASLayoutSpec");
+            if (layoutSpecCls) {
+                ASLayoutSpec *empty = [[layoutSpecCls alloc] init];
+                [[empty style] setValue:[NSValue valueWithCGSize:CGSizeZero] forKey:@"preferredSize"];
+                return empty;
+            }
+            return %orig;
+        }
+        ASNetworkImageNode *coverNode = ApolloImageNodeForURL(url, (ASDisplayNode *)self);
+        ASLayoutSpec *wrapped = coverNode ? ApolloWrapImageNodeForLayout(coverNode, constrainedSize.max.width) : nil;
+        if (wrapped) return wrapped;   // resolved → album cover shown inline
+        return %orig;                  // still resolving → native card as placeholder
+    }
+
     if (!ApolloIsInlineRenderableImageURL(url) && !ApolloIsInlineRenderableVideoURL(url)) return %orig;
 
     // Album inline rendering depends on async resolution. Until that succeeds,

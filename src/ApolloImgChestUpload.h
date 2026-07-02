@@ -24,6 +24,13 @@ void ApolloImgChestUploadData(NSData *data,
 /// Used by the chat send path to send the short post link instead of the long CDN file URL.
 NSURL *_Nullable ApolloImgChestPostURLForUploadedLink(NSURL *cdnLink);
 
+/// When `albumID` is the id of a multi-image ImgChest album post this tweak created (issue #552),
+/// returns its real post URL (imgchest.com/p/<id>); nil otherwise. The synthetic Imgur album
+/// response we hand Apollo carries this id, and Apollo's createAlbum then rebuilds the submit link
+/// as imgur.com/a/<id> — keeping our ImgChest post id but swapping the host to imgur.com, which
+/// posts a dead Imgur album. The submit path uses this to rewrite that url back to ImgChest.
+NSURL *_Nullable ApolloImgChestPostURLForAlbumID(NSString *albumID);
+
 /// When `request` is an Imgur album-creation request whose member tokens are
 /// all cached ImgChest uploads, returns a block that asynchronously creates
 /// the combined ImgChest post and replies with a synthetic Imgur album

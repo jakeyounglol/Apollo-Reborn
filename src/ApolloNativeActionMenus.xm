@@ -777,6 +777,9 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
     }
 
     NSString *title = ApolloReadSwiftStringIvar(actionController, "actionsDescription") ?: @"";
+    // Issue #515: append "Public Sticky from Subreddit" when this is the removal
+    // "Notify user via…" menu (no-op otherwise).
+    ApolloInjectPublicStickyAsSubredditIfNeeded(children, title);
     return [UIMenu menuWithTitle:title children:children];
 }
 

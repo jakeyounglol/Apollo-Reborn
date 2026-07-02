@@ -95,4 +95,10 @@ uint32_t ApolloPackedColorFromHexString(NSString *hex);
 // main-thread NSString used by UI/persistence) and the render-safe packed
 // snapshot for the renderer. Call on the main thread.
 void ApolloSetLinkPreviewCardColorHex(NSString *hex);
+
+// Issue #515 (ApolloPublicStickyAsSubreddit): when `menuTitle` is the removal
+// "Notify user via…" menu, append a "Public Sticky from Subreddit" UIAction to
+// `children` (an NSMutableArray<UIMenuElement *>). No-op for any other menu.
+// Called from ApolloNativeActionMenuBuildMenu as it converts the action sheet.
+void ApolloInjectPublicStickyAsSubredditIfNeeded(NSMutableArray *children, NSString *menuTitle);
 __END_DECLS

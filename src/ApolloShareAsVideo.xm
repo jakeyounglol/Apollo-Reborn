@@ -64,6 +64,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "ApolloCommon.h"
+#import "ApolloHostedVideo.h"
 
 #pragma mark - Tunables
 
@@ -179,22 +180,40 @@ static NSURL *ApolloSVToExportableMP4(NSURL *url) {
     return nil;
 }
 
+#pragma mark - External hosted video (Streamable / Redgifs)
+
+// Some external video posts (Streamable, Redgifs) carry NO RDKVideo — Apollo plays
+// them inline by resolving the host's own API at runtime, but exposes them to the
+// share sheet only as a link card whose external page URL sits on -[RDKLink URL].
+// Apollo's resolved URL is never written back to the link and its resolvers are
+// pure-Swift (no @objc entry point), so we resolve the progressive mp4 ourselves
+// from the host's public API at export time. Host classification + resolution live
+// in the shared ApolloHostedVideo helper (also used by ApolloShareAsImageGallery to
+// replace the link card with the video poster). Both hosts serve a single combined
+// mp4 with embedded audio, so no separate audio track is needed.
+
 // SYNCHRONOUS feasibility check (decides whether the toggle is shown). True when
 // the post has a video we can produce a progressive, exportable file for:
 //   * a v.redd.it video (we'll resolve its DASH MP4 + audio at export time), or
-//   * a direct .mp4 URL.
-// HLS-only sources (Streamable / redgifs with no progressive form) return NO, so
-// the toggle simply never appears for them.
+//   * a direct .mp4 URL, or
+//   * a Streamable / Redgifs link post (resolved via the host API at export time).
 static BOOL ApolloSVPostIsExportableVideo(id link) {
+    // Preferred fast paths: a real RDKVideo we can export with no extra network —
+    // v.redd.it (DASH) or a direct .mp4. Reddit also synthesizes a v.redd.it
+    // previewVideo for some external link posts, which is covered here too.
     id video = ApolloSVBestVideo(link);
-    if (!video) return NO;
-
-    NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
-    NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
-    NSURL *small = (NSURL *)ApolloSVCall(video, @selector(smallerURL));
-
-    if (ApolloSVHostContains(url, @"v.redd.it") || ApolloSVHostContains(fb, @"v.redd.it")) return YES;
-    if (ApolloSVIsMP4(url) || ApolloSVIsMP4(fb) || ApolloSVIsMP4(small)) return YES;
+    if (video) {
+        NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
+        NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
+        NSURL *small = (NSURL *)ApolloSVCall(video, @selector(smallerURL));
+        if (ApolloSVHostContains(url, @"v.redd.it") || ApolloSVHostContains(fb, @"v.redd.it")) return YES;
+        if (ApolloSVIsMP4(url) || ApolloSVIsMP4(fb) || ApolloSVIsMP4(small)) return YES;
+    }
+    // External hosts Apollo plays inline but exposes only as a link card (no
+    // RDKVideo): Streamable / Redgifs. Their progressive mp4 is resolved from the
+    // link's page URL at export time, so offer the toggle here.
+    NSURL *pageURL = (NSURL *)ApolloSVCall(link, @selector(URL));
+    if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) return YES;
     return NO;
 }
 
@@ -282,52 +301,80 @@ static void ApolloSVResolveSources(id link, void (^completion)(NSURL *videoURL, 
         dispatch_async(dispatch_get_main_queue(), ^{ completion(v, a, s); });
     };
 
+    NSURL *pageURL = (NSURL *)ApolloSVCall(link, @selector(URL));
     id video = ApolloSVBestVideo(link);
-    if (!video) { done(nil, nil, CGSizeZero); return; }
-
-    NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
-    NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
-    NSURL *small = (NSURL *)ApolloSVCall(video, @selector(smallerURL));
-
-    double w = ApolloSVCallDouble(video, @selector(width));
-    double h = ApolloSVCallDouble(video, @selector(height));
+    NSURL *url   = video ? (NSURL *)ApolloSVCall(video, @selector(URL)) : nil;
+    NSURL *fb    = video ? (NSURL *)ApolloSVCall(video, @selector(fallbackURL)) : nil;
+    NSURL *small = video ? (NSURL *)ApolloSVCall(video, @selector(smallerURL)) : nil;
+    double w = video ? ApolloSVCallDouble(video, @selector(width))  : 0.0;
+    double h = video ? ApolloSVCallDouble(video, @selector(height)) : 0.0;
     CGSize natural = (w > 0 && h > 0) ? CGSizeMake(w, h) : CGSizeZero;
 
-    NSString *assetID = ApolloSVRedditAssetID(url) ?: ApolloSVRedditAssetID(fb);
-    if (assetID.length > 0) {
-        NSURL *mpd = [NSURL URLWithString:[NSString stringWithFormat:@"https://v.redd.it/%@/DASHPlaylist.mpd", assetID]];
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:mpd
-                                                          cachePolicy:NSURLRequestUseProtocolCachePolicy
-                                                      timeoutInterval:10.0];
-        ApolloLog(@"[ShareVideo] resolving v.redd.it asset=%@", assetID);
-        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
-            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
-                ? ((NSHTTPURLResponse *)response).statusCode : 0;
-            NSURL *videoURL = nil, *audioURL = nil;
-            if (!error && status >= 200 && status < 300 && data.length) {
-                videoURL = ApolloSVLowestDashURL(data, mpd, @"video");
-                audioURL = ApolloSVLowestDashURL(data, mpd, @"audio");
+    // Resolves from the post's RDKVideo: a v.redd.it DASH stream (split video+audio)
+    // or a direct progressive .mp4. Used for native videos, and as the fallback when
+    // a hosted-source resolve fails.
+    void (^resolveFromRDKVideo)(void) = ^{
+        if (!video) { done(nil, nil, natural); return; }
+        NSString *assetID = ApolloSVRedditAssetID(url) ?: ApolloSVRedditAssetID(fb);
+        if (assetID.length > 0) {
+            NSURL *mpd = [NSURL URLWithString:[NSString stringWithFormat:@"https://v.redd.it/%@/DASHPlaylist.mpd", assetID]];
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:mpd
+                                                              cachePolicy:NSURLRequestUseProtocolCachePolicy
+                                                          timeoutInterval:10.0];
+            ApolloLog(@"[ShareVideo] resolving v.redd.it asset=%@", assetID);
+            NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+                    ? ((NSHTTPURLResponse *)response).statusCode : 0;
+                NSURL *videoURL = nil, *audioURL = nil;
+                if (!error && status >= 200 && status < 300 && data.length) {
+                    videoURL = ApolloSVLowestDashURL(data, mpd, @"video");
+                    audioURL = ApolloSVLowestDashURL(data, mpd, @"audio");
+                }
+                if (!videoURL) {
+                    // Manifest unavailable/unparseable: fall back to the API's
+                    // progressive fallback MP4 (video-only, no audio).
+                    videoURL = ApolloSVIsMP4(fb) ? fb : (ApolloSVIsMP4(url) ? url : nil);
+                    audioURL = nil;
+                }
+                ApolloLog(@"[ShareVideo] v.redd.it resolved video=%@ audio=%@",
+                          videoURL ? @"yes" : @"no", audioURL ? @"yes" : @"no");
+                done(videoURL, audioURL, natural);
+            }];
+            [task resume];
+            return;
+        }
+        // Direct progressive MP4 (e.g. imgur). No separate audio track to fetch; if
+        // the file itself carries audio the composition picks it up from this asset.
+        NSURL *direct = ApolloSVIsMP4(url) ? url : (ApolloSVIsMP4(fb) ? fb : (ApolloSVIsMP4(small) ? small : nil));
+        if (direct) {
+            ApolloLog(@"[ShareVideo] direct mp4 resolved=yes");
+            done(direct, nil, natural);
+            return;
+        }
+        ApolloLog(@"[ShareVideo] no exportable RDKVideo source");
+        done(nil, nil, natural);
+    };
+
+    // Prefer the host's own mp4 for Streamable/Redgifs posts: it carries the
+    // original audio + full quality, whereas Reddit's reddit_video_preview (which
+    // ApolloSVBestVideo picks for these external links) is SILENT and re-encoded.
+    // Fall back to the RDKVideo path if the host resolve fails.
+    if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) {
+        ApolloLog(@"[ShareVideo] hosted post — preferring host mp4 over reddit preview");
+        ApolloHostedVideoResolve(pageURL, ^(NSURL *mp4, __unused NSURL *poster,
+                                            CGSize pixelSize, __unused BOOL hasAudio) {
+            if (mp4) {
+                CGSize sz = (natural.width > 0 && natural.height > 0) ? natural : pixelSize;
+                done(mp4, nil, sz);
+            } else {
+                ApolloLog(@"[ShareVideo] host resolve failed — falling back to RDKVideo");
+                resolveFromRDKVideo();
             }
-            if (!videoURL) {
-                // Manifest unavailable/unparseable: fall back to the API's
-                // progressive fallback MP4 (video-only, no audio).
-                videoURL = ApolloSVIsMP4(fb) ? fb : (ApolloSVIsMP4(url) ? url : nil);
-                audioURL = nil;
-            }
-            ApolloLog(@"[ShareVideo] v.redd.it resolved video=%@ audio=%@",
-                      videoURL ? @"yes" : @"no", audioURL ? @"yes" : @"no");
-            done(videoURL, audioURL, natural);
-        }];
-        [task resume];
+        });
         return;
     }
-
-    // Direct progressive MP4 (e.g. imgur). No separate audio track to fetch; if
-    // the file itself carries audio the composition picks it up from this asset.
-    NSURL *direct = ApolloSVIsMP4(url) ? url : (ApolloSVIsMP4(fb) ? fb : (ApolloSVIsMP4(small) ? small : nil));
-    ApolloLog(@"[ShareVideo] direct mp4 resolved=%@", direct ? @"yes" : @"no");
-    done(direct, nil, natural);
+    resolveFromRDKVideo();
 }
 
 #pragma mark - Card image + media rect
@@ -397,7 +444,18 @@ static BOOL ApolloSVMediaRectNormalized(id vc, CGRect *outNorm) {
         id baseCommentNode = ApolloSVIvarObject(previewNode, "baseCommentNode");
         mediaNode = ApolloSVLargestMediaNode(baseCommentNode ?: previewNode);
     } else {
-        mediaNode = ApolloSVIvarObject(previewNode, "imageNode");
+        // Native media posts expose the preview's imageNode directly. External
+        // video link posts (Streamable / Redgifs) render a link-preview card whose
+        // thumbnail isn't `imageNode`, so target the largest image/video node in
+        // the card — that thumbnail is what we composite the video over. Each path
+        // cross-falls-back to the other for robustness.
+        NSURL *pageURL = (NSURL *)ApolloSVCall(ApolloSVIvarObject(vc, "link"), @selector(URL));
+        if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) {
+            mediaNode = ApolloSVLargestMediaNode(previewNode) ?: ApolloSVIvarObject(previewNode, "imageNode");
+            ApolloLog(@"[ShareVideo] hosted-link post media node=%@", mediaNode ? @"largest" : @"none");
+        } else {
+            mediaNode = ApolloSVIvarObject(previewNode, "imageNode") ?: ApolloSVLargestMediaNode(previewNode);
+        }
     }
     if (!mediaNode) return NO;
 
@@ -593,11 +651,19 @@ static CGFloat ApolloSVEven(CGFloat v) { long n = lround(v); if (n & 1) n += 1; 
 // during export and completion(outURL,error) on the main queue when finished.
 // Keeps strong refs to its CALayers/session on `vc` so nothing is reclaimed
 // mid-export.
-static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
-                           NSURL *videoURL, NSURL *audioURL,
-                           void (^progress)(float p),
-                           void (^completion)(NSURL *outURL, NSError *error)) {
+// Composites the live video over the card and exports an mp4. `videoURL` should be
+// a LOCAL file (materialized by ApolloSVExport) so AVFoundation reads the full
+// track list. `tempVideoFile`, if non-nil, is that downloaded temp file and is
+// deleted once the export finishes or fails.
+static void ApolloSVComposeAndExport(id vc, UIImage *card, CGRect mediaNorm,
+                                     NSURL *videoURL, NSURL *audioURL, NSURL *tempVideoFile,
+                                     void (^progress)(float p),
+                                     void (^completion)(NSURL *outURL, NSError *error)) {
+    void (^cleanupTemp)(void) = ^{
+        if (tempVideoFile) [[NSFileManager defaultManager] removeItemAtURL:tempVideoFile error:nil];
+    };
     void (^fail)(NSString *) = ^(NSString *why) {
+        cleanupTemp();
         ApolloLog(@"[ShareVideo] export FAIL: %@", why);
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(nil, [NSError errorWithDomain:@"ApolloShareVideo" code:1
@@ -749,6 +815,7 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
             // retained card image) is released with the composition after export.
             dispatch_async(dispatch_get_main_queue(), ^{
                 objc_setAssociatedObject(vc, &kApolloShareVideoSessionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                cleanupTemp(); // the downloaded source is no longer needed
                 if (st == AVAssetExportSessionStatusCompleted) {
                     ApolloLog(@"[ShareVideo] export OK -> %@", outPath);
                     completion(outURL, nil);
@@ -759,6 +826,78 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
                 }
             });
         }];
+    });
+}
+
+#pragma mark - Source materialization + export entry
+
+// Downloads a remote http(s) URL to a local temp .mp4, returning its file URL (nil
+// on failure). AVFoundation needs a LOCAL file to reliably enumerate every track:
+// streaming a non-fast-start mp4 (e.g. Redgifs' CDN files) can leave the embedded
+// audio track undiscovered, exporting a silent clip. A local copy also dodges
+// signed-URL expiry mid-export. A browser User-Agent is sent so CDN-gating hosts
+// (Redgifs) still serve it. cb runs on the URLSession queue.
+static void ApolloSVDownloadToTemp(NSURL *url, void (^cb)(NSURL *localURL)) {
+    if (![url isKindOfClass:[NSURL class]]) { cb(nil); return; }
+    NSString *scheme = url.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) { cb(nil); return; }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                  timeoutInterval:60.0];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        forHTTPHeaderField:@"User-Agent"];
+    ApolloLog(@"[ShareVideo] materializing source to temp…");
+    NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithRequest:req
+        completionHandler:^(NSURL *tmp, NSURLResponse *response, NSError *error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+            ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        if (error || !tmp || (status && (status < 200 || status >= 300))) {
+            ApolloLog(@"[ShareVideo] source download failed (http %ld: %@) — falling back to streaming",
+                      (long)status, error.localizedDescription);
+            cb(nil); return;
+        }
+        NSURL *dest = [[NSURL fileURLWithPath:NSTemporaryDirectory()]
+            URLByAppendingPathComponent:[NSString stringWithFormat:@"ApolloShareVideoSrc-%@.mp4",
+                                         [[NSUUID UUID] UUIDString]]];
+        [[NSFileManager defaultManager] removeItemAtURL:dest error:nil];
+        NSError *moveErr = nil;
+        if (![[NSFileManager defaultManager] moveItemAtURL:tmp toURL:dest error:&moveErr]) {
+            ApolloLog(@"[ShareVideo] temp move failed: %@ — falling back to streaming", moveErr.localizedDescription);
+            cb(nil); return;
+        }
+        cb(dest);
+    }];
+    [task resume];
+}
+
+// Export entry. For the COMBINED-mp4 case (audioURL == nil: Streamable / Redgifs /
+// direct mp4) the embedded audio lives in the video file itself, so the file is
+// first materialized to local temp — otherwise non-fast-start sources export
+// silent. v.redd.it (separate audio track, audioURL != nil) is the common path and
+// already streams reliably, so it is left untouched. Falls back to streaming if the
+// download fails.
+static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
+                           NSURL *videoURL, NSURL *audioURL,
+                           void (^progress)(float p),
+                           void (^completion)(NSURL *outURL, NSError *error)) {
+    if (![card isKindOfClass:[UIImage class]] || !videoURL) {
+        ApolloLog(@"[ShareVideo] export FAIL: missing card or video url");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, [NSError errorWithDomain:@"ApolloShareVideo" code:1
+                                            userInfo:@{NSLocalizedDescriptionKey: @"missing card or video url"}]);
+        });
+        return;
+    }
+    ApolloLog(@"[ShareVideo] export entry: audioURL=%@", audioURL ? @"present" : @"nil");
+    if (audioURL != nil) { // v.redd.it: separate audio track streams fine
+        ApolloSVComposeAndExport(vc, card, mediaNorm, videoURL, audioURL, nil, progress, completion);
+        return;
+    }
+    ApolloSVDownloadToTemp(videoURL, ^(NSURL *localVideoURL) {
+        NSURL *useVideoURL = localVideoURL ?: videoURL;
+        NSURL *tempVideoFile = (localVideoURL && localVideoURL.isFileURL) ? localVideoURL : nil;
+        ApolloSVComposeAndExport(vc, card, mediaNorm, useVideoURL, audioURL, tempVideoFile, progress, completion);
     });
 }
 

@@ -3400,15 +3400,6 @@ static ApolloLinkPreview *ApolloLPPreviewByApplyingTranslation(ASDisplayNode *ho
     return displayPreview;
 }
 
-static ASLayoutSpec *ApolloLPEmptyLayoutSpec(void) {
-    Class layoutSpecCls = ApolloLPClass(@"ASLayoutSpec");
-    if (!layoutSpecCls) return nil;
-
-    ASLayoutSpec *empty = [[layoutSpecCls alloc] init];
-    ApolloLPApplyStyleSize([empty style], CGSizeZero);
-    return empty;
-}
-
 static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL *url, id nativeSpec) {
     NSString *redditUsername = ApolloLPRedditUsernameFromProfileURL(url);
     if (redditUsername.length == 0 || !ApolloBannedProfileCachedIsSuspended(redditUsername)) {
@@ -3458,10 +3449,15 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
         }
     }
     if (ApolloLPIsImageChestAlbumURL(url)) {
-        ApolloLPLogOncePerHost(host, @"suppress-imagechest-card");
+        // #552: defer to the inline-image album renderer (ApolloInlineImages'
+        // LinkButtonNode hook) instead of suppressing to empty. Suppressing left
+        // ImgChest album LINK POSTS blank — the inline-image album only rendered
+        // for in-text links, never a bare link post, so nothing filled the space.
+        // Deferring lets the album cover render (or the native card show as a
+        // placeholder / failure fallback) regardless of hook load order.
+        ApolloLPLogOncePerHost(host, @"defer-imagechest-album");
         ApolloLPRestoreHostShell((ASDisplayNode *)self);
-        ASLayoutSpec *empty = ApolloLPEmptyLayoutSpec();
-        return empty ?: %orig;
+        return %orig;
     }
 
     NSInteger selectedMode = ApolloLPModeForArea(area);

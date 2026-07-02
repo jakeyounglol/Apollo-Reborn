@@ -1416,6 +1416,9 @@ static char kApolloAISummaryOwnerKey;
 static char kApolloAISummaryIsPostKey;
 
 static void ApolloAIForceHeaderRemeasure(NSString *fullName);
+static void ApolloAIForceHeaderRemeasureForNode(id headerNode, NSString *fullName, NSInteger attemptsLeft);
+static void ApolloAIRealizeHeaderNodeDisplay(id headerNode);
+static void ApolloAIApplyRestoredState(id headerNode, NSString *fullName);
 
 static UIColor *ApolloAISummaryThemeAccent(id headerNode) {
     NSString *fullName = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
@@ -1661,8 +1664,11 @@ static void ApolloAIRenderSummaryNode(id headerNode, BOOL isPost) {
 // Single source of truth for a box: set its state (+ ready/streamed text or
 // error message) and re-render. No-ops if nothing changed so we don't trigger
 // redundant relayouts.
-static void ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState state, NSString *text) {
-    if (!headerNode) return;
+// Returns YES iff the box's state/text actually changed (so callers can issue
+// exactly one row-height remeasure on a real change, and skip it on a no-op —
+// which is what keeps scroll redisplay from re-measuring an unchanged header).
+static BOOL ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState state, NSString *text) {
+    if (!headerNode) return NO;
     const void *stateKey = isPost ? &kApolloAIPostStateKey : &kApolloAICommentStateKey;
     const void *summaryKey = isPost ? &kApolloAIPostSummaryKey : &kApolloAICommentSummaryKey;
     const void *errorKey = isPost ? &kApolloAIPostErrorKey : &kApolloAICommentErrorKey;
@@ -1671,7 +1677,7 @@ static void ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState sta
 
     ApolloAIBoxState oldState = ApolloAIGetBoxState(headerNode, isPost);
     NSString *oldText = objc_getAssociatedObject(headerNode, textKey);
-    if (oldState == state && (text == oldText || [text isEqualToString:oldText])) return;
+    if (oldState == state && (text == oldText || [text isEqualToString:oldText])) return NO;
 
     // Collapsed by default so opening a comments view remains visually stable.
     // Generation and streaming still begin immediately in the background; the
@@ -1687,19 +1693,24 @@ static void ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState sta
     ApolloAIRenderSummaryNode(headerNode, isPost);
     [headerNode invalidateCalculatedLayout];
     [headerNode setNeedsLayout];
+    return YES;
 }
 
-static void ApolloAISetBoxStateOnMatchingHeaders(NSString *fullName, BOOL isPost, ApolloAIBoxState state, NSString *text) {
-    if (fullName.length == 0) return;
+// Returns YES iff at least one matching header actually changed state, so the
+// caller can remeasure exactly once on a real change.
+static BOOL ApolloAISetBoxStateOnMatchingHeaders(NSString *fullName, BOOL isPost, ApolloAIBoxState state, NSString *text) {
+    if (fullName.length == 0) return NO;
+    BOOL changed = NO;
     for (id headerNode in sHeaderNodes.allObjects) {
         NSString *headerFullName = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
         if (headerFullName.length == 0) {
             headerFullName = ApolloAILinkFullName(ApolloAIScanForLink(headerNode));
         }
         if ([headerFullName isEqualToString:fullName]) {
-            ApolloAISetBoxState(headerNode, isPost, state, text);
+            if (ApolloAISetBoxState(headerNode, isPost, state, text)) changed = YES;
         }
     }
+    return changed;
 }
 
 // Promote idle (none) boxes for this post to the loading state, without
@@ -1719,28 +1730,65 @@ static void ApolloAIShowLoadingIfIdle(NSString *fullName, BOOL isPost) {
 // Apply the current known state of a post to a (re)appearing header — used when
 // a header cell loads mid-generation or is recycled, so it doesn't show a blank
 // box. Mirrors the caches / in-flight / failed bookkeeping.
-static void ApolloAIRestoreStateForHeader(id headerNode, NSString *fullName) {
+// Apply the post/comment box state from the caches/in-flight/captured bookkeeping
+// onto a (re)appearing header. Split out of ApolloAIRestoreStateForHeader so the
+// whole cascade can be DEFERRED off the cell's first layout pass (see below).
+// Returns nothing; remeasures + realizes display once, only on a real change.
+static void ApolloAIApplyRestoredState(id headerNode, NSString *fullName) {
     if (!headerNode || fullName.length == 0) return;
+    BOOL changed = NO;
     if ([sPostSuppressed containsObject:fullName]) {
         // No usable article content — keep the box hidden on recycle. Must be
         // checked BEFORE sPostFailed, or a recycled header would surface the
         // error triangle for a post we deliberately hid.
-        ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateNone, nil);
+        if (ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateNone, nil)) changed = YES;
     } else if (sPostSummaryCache[fullName].length > 0) {
-        ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
+        if (ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName])) changed = YES;
     } else if ([sPostFailed containsObject:fullName]) {
-        ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateError, nil);
+        if (ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateError, nil)) changed = YES;
     } else if ([sPostInFlight containsObject:fullName]) {
-        ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateLoading, nil);
+        if (ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateLoading, nil)) changed = YES;
     }
     if (sCommentSummaryCache[fullName].length > 0) {
-        ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateReady, sCommentSummaryCache[fullName]);
+        if (ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateReady, sCommentSummaryCache[fullName])) changed = YES;
     } else if ([sCommentFailed containsObject:fullName]) {
-        ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateError, nil);
+        if (ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateError, nil)) changed = YES;
     } else if ([sCommentInFlight containsObject:fullName] ||
                [sCapturedComments[fullName] count] >= kApolloAIMinComments) {
-        ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateLoading, nil);
+        if (ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateLoading, nil)) changed = YES;
     }
+    if (changed) {
+        // Re-query the row height AND force a real display pass (see
+        // ApolloAIForceHeaderRemeasureForNode). Already on a later runloop turn
+        // (this whole function is dispatched), so no re-entrancy concern.
+        ApolloAIForceHeaderRemeasureForNode(headerNode, fullName, 2);
+    }
+}
+
+// Apply the current known state of a post to a (re)appearing header — used when a
+// header cell loads mid-generation or is recycled, so it doesn't show a blank box.
+//
+// #526 (round 2): we DEFER the whole state application to the next runloop turn
+// instead of applying it synchronously here. RestoreStateForHeader runs from the
+// header cell's didLoad/didEnterDisplayState DURING the push transition, before
+// the fresh cell has had its first natural (boxless) layout + DISPLAY pass. On a
+// cache hit, applying Ready synchronously injects the AI card into that very first
+// pass: the row then measures TALL (the spec reserves the card's height) but the
+// freshly-attached card/background subnodes — and the toolbar that shares the
+// rebuilt lower stack — never get a display pass for that layout, so the lower
+// half draws BLANK (the empty gap users reported; round 1's begin/endUpdates
+// couldn't fix it because re-querying a cached height can't realize a missing
+// layer). Deferring makes the cell measure + display boxless FIRST — exactly the
+// known-good first-entry timing — then introduces the card a turn later on a live,
+// displaying node, where ApplyRestoredState remeasures AND force-realizes display.
+static void ApolloAIRestoreStateForHeader(id headerNode, NSString *fullName) {
+    if (!headerNode || fullName.length == 0) return;
+    __weak id weakHeader = headerNode;
+    NSString *fn = [fullName copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id strong = weakHeader;
+        if (strong) ApolloAIApplyRestoredState(strong, fn);
+    });
 }
 
 // Hide a post's link/article box: the linked page yielded no usable prose
@@ -1796,16 +1844,105 @@ static BOOL ApolloAIErrorIsTransientConcurrency(NSError *error) {
     return error.code == 9;
 }
 
+// Force a header cell node's AI card/background subnodes (and the re-parented
+// lower stack — toolbar, etc.) to actually DRAW. begin/endUpdates only re-queries
+// the cached row HEIGHT; on re-entry the box state is applied before the fresh
+// cell's first display pass, so the card subnodes get a reserved frame (the row
+// measures TALL) but their backing layers are never realized for that display
+// cycle → a tall, empty/undrawn gap (#526). A re-query cannot realize a missing
+// layer; only a real top-down layout + display pass can. That is exactly what
+// backgrounding→foregrounding does (which users found fixes it), reproduced here
+// synchronously and scoped to the one header. Selectors resolved at runtime so we
+// don't depend on private ASDisplayKit headers, and guarded so a node that isn't
+// loaded yet is skipped rather than force-loaded.
+static void ApolloAIRealizeHeaderNodeDisplay(id headerNode) {
+    if (!headerNode) return;
+    if ([headerNode respondsToSelector:@selector(isNodeLoaded)] &&
+        !(((BOOL (*)(id, SEL))objc_msgSend)(headerNode, @selector(isNodeLoaded)))) return;
+    if ([headerNode respondsToSelector:@selector(setNeedsLayout)])
+        ((void (*)(id, SEL))objc_msgSend)(headerNode, @selector(setNeedsLayout));
+    if ([headerNode respondsToSelector:@selector(layoutIfNeeded)])
+        ((void (*)(id, SEL))objc_msgSend)(headerNode, @selector(layoutIfNeeded));
+    if ([headerNode respondsToSelector:@selector(recursivelyEnsureDisplaySynchronously:)])
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(headerNode, @selector(recursivelyEnsureDisplaySynchronously:), YES);
+}
+
+// Realize display on every live header for this post (used by the fullName-keyed
+// remeasure path, which has no single node reference).
+static void ApolloAIRealizeHeadersForFullName(NSString *fullName) {
+    if (fullName.length == 0) return;
+    for (id headerNode in sHeaderNodes.allObjects) {
+        NSString *hfn = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
+        if ([hfn isEqualToString:fullName]) ApolloAIRealizeHeaderNodeDisplay(headerNode);
+    }
+}
+
 static void ApolloAIForceHeaderRemeasure(NSString *fullName) {
     UIViewController *vc = [sControllerByFullName objectForKey:fullName];
     UITableView *tableView = ApolloAICommentsTableView(vc);
     if (!tableView) return;
 
     // Texture has already cached the row's old height. begin/end updates asks
-    // the backing UITableView to query the node's newly invalidated layout.
+    // the backing UITableView to query the node's newly invalidated layout, then
+    // we force the affected header(s) to actually draw (see
+    // ApolloAIRealizeHeaderNodeDisplay — fixes the tall-but-undrawn gap, #526).
     [tableView beginUpdates];
     [tableView endUpdates];
-    ApolloLog(@"[AISummary][UI] requested header remeasure for %@", fullName);
+    ApolloAIRealizeHeadersForFullName(fullName);
+    ApolloLog(@"[AISummary][UI] requested header remeasure+realize for %@", fullName);
+}
+
+// Resolve the comments UITableView straight from the header cell node's own view
+// hierarchy. The header (an ASCellNode) is hosted inside its UITableView well
+// before viewDidAppear registers the controller in sControllerByFullName — and
+// re-entry restores the box from didLoad/didEnterDisplayState, DURING the push
+// transition, when that registration hasn't happened yet. Resolving from the node
+// makes the re-entry remeasure independent of controller registration timing,
+// which is what makes the #526 fix deterministic rather than racy.
+static UITableView *ApolloAITableViewForHeaderNode(id headerNode) {
+    if (!headerNode || ![headerNode respondsToSelector:@selector(view)]) return nil;
+    // Don't force a node to load its backing view just to look for a table.
+    if ([headerNode respondsToSelector:@selector(isNodeLoaded)] &&
+        !(((BOOL (*)(id, SEL))objc_msgSend)(headerNode, @selector(isNodeLoaded)))) return nil;
+    UIView *v = ((UIView *(*)(id, SEL))objc_msgSend)(headerNode, @selector(view));
+    for (UIView *cur = v; cur; cur = cur.superview) {
+        if ([cur isKindOfClass:[UITableView class]]) return (UITableView *)cur;
+    }
+    return nil;
+}
+
+// Re-query a header's row height, finding the table from the NODE first (preferred,
+// works mid-transition) and falling back to the controller map. Same begin/end
+// updates mechanism as ApolloAIForceHeaderRemeasure: ApolloAISetBoxState only
+// invalidates the node's calculated layout, NOT the UITableView's cached row
+// height, so a box restored on re-entry would otherwise compose into a row sized
+// for the old (boxless) content and render as an empty/clipped card (#526). If no
+// table resolves yet (cell not attached AND controller not registered), retry on
+// the next runloop turn — by then the cell is on screen — capped so it can't loop.
+static void ApolloAIForceHeaderRemeasureForNode(id headerNode, NSString *fullName, NSInteger attemptsLeft) {
+    if (!headerNode) return;
+    UITableView *tableView = ApolloAITableViewForHeaderNode(headerNode);
+    if (!tableView) {
+        UIViewController *vc = [sControllerByFullName objectForKey:fullName];
+        tableView = ApolloAICommentsTableView(vc);
+    }
+    if (!tableView) {
+        if (attemptsLeft > 0) {
+            __weak id weakHeader = headerNode;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                id strong = weakHeader;
+                if (strong) ApolloAIForceHeaderRemeasureForNode(strong, fullName, attemptsLeft - 1);
+            });
+        }
+        return;
+    }
+    [tableView beginUpdates];
+    [tableView endUpdates];
+    // The actual #526 cure: re-querying the height above is not enough on
+    // re-entry (the row is already TALL but the card/toolbar layers were never
+    // drawn). Force a real top-down layout + display pass on this header.
+    ApolloAIRealizeHeaderNodeDisplay(headerNode);
+    ApolloLog(@"[AISummary][UI] re-entry remeasure+realize for %@ (table=%p)", fullName, tableView);
 }
 
 // Is any live header for this post currently showing the expanded body of the
@@ -2380,7 +2517,11 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
         // here.)
         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
     } else if (cacheValid) {
-        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
+        // Cache HIT on re-entry: set Ready, then remeasure the row height if it
+        // actually changed. Without this the row keeps the stale boxless height
+        // Texture measured before the state was applied -> empty card (#526).
+        if (ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]))
+            ApolloAIForceHeaderRemeasure(fullName);
     } else if (sEnableTapToSummarize && (haveBody || haveArticle) &&
                ![sTapRequested containsObject:postTapKey] &&
                ![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
@@ -2493,7 +2634,10 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
     if (sEnableAICommentSummaries) {
     NSString *cachedCommentSummary = sCommentSummaryCache[fullName];
     if (cachedCommentSummary.length > 0) {
-        ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateReady, cachedCommentSummary);
+        // Cache HIT on re-entry: set Ready, then remeasure only on a real change,
+        // matching the post branch above. Closes the comment side of #526.
+        if (ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateReady, cachedCommentSummary))
+            ApolloAIForceHeaderRemeasure(fullName);
     } else if (![sCommentInFlight containsObject:fullName] &&
                ![sCommentFailed containsObject:fullName]) {
         NSUInteger commentCount = 0;
