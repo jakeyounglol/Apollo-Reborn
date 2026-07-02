@@ -15,6 +15,7 @@
 #import "ApolloImgChestUpload.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloPushNotifications.h"
+#import "ApolloBarkNotifications.h"
 #import "ApolloState.h"
 #import "Tweak.h"
 #import "CustomAPIViewController.h"
@@ -1323,19 +1324,61 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // Loading Notifications — contact developer" alert — telling users to contact a
 // developer about something no developer can fix at runtime.
 //
-// Push, watchers, and inbox alerts genuinely can't be delivered without the
-// entitlement, so faking a successful registration would only mislead users
-// into thinking notifications work. Instead we (1) swallow *only* this specific,
-// unfixable error here so the scary alert never appears, and (2) replace the
-// Notifications settings screen with a clear explanation (see the
-// NotificationsViewController hook below). Genuine, transient failures (offline,
-// rate limiting, …) fall through to %orig and keep their original error so real
-// problems still surface.
+// APNs genuinely can't deliver without the entitlement, so by default we
+// (1) swallow *only* this specific, unfixable error here so the scary alert
+// never appears, and (2) replace the Notifications settings screen with a
+// clear explanation (see the NotificationsViewController hook below).
+// Genuine, transient failures (offline, rate limiting, …) fall through to
+// %orig and keep their original error so real problems still surface.
+//
+// With Bark mode active (see ApolloBarkNotifications.h) the failure instead
+// becomes the trigger for the synthetic registration: Apollo attempted a real
+// registration (so its token-fetch completions are queued and this callback
+// arrives on the main thread), and we answer it with the persistent synthetic
+// token. Apollo then runs its ENTIRE native registration/notification-
+// settings/watcher flow unmodified — POST /v1/device and friends fire at the
+// legacy hosts and are rewritten to the self-hosted backend, where the device
+// registers with transport=bark and delivery happens via the Bark app.
 %hook _TtC6Apollo11AppDelegate
 - (void)application:(UIApplication *)application didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
     if (ApolloErrorIsMissingPushEntitlement(error)) {
+        if (ApolloBarkModeActive()) {
+            NSData *token = ApolloBarkSyntheticTokenData();
+            if (token) {
+                ApolloLog(@"[Bark] No aps-environment entitlement but Bark mode is active — answering the failed registration with the synthetic device token so Apollo's native notification flow proceeds.");
+                // _TtC6Apollo11AppDelegate is only forward-declared; the
+                // protocol cast gives clang the selector signature.
+                [(id<UIApplicationDelegate>)self application:application didRegisterForRemoteNotificationsWithDeviceToken:token];
+                return;
+            }
+        }
         ApolloLog(@"[Push] Missing aps-environment entitlement (free-account sideload) — push can never be delivered on this build. Suppressing the misleading registration error; the Notifications screen explains why instead.");
         return;
+    }
+    %orig;
+}
+
+// If a REAL APNs token ever arrives (the user re-signed with a paid dev
+// account), the synthetic Bark device row on the backend becomes a stale
+// duplicate: Bark send failures deliberately never delete device rows, so
+// without this the user would get every notification twice (Bark + APNs).
+// Delete the synthetic registration before letting Apollo register the real
+// token.
+- (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
+    NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
+    if (synthetic.length > 0 && deviceToken.length > 0) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:deviceToken.length * 2];
+        const uint8_t *bytes = (const uint8_t *)deviceToken.bytes;
+        for (NSUInteger i = 0; i < deviceToken.length; i++) {
+            [hex appendFormat:@"%02x", bytes[i]];
+        }
+        if (![hex isEqualToString:synthetic]) {
+            ApolloLog(@"[Bark] Real APNs token arrived; retiring the synthetic Bark device registration.");
+            ApolloBarkDeleteBackendDevice(synthetic);
+            // One-shot: drop the stored token so this doesn't refire every
+            // launch. A later free re-sign just generates a fresh one.
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyBarkSyntheticDeviceToken];
+        }
     }
     %orig;
 }
@@ -1354,6 +1397,13 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // the install logic lives in a C helper taking a plain UIViewController*.
 static void ApolloInstallNotificationsUnavailableOverlay(UIViewController *controller) {
     if (ApolloPushNotificationsSupported()) {
+        return;
+    }
+    // Bark mode makes the stock Notifications screen fully functional (the
+    // synthetic registration above answers Apollo's token fetch), so leave it
+    // alone. The overlay's copy points users at the Bark setup when this
+    // returns NO.
+    if (ApolloBarkModeActive()) {
         return;
     }
     // 'APNU' — unique enough to find our overlay again without a second add.

@@ -117,7 +117,7 @@ UIView *ApolloMakeNotificationsUnavailableView(void) {
         [UIColor secondaryLabelColor]);
 
     UILabel *footnote = ApolloUnavailableLabel(
-        @"To use notifications, install a build signed with a paid Apple Developer account. Everything else in Apollo keeps working as normal.",
+        @"To get notifications on this build anyway, install the free Bark app from the App Store, copy its push URL (Server > right-click the key), and enable Bark Delivery in Settings > General > Custom API alongside your notification backend. Or install a build signed with a paid Apple Developer account.",
         [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
         [UIColor secondaryLabelColor]);
 

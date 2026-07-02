@@ -21,10 +21,14 @@ extern "C" {
 // string found for application"), which Apollo resurfaces as an alarming
 // "Error Loading Notifications — contact developer" alert.
 //
-// Rather than fake a working registration (which would mislead users into
-// thinking push could work), the tweak detects this signing-time limitation up
-// front, replaces the Notifications screen with a clear explanation, and
-// suppresses the misleading error. The helpers below back that behavior.
+// By default the tweak detects this signing-time limitation up front,
+// replaces the Notifications screen with a clear explanation, and suppresses
+// the misleading error — faking a working registration with no delivery path
+// would only mislead users. The one exception is Bark mode (see
+// ApolloBarkNotifications.h): when the user has configured delivery through
+// the Bark app, a synthetic registration is genuinely backed by a working
+// delivery path, so the failed registration is answered with a synthetic
+// token instead and the stock Notifications screen is left alone.
 
 // YES when the running build carries an `aps-environment` entitlement, i.e. push
 // registration can actually succeed (an App Store build, or a sideload signed

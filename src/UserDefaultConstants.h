@@ -206,6 +206,23 @@ static NSString *const UDKeyNotificationBackendURL = @"NotificationBackendURL";
 // endpoints (/v1/device, /v1/device/{apns}/account[s]).
 static NSString *const UDKeyNotificationBackendRegistrationToken = @"NotificationBackendRegistrationToken";
 
+// Bark delivery for free-account sideloads (no aps-environment entitlement).
+// When enabled AND a valid Bark push URL is set AND the backend above is
+// configured, the tweak feeds Apollo a synthetic device token so its native
+// notification/watcher registration runs, and the backend delivers via an
+// HTTP POST to the Bark push URL instead of APNs. Ignored entirely on builds
+// that carry a real push entitlement.
+static NSString *const UDKeyBarkNotificationsEnabled = @"BarkNotificationsEnabled";
+// Full Bark push URL: https://api.day.app/<device_key> or a self-hosted
+// bark-server equivalent. The device key is a bearer capability — treat it
+// like a password.
+static NSString *const UDKeyBarkPushURL = @"BarkPushURL";
+// The synthetic 64-hex device token registered with the backend in place of
+// an APNs token. Generated once (SecRandomCopyBytes) and persisted so the
+// backend device row stays stable across launches; travels in settings
+// backups automatically (whole-plist backup).
+static NSString *const UDKeyBarkSyntheticDeviceToken = @"BarkSyntheticDeviceToken";
+
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
 
