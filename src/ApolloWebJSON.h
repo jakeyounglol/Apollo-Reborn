@@ -66,6 +66,15 @@ id ApolloWebJSONFixupModeratorsResponseObject(NSURLResponse *response, id respon
 // OAuth path is untouched). Called from the RDKResponseSerializer hook.
 BOOL ApolloWebJSONShouldStubInvitedModerators(NSURLResponse *response);
 
+// YES if `response` is a cookie-routed GET /r/<sub>/api/link_flair(_v2) or
+// user_flair(_v2) — OAuth-only endpoints that 404 on www.reddit.com — and a
+// cookie session is active. The caller should override the parsed result to an
+// empty array (and clear the parse/status error) so the post composer's Submit
+// drawer loads with no flair options instead of hanging/erroring. NO for any
+// other endpoint or when the active account is OAuth. Called from the
+// RDKResponseSerializer hook.
+BOOL ApolloWebJSONShouldStubFlairList(NSURLResponse *response);
+
 // Hydrates the legacy single-session globals from the keychain, migrating any
 // legacy NSUserDefaults cookie value, then any legacy single-global session,
 // into the per-account ApolloWebSessionStore (see that file's harvest path for
@@ -91,6 +100,14 @@ BOOL ApolloWebJSONHasUsableSession(void);
 // account on disk. Implemented in ApolloWebJSONIdentity.xm. The caller should
 // prompt a relaunch: AccountManager loads accounts once per launch.
 BOOL ApolloWebJSONSynthesizeSignedInAccount(NSString *username);
+
+// Re-arms expiry detection for `username` after a fresh harvest replaced its
+// stored session: clears the "already announced" latch, the block-page streak,
+// and any probe backoff, so the NEW session's health is tracked from scratch.
+// Called from the harvest path (login VC + silent re-harvester); without it a
+// re-authenticated account could never be detected as expired again until the
+// next app launch.
+void ApolloWebJSONNoteSessionReauthenticated(NSString *username);
 
 // Posted (on the main thread) the first time a harvested session is observed to
 // have expired/been revoked, with userInfo[@"username"] set to the (lowercased)

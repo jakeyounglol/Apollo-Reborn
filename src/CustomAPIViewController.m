@@ -2142,14 +2142,14 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
-// Adding ANOTHER web-session account when one already exists must clear the
-// shared WKWebView cookie jar first, or the login page would just silently
-// reuse the already-signed-in web user (see ApolloWebSessionLoginViewController.h).
+// This row is "manage/refresh my web login", NOT "add another account", so it
+// must NOT clear the shared WKWebView cookie jar: the jar usually holds the
+// live, server-rotated login this account depends on (and that the silent
+// re-harvest recovers from). The plain login flow detects an existing jar
+// login and offers Keep (re-harvest it) / Re-authenticate — exactly the right
+// choices here. Only account-ADD flows (switcher/chooser) clear the jar first.
 - (void)presentWebSessionLoginViewController {
-    BOOL hasExistingWebSession = ApolloWebSessionUsernames().count > 0;
-    ApolloWebSessionLoginViewController *vc = hasExistingWebSession
-        ? [ApolloWebSessionLoginViewController loginControllerForAdditionalAccount]
-        : [ApolloWebSessionLoginViewController new];
+    ApolloWebSessionLoginViewController *vc = [ApolloWebSessionLoginViewController new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     [self presentViewController:nav animated:YES completion:nil];
 }

@@ -4,6 +4,7 @@
 #import "UserDefaultConstants.h"
 #import "Defaults.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloWebSessionLoginViewController.h" // silent re-harvest before the expiry prompt
 
 #import <Security/Security.h>
 
@@ -175,6 +176,15 @@ static ApolloWebJSONPathKind ApolloWebJSONClassifyReadPath(NSString *path) {
         if ([what isEqualToString:@"about"]) return ApolloWebJSONPathListing;    // /r/<sub>/about[/...]
         if ([what isEqualToString:@"wiki"]) return ApolloWebJSONPathListing;     // /r/<sub>/wiki/...
         if ([what isEqualToString:@"duplicates"]) return ApolloWebJSONPathListing;
+        // Subreddit-scoped /r/<sub>/api/* GETs (link_flair, user_flair, …).
+        // Some are OAuth-only and 404 on www (the flair-list stub covers the
+        // ones the composer needs), but they MUST be routed regardless: left
+        // on oauth they 401 against the synthetic bearer, and the identity
+        // layer's instant-success token refresh turns that into an infinite
+        // 401→refresh→retry loop (~8 req/s, observed live hanging the Submit
+        // drawer on /r/<sub>/api/link_flair). A definitive www response —
+        // even a 404 — ends the cycle.
+        if ([what isEqualToString:@"api"]) return ApolloWebJSONPathAPI;
         return ApolloWebJSONPathUnsupported;
     }
 
@@ -363,6 +373,19 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
     if (isWrite && session.modhash.length > 0) {
         [mutable setValue:session.modhash forHTTPHeaderField:@"X-Modhash"];
     }
+    // Shape cookie-authed writes like the browser requests Reddit's anti-bot
+    // expects: a same-origin fetch from www.reddit.com carries these on every
+    // real browser write, and a bare non-browser-shaped POST is the likely
+    // trigger for the "breaks right after I change a setting / edit my
+    // subscriptions" block-page reports. Reads pass without them today, so
+    // they're added on the write path only (smallest change that can help).
+    if (isWrite) {
+        [mutable setValue:@"https://www.reddit.com" forHTTPHeaderField:@"Origin"];
+        [mutable setValue:@"https://www.reddit.com/" forHTTPHeaderField:@"Referer"];
+        [mutable setValue:@"same-origin" forHTTPHeaderField:@"Sec-Fetch-Site"];
+        [mutable setValue:@"cors" forHTTPHeaderField:@"Sec-Fetch-Mode"];
+        [mutable setValue:@"empty" forHTTPHeaderField:@"Sec-Fetch-Dest"];
+    }
 
     [mutable setValue:([sUserAgent length] > 0 ? sUserAgent : defaultUserAgent) forHTTPHeaderField:@"User-Agent"];
 
@@ -390,9 +413,28 @@ static NSMutableSet<NSString *> *sSessionExpiredAnnouncedUsers;
 static NSMutableSet<NSString *> *sSessionProbeInFlightUsers;
 static const NSUInteger kSessionExpiredBlockThreshold = 3;
 
+// Backoff state for inconclusive probes (rate limit / server error / network
+// blip): probe again later instead of declaring the session dead on a signal
+// that says nothing about the cookie. Keyed by lowercased username.
+static NSMutableDictionary<NSString *, NSNumber *> *sProbeBackoffAttemptsByUser;
+static const NSTimeInterval kProbeBackoffDelays[] = {30.0, 120.0, 480.0, 900.0};
+static const NSUInteger kProbeBackoffDelayCount = sizeof(kProbeBackoffDelays) / sizeof(kProbeBackoffDelays[0]);
+
+static void ApolloWebJSONMergeSetCookiesFromResponse(NSString *username, NSHTTPURLResponse *http);
+
 static void ApolloWebJSONResetBlockStreak(NSString *username) {
     @synchronized (ApolloWebJSONExpiryLock()) {
         [sConsecutiveBlockResponsesByUser removeObjectForKey:username];
+    }
+}
+
+void ApolloWebJSONNoteSessionReauthenticated(NSString *username) {
+    NSString *key = [[username ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    if (key.length == 0) return;
+    @synchronized (ApolloWebJSONExpiryLock()) {
+        [sConsecutiveBlockResponsesByUser removeObjectForKey:key];
+        [sSessionExpiredAnnouncedUsers removeObject:key];
+        [sProbeBackoffAttemptsByUser removeObjectForKey:key];
     }
 }
 
@@ -429,31 +471,175 @@ static void ApolloWebJSONVerifySessionThenAnnounce(NSString *username) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-        BOOL alive = NO;
+        // Three-way verdict. "Inconclusive" (rate limit, server error, network
+        // blip, challenge page served as 200) says nothing about the cookie:
+        // announcing on it kills a healthy session and trains the user to
+        // re-login pointlessly, so those back off and probe again instead.
+        typedef NS_ENUM(NSInteger, ProbeVerdict) { ProbeInconclusive, ProbeAlive, ProbeDead };
+        ProbeVerdict verdict = ProbeInconclusive;
+        NSString *contentType = [http.allHeaderFields[@"Content-Type"] lowercaseString] ?: @"";
         if (http.statusCode == 200 && data.length > 0) {
             id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             NSDictionary *d = [json isKindOfClass:[NSDictionary class]] ? json[@"data"] : nil;
             NSString *name = [d isKindOfClass:[NSDictionary class]] ? d[@"name"] : nil;
-            alive = [name isKindOfClass:[NSString class]] && name.length > 0;
+            if ([name isKindOfClass:[NSString class]] && name.length > 0) {
+                verdict = ProbeAlive;
+            } else if ([json isKindOfClass:[NSDictionary class]]) {
+                // A logged-out /api/me.json is HTTP 200 with an empty JSON
+                // object — the definitive "this cookie no longer signs in".
+                verdict = ProbeDead;
+            }
+            // 200 with a non-JSON body (challenge page) stays inconclusive.
+        } else if (http.statusCode == 403 && [contentType containsString:@"text/html"]) {
+            // The anonymous block page on a direct probe: the cookie itself no
+            // longer authenticates. (A sustained IP rate limit can also look
+            // like this — the silent re-harvest gate downstream of the expiry
+            // notification is what disambiguates those.)
+            verdict = ProbeDead;
         }
 
-        if (alive) {
+        if (verdict == ProbeAlive) {
             ApolloWebJSONResetBlockStreak(username);
+            @synchronized (ApolloWebJSONExpiryLock()) { [sProbeBackoffAttemptsByUser removeObjectForKey:username]; }
+            // A successful probe is the perfect moment to fold in any rotated
+            // auth cookies the response carried.
+            ApolloWebJSONMergeSetCookiesFromResponse(username, http);
             ApolloLog(@"[WebJSON] Session probe for u/%@ still authenticates — suppressing false expiry prompt", username);
+        } else if (verdict == ProbeDead) {
+            // The stored snapshot no longer signs in — but the persistent
+            // WKWebView jar usually still holds a LIVE login for this user
+            // (Reddit rotates its cookies there, while our frozen header went
+            // stale). Try a silent re-harvest first; only the visible prompt
+            // when that also fails. Success re-arms all expiry state via
+            // ApolloWebJSONNoteSessionReauthenticated inside the harvest.
+            ApolloLog(@"[WebJSON] Session probe for u/%@ came back logged-out (HTTP %ld) — attempting silent re-harvest before prompting",
+                      username, (long)http.statusCode);
+            [ApolloWebSessionLoginViewController attemptSilentReharvestForUsername:username completion:^(BOOL success) {
+                if (success) return; // recovered without UI; nothing to announce
+                @synchronized (ApolloWebJSONExpiryLock()) {
+                    [sSessionExpiredAnnouncedUsers addObject:username];
+                    [sProbeBackoffAttemptsByUser removeObjectForKey:username];
+                }
+                ApolloLog(@"[WebJSON] Silent re-harvest for u/%@ failed — session expired, prompting re-login", username);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloWebJSONSessionExpiredNotification
+                                                                          object:nil
+                                                                        userInfo:@{@"username": username}];
+                });
+            }];
         } else {
-            @synchronized (ApolloWebJSONExpiryLock()) { [sSessionExpiredAnnouncedUsers addObject:username]; }
-            ApolloLog(@"[WebJSON] Session probe for u/%@ failed (HTTP %ld%@) — session expired, prompting re-login",
-                      username, (long)http.statusCode, error ? [@", " stringByAppendingString:error.localizedDescription] : @"");
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[NSNotificationCenter defaultCenter] postNotificationName:ApolloWebJSONSessionExpiredNotification
-                                                                      object:nil
-                                                                    userInfo:@{@"username": username}];
+            // Inconclusive: schedule a backoff re-probe. Honor Retry-After when
+            // the server sent one; otherwise walk the exponential table.
+            NSUInteger attempt;
+            @synchronized (ApolloWebJSONExpiryLock()) {
+                if (!sProbeBackoffAttemptsByUser) sProbeBackoffAttemptsByUser = [NSMutableDictionary dictionary];
+                attempt = sProbeBackoffAttemptsByUser[username].unsignedIntegerValue;
+                sProbeBackoffAttemptsByUser[username] = @(attempt + 1);
+            }
+            NSTimeInterval delay = kProbeBackoffDelays[MIN(attempt, kProbeBackoffDelayCount - 1)];
+            NSTimeInterval retryAfter = [http.allHeaderFields[@"Retry-After"] doubleValue];
+            if (retryAfter > delay) delay = MIN(retryAfter, 900.0);
+            ApolloLog(@"[WebJSON] Session probe for u/%@ inconclusive (HTTP %ld%@) — not treating as expiry, re-probing in %.0fs",
+                      username, (long)http.statusCode, error ? [@", " stringByAppendingString:error.localizedDescription] : @"", delay);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                BOOL stillBlocked;
+                @synchronized (ApolloWebJSONExpiryLock()) {
+                    stillBlocked = sConsecutiveBlockResponsesByUser[username].unsignedIntegerValue >= kSessionExpiredBlockThreshold;
+                }
+                if (stillBlocked) {
+                    ApolloWebJSONVerifySessionThenAnnounce(username);
+                } else {
+                    // A good response came through while we were waiting — the
+                    // burst was transient, forget the backoff.
+                    @synchronized (ApolloWebJSONExpiryLock()) { [sProbeBackoffAttemptsByUser removeObjectForKey:username]; }
+                }
             });
         }
         @synchronized (ApolloWebJSONExpiryLock()) { [sSessionProbeInFlightUsers removeObject:username]; }
         [session finishTasksAndInvalidate];
     }];
     [task resume];
+}
+
+#pragma mark - Set-Cookie rotation capture
+
+// Auth-relevant cookie names worth persisting when Reddit rotates them via
+// Set-Cookie. Deliberately NOT every cookie: session_tracker (analytics)
+// rotates on nearly every response and would churn a keychain write each
+// time, while these rotate rarely (token_v2 is a ~24h JWT) but are exactly
+// the ones whose staleness kills the stored session.
+static NSSet<NSString *> *ApolloWebJSONMergeableCookieNames(void) {
+    static NSSet *names;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        names = [NSSet setWithArray:@[@"reddit_session", @"token_v2", @"loid", @"csrf_token", @"edgebucket"]];
+    });
+    return names;
+}
+
+// Merge server-rotated auth cookies from a cookie-authed www.reddit.com
+// response back into the stored per-account session header. The stored header
+// is a frozen snapshot from harvest time; without this, Reddit's token_v2
+// rotation (~24h) silently invalidates the snapshot while the server-side
+// session stays perfectly alive — the root cause of the "stops working a few
+// times a day, but the login browser says I'm already signed in" reports.
+// Serialized behind a lock: two concurrent responses doing read-modify-write
+// against the same keychain item must not interleave.
+static void ApolloWebJSONMergeSetCookiesFromResponse(NSString *username, NSHTTPURLResponse *http) {
+    if (username.length == 0 || !http) return;
+    if ([http valueForHTTPHeaderField:@"Set-Cookie"].length == 0) return;
+    NSArray<NSHTTPCookie *> *cookies = [NSHTTPCookie cookiesWithResponseHeaderFields:http.allHeaderFields
+                                                                              forURL:[NSURL URLWithString:@"https://www.reddit.com/"]];
+    if (cookies.count == 0) return;
+
+    static NSObject *mergeLock;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ mergeLock = [NSObject new]; });
+
+    @synchronized (mergeLock) {
+        ApolloWebSessionEntry *entry = ApolloWebSessionFor(username);
+        if (entry.cookieHeader.length == 0) return;
+
+        // Parse the stored "name=value; name2=value2" header into ordered pairs
+        // so the re-serialized header keeps a stable shape.
+        NSMutableArray<NSString *> *order = [NSMutableArray array];
+        NSMutableDictionary<NSString *, NSString *> *values = [NSMutableDictionary dictionary];
+        for (NSString *pair in [entry.cookieHeader componentsSeparatedByString:@"; "]) {
+            NSRange eq = [pair rangeOfString:@"="];
+            if (eq.location == NSNotFound || eq.location == 0) continue;
+            NSString *name = [pair substringToIndex:eq.location];
+            if (!values[name]) [order addObject:name];
+            values[name] = [pair substringFromIndex:eq.location + 1];
+        }
+
+        BOOL changed = NO;
+        for (NSHTTPCookie *c in cookies) {
+            if (![ApolloWebJSONMergeableCookieNames() containsObject:c.name]) continue;
+            // A past expiry (or empty value) is the server deleting the cookie.
+            BOOL deletion = c.value.length == 0 || (c.expiresDate && c.expiresDate.timeIntervalSinceNow < 0);
+            if (deletion) {
+                if (values[c.name]) {
+                    [order removeObject:c.name];
+                    [values removeObjectForKey:c.name];
+                    changed = YES;
+                    ApolloLog(@"[WebJSON] Server expired cookie %@ for u/%@ — dropping it from the stored session", c.name, username);
+                }
+                continue;
+            }
+            if ([values[c.name] isEqualToString:c.value]) continue;
+            if (!values[c.name]) [order addObject:c.name];
+            values[c.name] = c.value;
+            changed = YES;
+            ApolloLog(@"[WebJSON] Server rotated cookie %@ for u/%@ — refreshing the stored session", c.name, username);
+        }
+        if (!changed) return;
+
+        NSMutableArray<NSString *> *pairs = [NSMutableArray arrayWithCapacity:order.count];
+        for (NSString *name in order) {
+            [pairs addObject:[NSString stringWithFormat:@"%@=%@", name, values[name]]];
+        }
+        ApolloWebSessionSet(username, [pairs componentsJoinedByString:@"; "], entry.modhash);
+    }
 }
 
 void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
@@ -478,11 +664,27 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     NSString *username = ApolloWebJSONAccountFromURL(url);
     if (username.length == 0) return;
 
+    // Persist server-rotated auth cookies before the expiry accounting.
+    // Successful responses only: a 403 block/challenge page never carries a
+    // fresh token_v2, and merging challenge cookies could poison the header.
+    NSHTTPURLResponse *earlyHTTP = (NSHTTPURLResponse *)response;
+    if (earlyHTTP.statusCode >= 200 && earlyHTTP.statusCode < 400) {
+        ApolloWebJSONMergeSetCookiesFromResponse(username, earlyHTTP);
+    }
+
     BOOL alreadyAnnounced;
     @synchronized (ApolloWebJSONExpiryLock()) {
         alreadyAnnounced = [sSessionExpiredAnnouncedUsers containsObject:username];
     }
     if (alreadyAnnounced) return;
+
+    // New-modmail endpoints (/api/mod/conversations…) are OAuth2-only: they
+    // return the 403 HTML block page for ANY cookie-authed request, healthy
+    // session or not (verified live — mod.reddit.com refuses the bare cookie
+    // too). For a moderator account they fire on every inbox refresh, so
+    // counting them would poison the expiry streak with permanent false
+    // evidence. They say nothing about the session either way — ignore them.
+    if ([url.path hasPrefix:@"/api/mod/"]) return;
 
     NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
     // Reddit's anonymous block page is HTTP 403 with a ~190 KB text/html body.
@@ -493,11 +695,16 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     BOOL isBlockPage = (http.statusCode == 403) && [contentType containsString:@"text/html"];
 
     if (!isBlockPage) {
-        // Any non-block response on a cookie-authed request means the session is
-        // still answering us, so clear the streak. This is what keeps a transient
-        // Cloudflare/rate-limit/captcha block page from accumulating toward a
-        // false expiry: a 200 (or even a 403 JSON content error) in between resets
-        // the count.
+        // A 429 or 5xx says nothing about the session either way — hold the
+        // streak where it is (it's neither evidence of death nor of life), so a
+        // rate-limit burst mixed into a block-page streak can't fake or mask a
+        // real expiry.
+        if (http.statusCode == 429 || http.statusCode >= 500) return;
+        // Any other non-block response on a cookie-authed request means the
+        // session is still answering us, so clear the streak. This is what keeps
+        // a transient Cloudflare/rate-limit/captcha block page from accumulating
+        // toward a false expiry: a 200 (or even a 403 JSON content error) in
+        // between resets the count.
         ApolloWebJSONResetBlockStreak(username);
         return;
     }
@@ -772,6 +979,29 @@ BOOL ApolloWebJSONShouldStubInvitedModerators(NSURLResponse *response) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         re = [NSRegularExpression regularExpressionWithPattern:@"^/api/v1/[^/]+/moderators_invited/?$"
+                                                         options:0 error:NULL];
+    });
+    return [re firstMatchInString:path options:0 range:NSMakeRange(0, path.length)] != nil;
+}
+
+// GET /r/<sub>/api/link_flair(_v2) — the post composer's flair-template list —
+// is OAuth-only: the www mirror 404s for cookie auth (verified live; old
+// reddit picks flair via a different POST flow the app can't use). The rewrite
+// still routes it to www so it draws a definitive 404 instead of the oauth
+// 401→refresh→retry loop (see the classifier note), and this override turns
+// that 404 into an empty flair list so the Submit drawer loads normally — no
+// flair choices, a missing feature rather than a hang. user_flair(_v2) gets
+// the same treatment for symmetry. OAuth accounts untouched (session gate).
+BOOL ApolloWebJSONShouldStubFlairList(NSURLResponse *response) {
+    if (!ApolloWebJSONHasUsableSession()) return NO;
+    if (![response isKindOfClass:[NSHTTPURLResponse class]]) return NO;
+    NSString *host = [((NSHTTPURLResponse *)response).URL.host lowercaseString] ?: @"";
+    if (![host isEqualToString:@"www.reddit.com"]) return NO;
+    NSString *path = [((NSHTTPURLResponse *)response).URL.path lowercaseString] ?: @"";
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"^/r/[^/]+/api/(link_flair|user_flair)(_v2)?/?$"
                                                          options:0 error:NULL];
     });
     return [re firstMatchInString:path options:0 range:NSMakeRange(0, path.length)] != nil;
