@@ -61,11 +61,10 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
     return logicalRow;
 }
 
-// Canonical row indices within SectionNotificationBackend. The two Bark rows
-// only exist on builds without a push entitlement (a free-account sideload —
-// on paid-cert builds Bark mode never engages, so showing its controls would
-// be noise); when hidden, the rows below them slide up two slots. Mirrors the
-// Media-section mapping below.
+// Row indices within SectionNotificationBackend. The Bark rows are always
+// visible: on builds without a push entitlement Bark is the only delivery
+// path, and on entitled builds it's an optional alternative transport (the
+// backend flips the device row between apns and bark on re-registration).
 typedef NS_ENUM(NSInteger, ApolloNotifBackendRow) {
     kNotifBackendRowURL = 0,
     kNotifBackendRowToken,
@@ -75,14 +74,6 @@ typedef NS_ENUM(NSInteger, ApolloNotifBackendRow) {
     kNotifBackendRowTestBark,
     kNotifBackendRowCount
 };
-
-// Map a physical (visible) Notification Backend row to its canonical index.
-static NSInteger ApolloNotifBackendLogicalRow(NSInteger physicalRow) {
-    if (ApolloPushNotificationsSupported() && physicalRow >= kNotifBackendRowBarkSwitch) {
-        return physicalRow + 2;
-    }
-    return physicalRow;
-}
 
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
@@ -591,9 +582,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // off, plus the hold-speed picker (logical row 13) when that toggle is on.
         case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows) + (sVideoHoldSpeedEnabled ? 1 : 0);
         case SectionSubreddits: return 10 - (sSubredditListEnhancements ? 0 : 1) - (sCommunityHighlights ? 0 : 1);
-        // URL + Registration Token + Test Connection, plus the two Bark rows
-        // on builds where APNs can never deliver (no push entitlement).
-        case SectionNotificationBackend: return ApolloPushNotificationsSupported() ? 3 : kNotifBackendRowCount;
+        case SectionNotificationBackend: return kNotifBackendRowCount;
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
     }
@@ -1301,9 +1290,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
-- (UITableViewCell *)notificationBackendCellForRow:(NSInteger)physicalRow tableView:(UITableView *)tableView {
-    NSInteger row = ApolloNotifBackendLogicalRow(physicalRow);
-
+- (UITableViewCell *)notificationBackendCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
     if (row == kNotifBackendRowURL) {
         NSString *currentURL = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendURL] ?: @"";
         UITableViewCell *cell = [self stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_URL"
@@ -1336,7 +1323,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (row == kNotifBackendRowBarkSwitch) {
         return [self switchCellWithIdentifier:@"Cell_NotifBackend_BarkSwitch"
                                         label:@"Bark Delivery"
-                                       detail:@"Deliver notifications through the free Bark app — no push entitlement needed."
+                                       detail:@"Deliver notifications through the free Bark app instead of native push. Works without a push entitlement."
                                            on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBarkNotificationsEnabled]
                                        action:@selector(barkNotificationsSwitchToggled:)];
     }
@@ -1592,14 +1579,16 @@ typedef NS_ENUM(NSInteger, Tag) {
             attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/nickclyde/apollo-backend"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" instance. APNs delivery requires a paid Apple Developer account on the signing side. Leave empty to disable."
             attributes:plainAttrs]];
-        if (!ApolloPushNotificationsSupported()) {
-            [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n\nThis build has no push entitlement, so APNs can never deliver — Bark Delivery works around that: install the free "
-                attributes:plainAttrs]];
-            [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
-                attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
-            [text appendAttributedString:[[NSAttributedString alloc] initWithString:@", copy its push URL, and notifications arrive via Bark with a tap-through back into Apollo. Note: notification content passes through the Bark relay unencrypted."
-                attributes:plainAttrs]];
-        }
+        NSString *barkLead = ApolloPushNotificationsSupported()
+            ? @"\n\nThis build has working native push, but Bark Delivery can reroute notifications through the free "
+            : @"\n\nThis build has no push entitlement, so APNs can never deliver — Bark Delivery works around that: install the free ";
+        NSString *barkTail = ApolloPushNotificationsSupported()
+            ? @" instead; toggling flips the delivery transport immediately, and native push resumes when turned off. Note: notification content passes through the Bark relay unencrypted."
+            : @", copy its push URL, and notifications arrive via Bark with a tap-through back into Apollo (after setup, open Apollo's Notifications settings once to finish registering). Note: notification content passes through the Bark relay unencrypted.";
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkLead attributes:plainAttrs]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkTail attributes:plainAttrs]];
     } else {
         return nil;
     }
@@ -1730,7 +1719,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self presentVideoHoldSpeedSheetFromSourceView:cell];
         }
     } else if (indexPath.section == SectionNotificationBackend) {
-        NSInteger row = ApolloNotifBackendLogicalRow(indexPath.row);
+        NSInteger row = indexPath.row;
         if (row == kNotifBackendRowTestConnection) {
             [self testNotificationBackendConnection];
         } else if (row == kNotifBackendRowTestBark) {
@@ -1847,8 +1836,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
     if (indexPath.section == SectionNotificationBackend) {
-        NSInteger row = ApolloNotifBackendLogicalRow(indexPath.row);
-        return (row == kNotifBackendRowTestConnection || row == kNotifBackendRowTestBark);
+        return (indexPath.row == kNotifBackendRowTestConnection || indexPath.row == kNotifBackendRowTestBark);
     }
     return NO;
 }
@@ -2125,6 +2113,13 @@ typedef NS_ENUM(NSInteger, Tag) {
         textField.text = trimmed;
         [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyBarkPushURL];
         textField.textColor = [self isNotificationBackendURLValid:trimmed] ? [UIColor labelColor] : [UIColor systemRedColor];
+        if (ApolloBarkModeActive()) {
+            // Bark is on and the URL is usable — sync the backend device row
+            // so the (new) endpoint applies immediately. Covers both
+            // first-time setup (toggle flipped before the URL existed) and
+            // endpoint edits on an already-registered device.
+            ApolloBarkSyncBackendDeviceTransport();
+        }
     }
 
     if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
@@ -2136,14 +2131,32 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)barkNotificationsSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyBarkNotificationsEnabled];
-    if (!sender.isOn) {
-        // Bark send failures never delete device rows server-side (by
-        // design), so turning Bark off must retire the registration
-        // explicitly or the backend keeps pushing to the Bark app forever.
-        NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
-        if (synthetic.length > 0 && ApolloIsNotificationBackendConfigured()) {
-            ApolloBarkDeleteBackendDevice(synthetic);
+
+    if (sender.isOn) {
+        // Flip the backend device row to transport=bark right away. With no
+        // valid Bark URL yet, Bark mode is inactive and this would register
+        // an undeliverable row — skip; saving the URL syncs instead.
+        if (ApolloBarkModeActive()) {
+            ApolloBarkSyncBackendDeviceTransport();
         }
+        return;
+    }
+
+    if (ApolloPushNotificationsSupported()) {
+        // Entitled build turning Bark off: same device row (the real APNs
+        // token), flip it back to transport=apns — native push resumes
+        // immediately.
+        ApolloBarkSyncBackendDeviceTransport();
+        return;
+    }
+
+    // Unentitled build turning Bark off: nothing can deliver to this build
+    // anymore, and Bark send failures never delete device rows server-side
+    // (by design), so retiring the synthetic registration explicitly is the
+    // only way to stop the backend pushing to the Bark app forever.
+    NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
+    if (synthetic.length > 0 && ApolloIsNotificationBackendConfigured()) {
+        ApolloBarkDeleteBackendDevice(synthetic);
     }
 }
 

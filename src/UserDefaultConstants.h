@@ -210,8 +210,9 @@ static NSString *const UDKeyNotificationBackendRegistrationToken = @"Notificatio
 // When enabled AND a valid Bark push URL is set AND the backend above is
 // configured, the tweak feeds Apollo a synthetic device token so its native
 // notification/watcher registration runs, and the backend delivers via an
-// HTTP POST to the Bark push URL instead of APNs. Ignored entirely on builds
-// that carry a real push entitlement.
+// HTTP POST to the Bark push URL instead of APNs. On builds with a real push
+// entitlement this instead flips the existing (real-token) backend device row
+// between transport=apns and transport=bark.
 static NSString *const UDKeyBarkNotificationsEnabled = @"BarkNotificationsEnabled";
 // Full Bark push URL: https://api.day.app/<device_key> or a self-hosted
 // bark-server equivalent. The device key is a bearer capability — treat it
@@ -222,6 +223,11 @@ static NSString *const UDKeyBarkPushURL = @"BarkPushURL";
 // backend device row stays stable across launches; travels in settings
 // backups automatically (whole-plist backup).
 static NSString *const UDKeyBarkSyntheticDeviceToken = @"BarkSyntheticDeviceToken";
+// Lowercase hex of the device token from the most recent registration Apollo
+// completed (the real APNs token on entitled builds, the synthetic one on
+// free sideloads). Stashed by the didRegister hook so the settings UI can
+// address the backend device row directly when flipping transports.
+static NSString *const UDKeyLastDeviceTokenHex = @"BarkLastDeviceTokenHex";
 
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";

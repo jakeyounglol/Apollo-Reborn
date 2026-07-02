@@ -65,12 +65,13 @@ NSURL *ApolloBarkPushURL(void) {
 }
 
 BOOL ApolloBarkModeActive(void) {
-    // Order matters for cost: defaults reads first, entitlement check
-    // (computed once, then cached) last. Never active with a real push
-    // entitlement — the stock APNs flow must stay untouched there.
+    // Deliberately entitlement-agnostic: Bark is an explicit user choice on
+    // any build. Without a push entitlement it's the only delivery path (the
+    // synthetic-token flow); with one, the real APNs token registers with
+    // transport=bark and the backend flips the same device row between
+    // transports on re-registration.
     return ApolloBarkConfigured()
-        && ApolloIsNotificationBackendConfigured()
-        && !ApolloPushNotificationsSupported();
+        && ApolloIsNotificationBackendConfigured();
 }
 
 // MARK: - Synthetic device token
@@ -176,6 +177,70 @@ void ApolloBarkSendTestNotification(void (^completion)(BOOL ok, NSString *messag
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion(ok, message);
             });
+        }
+    }] resume];
+}
+
+// MARK: - Direct transport sync
+
+void ApolloBarkSyncBackendDeviceTransport(void) {
+    NSURL *base = ApolloNotificationBackendBaseURL();
+    if (!base) return;
+
+    // The device's backend identity: the token from the most recent
+    // registration Apollo completed (real APNs token on entitled builds, the
+    // synthetic one on free sideloads — stashed by the didRegister hook). A
+    // free sideload that hasn't registered yet falls back to the synthetic
+    // token it WILL register with, so the row it creates stays valid.
+    NSString *tokenHex = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyLastDeviceTokenHex];
+    if (tokenHex.length == 0 && !ApolloPushNotificationsSupported()) {
+        tokenHex = ApolloBarkSyntheticTokenHex();
+    }
+    if (tokenHex.length == 0) {
+        // Entitled build that has never registered this install — there is no
+        // device row to flip; Apollo's next registration carries the current
+        // transport in its headers anyway.
+        ApolloLog(@"[Bark] Transport sync skipped — no device registration seen yet; the current mode applies when Apollo next registers.");
+        return;
+    }
+
+    BOOL bark = ApolloBarkModeActive();
+    // Body matches the stock client's shape ({"apnsToken","sandbox"} — the
+    // backend's Go decoder matches field names case-insensitively). sandbox
+    // reflects this build's actual aps-environment ("development" profile =
+    // sandbox APNs gateway); the backend's APPLE_APNS_SANDBOX still overrides
+    // it, same as for Apollo's own registrations.
+    NSDictionary *body = @{
+        @"apnsToken": tokenHex,
+        @"sandbox": @(ApolloAPSEnvironmentIsDevelopment()),
+    };
+    NSData *json = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    if (!json) return;
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[base URLByAppendingPathComponent:@"v1/device"]];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = json;
+    request.timeoutInterval = 10;
+    [request setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    NSString *registrationToken = ApolloNotificationBackendRegistrationToken();
+    if (registrationToken.length > 0) {
+        [request setValue:registrationToken forHTTPHeaderField:@"X-Registration-Token"];
+    }
+    // Same authoritative transport channel the rewrite layer uses for
+    // Apollo's own registrations (headers win over the body server-side).
+    [request setValue:(bark ? @"bark" : @"apns") forHTTPHeaderField:@"X-Apollo-Transport"];
+    if (bark) {
+        [request setValue:ApolloBarkPushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
+    }
+
+    NSString *prefix = [tokenHex substringToIndex:MIN((NSUInteger)8, tokenHex.length)];
+    ApolloLog(@"[Bark] Syncing backend device %@… to transport=%@", prefix, bark ? @"bark" : @"apns");
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request
+                                      completionHandler:^(NSData * __unused data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            ApolloLog(@"[Bark] Transport sync failed: %@", error.localizedDescription);
+        } else {
+            ApolloLog(@"[Bark] Transport sync answered HTTP %ld", (long)[(NSHTTPURLResponse *)response statusCode]);
         }
     }] resume];
 }

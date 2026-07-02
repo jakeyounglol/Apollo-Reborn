@@ -39,6 +39,13 @@ extern "C" {
 // stock behavior untouched.
 BOOL ApolloPushNotificationsSupported(void);
 
+// YES when the `aps-environment` entitlement value is "development" (a paid
+// *developer*-profile sideload, whose tokens belong to Apple's sandbox APNs
+// gateway); NO for "production" or when the entitlement is absent/unreadable.
+// Used to report a truthful sandbox flag when the tweak registers a device
+// row itself (the backend's APPLE_APNS_SANDBOX can still override it).
+BOOL ApolloAPSEnvironmentIsDevelopment(void);
+
 // YES only when `error` is the missing-`aps-environment`-entitlement failure
 // described above. This is a signing-time condition that can never be resolved
 // at runtime, so it is treated as an expected sideload state rather than a bug.

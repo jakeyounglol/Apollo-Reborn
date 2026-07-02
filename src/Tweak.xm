@@ -1365,14 +1365,18 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // Delete the synthetic registration before letting Apollo register the real
 // token.
 - (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
-    NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
-    if (synthetic.length > 0 && deviceToken.length > 0) {
+    if (deviceToken.length > 0) {
         NSMutableString *hex = [NSMutableString stringWithCapacity:deviceToken.length * 2];
         const uint8_t *bytes = (const uint8_t *)deviceToken.bytes;
         for (NSUInteger i = 0; i < deviceToken.length; i++) {
             [hex appendFormat:@"%02x", bytes[i]];
         }
-        if (![hex isEqualToString:synthetic]) {
+        // Stash the device's backend identity so the settings UI can flip the
+        // row's transport directly (ApolloBarkSyncBackendDeviceTransport) —
+        // Apollo itself only re-registers on launch.
+        [[NSUserDefaults standardUserDefaults] setObject:hex forKey:UDKeyLastDeviceTokenHex];
+        NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
+        if (synthetic.length > 0 && ![hex isEqualToString:synthetic]) {
             ApolloLog(@"[Bark] Real APNs token arrived; retiring the synthetic Bark device registration.");
             ApolloBarkDeleteBackendDevice(synthetic);
             // One-shot: drop the stored token so this doesn't refire every

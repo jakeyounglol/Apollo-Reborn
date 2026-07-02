@@ -87,6 +87,11 @@ NSURL *ApolloNotificationBackendBaseURL(void) {
     return sCachedBaseURL;
 }
 
+NSString *ApolloNotificationBackendRegistrationToken(void) {
+    ApolloEnsureBackendCacheValid();
+    return sCachedRegistrationToken;
+}
+
 // MARK: - Path classification
 
 // Match `/v1/device` exactly (device registration — header-gated; the body is
