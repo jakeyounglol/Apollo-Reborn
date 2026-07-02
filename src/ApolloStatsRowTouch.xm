@@ -267,6 +267,7 @@ static NSInteger SRTNearestTargetIndex(NSArray<ApolloSRTTarget *> *targets, CGFl
 @property (nonatomic, assign) CGFloat zoom;
 @property (nonatomic, assign) CGSize stripPointSize;   // strip size in points
 @property (nonatomic, assign) BOOL hasSelection;       // NO until the first selectRect
+@property (nonatomic, assign) CGFloat lockedCenterY;   // 0 until first placement, then fixed
 - (instancetype)initWithImage:(UIImage *)img stripSize:(CGSize)stripSize zoom:(CGFloat)zoom;
 - (void)selectRect:(CGRect)rectInStrip caption:(NSString *)caption tint:(UIColor *)tint;
 - (void)positionAboveScreenPoint:(CGPoint)p inHost:(UIView *)host;
@@ -375,16 +376,21 @@ static NSInteger SRTNearestTargetIndex(NSArray<ApolloSRTTarget *> *targets, CGFl
     self.captionLabel.text = caption;
 }
 
-// Center horizontally on p.x (clamped), sitting above the finger. Uses center (not
+// Center horizontally on p.x (clamped). The VERTICAL position is anchored above
+// the initial press and then LOCKED — following the finger's y while sliding
+// across the row made the card bob up and down (jittery). Uses center (not
 // frame) so it stays correct while the show/hide scale transform is applied.
 - (void)positionAboveScreenPoint:(CGPoint)p inHost:(UIView *)host {
     CGFloat margin = 10.0;
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
     CGFloat cx = MAX(margin + w / 2.0, MIN(p.x, host.bounds.size.width - margin - w / 2.0));
-    CGFloat topInset = host.safeAreaInsets.top + 6.0;
-    CGFloat top = p.y - h - 44.0;               // clear of the finger/cursor
-    if (top < topInset) top = p.y + 44.0;       // not enough room above -> below the finger
-    self.center = CGPointMake(cx, top + h / 2.0);
+    if (self.lockedCenterY == 0.0) {            // first placement: anchor, then lock
+        CGFloat topInset = host.safeAreaInsets.top + 6.0;
+        CGFloat top = p.y - h - 44.0;           // clear of the finger/cursor
+        if (top < topInset) top = p.y + 44.0;   // not enough room above -> below the finger
+        self.lockedCenterY = top + h / 2.0;
+    }
+    self.center = CGPointMake(cx, self.lockedCenterY);
 }
 
 @end
