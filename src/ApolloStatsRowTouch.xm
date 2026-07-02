@@ -787,6 +787,8 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
 - (void)srtCommentTapFired:(UITapGestureRecognizer *)tap {
     if (tap.state != UIGestureRecognizerStateRecognized) return;
     SRTArmJumpPending();
+    // Match the vote buttons' native feedback: a light tick acknowledging the tap.
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
     ApolloLog(@"[StatsRow] comment bubble tapped — arming jump-to-comments");
 }
 

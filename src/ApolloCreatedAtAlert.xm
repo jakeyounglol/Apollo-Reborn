@@ -215,6 +215,8 @@ static void ApolloAgeTapFired(id cell, UITapGestureRecognizer *tap) {
     }
     if (!date) return;
 
+    // Match the vote buttons' native feedback: a light tick acknowledging the tap.
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
     ApolloPresentCreatedAtAlert(date, (ApolloASDisplayNode *)cell, isComment);
 }
 
