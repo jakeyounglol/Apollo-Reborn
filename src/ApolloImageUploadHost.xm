@@ -3064,13 +3064,21 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     if (completionHandler && ApolloIsImgurImageUploadRequest(request) &&
         !ApolloChatImageUploadPending() && ApolloCommentLinkUploadPending()) {
         NSString *linkMIMEType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
-        // ImgChest needs a key and can't host video; those cases still honor the
-        // plain-link intent by falling through to Apollo's own Imgur upload.
+        // ImgChest can't host video and needs its API key; Imgur needs an Imgur
+        // client id (the request chokepoints sign uploads with it — a keyless
+        // Imgur upload just 401s). When the chosen leg is unusable fall through
+        // to the other; when NEITHER is usable leave both flags NO so the upload
+        // takes the normal provider routing — a native upload that works beats a
+        // doomed keyless one.
         commentLinkImgChest = (sCommentLinkHost == CommentLinkHostImgChest &&
                                ApolloImgChestUploadAvailable() &&
                                !ApolloMediaMIMETypeIsVideo(linkMIMEType));
-        commentLinkImgur = !commentLinkImgChest;
-        ApolloLog(@"[CommentLinkHost] Routing comment-editor upload to %@ (fromData)", commentLinkImgChest ? @"ImgChest" : @"Imgur");
+        commentLinkImgur = (!commentLinkImgChest && sImgurClientId.length > 0);
+        if (commentLinkImgChest || commentLinkImgur) {
+            ApolloLog(@"[CommentLinkHost] Routing comment-editor upload to %@ (fromData)", commentLinkImgChest ? @"ImgChest" : @"Imgur");
+        } else {
+            ApolloLog(@"[CommentLinkHost] No usable link host (missing key or video) — using normal upload routing (fromData)");
+        }
     }
 
     // ImgChest host: divert Apollo's Imgur image upload to the ImgChest API
@@ -3119,15 +3127,12 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         return %orig(ApolloRedditUploadFastFailRequest(), bodyData ?: [NSData data], chestWrapped);
     }
 
-    // Comment Link Host = Imgur (or Img Chest unavailable / video): let Apollo's
-    // own Imgur upload run untouched — even when the Media Upload Host is Reddit
-    // or the keyless cookie path would normally claim it — and record the returned
-    // link so the comment-body rewrite can unwrap Apollo's markdown embed into a
-    // plain link. Keyless Web JSON sessions still need an Imgur key for this.
+    // Comment Link Host = Imgur (or Img Chest unavailable / video, with an Imgur
+    // client id configured): let Apollo's own Imgur upload run untouched — even
+    // when the Media Upload Host is Reddit or the keyless cookie path would
+    // normally claim it — and record the returned link so the comment-body
+    // rewrite can unwrap Apollo's markdown embed into a plain link.
     if (commentLinkImgur) {
-        if ([ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken] && sImgurClientId.length == 0) {
-            ApolloWarnKeylessUploadUnavailableOnce();
-        }
         void (^linkRecordingHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (!error && ApolloCommentLinkRecordUploadedURLFromImgurResponse(data)) {
                 ApolloCommentLinkShowUploadedToast(@"Imgur");
@@ -3239,11 +3244,17 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         !ApolloChatImageUploadPending() && ApolloCommentLinkUploadPending()) {
         NSString *linkFilename = fileURL.lastPathComponent.length > 0 ? fileURL.lastPathComponent : @"apollo-upload.jpg";
         NSString *linkMIMEType = ApolloMediaMIMETypeForFilename(linkFilename, [request valueForHTTPHeaderField:@"Content-Type"]);
+        // See the fromData: hook — fall through to normal routing when neither
+        // link-host leg is usable (missing key / video).
         commentLinkImgChest = (sCommentLinkHost == CommentLinkHostImgChest &&
                                ApolloImgChestUploadAvailable() &&
                                !ApolloMediaMIMETypeIsVideo(linkMIMEType));
-        commentLinkImgur = !commentLinkImgChest;
-        ApolloLog(@"[CommentLinkHost] Routing comment-editor upload to %@ (fromFile)", commentLinkImgChest ? @"ImgChest" : @"Imgur");
+        commentLinkImgur = (!commentLinkImgChest && sImgurClientId.length > 0);
+        if (commentLinkImgChest || commentLinkImgur) {
+            ApolloLog(@"[CommentLinkHost] Routing comment-editor upload to %@ (fromFile)", commentLinkImgChest ? @"ImgChest" : @"Imgur");
+        } else {
+            ApolloLog(@"[CommentLinkHost] No usable link host (missing key or video) — using normal upload routing (fromFile)");
+        }
     }
 
     // ImgChest host (see the fromData: hook) — runs ahead of the keyless Web JSON
@@ -3291,13 +3302,11 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         return %orig(ApolloRedditUploadFastFailRequest(), fileURL, chestWrapped);
     }
 
-    // Comment Link Host = Imgur (or Img Chest unavailable / video): see the
-    // fromData: hook — pass the upload through to Apollo's own Imgur path and
-    // record the returned link for the plain-link comment-body rewrite.
+    // Comment Link Host = Imgur (or Img Chest unavailable / video, with an Imgur
+    // client id configured): see the fromData: hook — pass the upload through to
+    // Apollo's own Imgur path and record the returned link for the plain-link
+    // comment-body rewrite.
     if (commentLinkImgur) {
-        if ([ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken] && sImgurClientId.length == 0) {
-            ApolloWarnKeylessUploadUnavailableOnce();
-        }
         void (^linkRecordingHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (!error && ApolloCommentLinkRecordUploadedURLFromImgurResponse(data)) {
                 ApolloCommentLinkShowUploadedToast(@"Imgur");

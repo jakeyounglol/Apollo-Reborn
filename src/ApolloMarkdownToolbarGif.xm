@@ -5,6 +5,7 @@
 #import "ApolloSubredditInfoCache.h"
 #import "CustomAPIViewController.h"
 #import "GiphyPickerViewController.h"
+#import "UserDefaultConstants.h"
 
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1426,19 +1427,23 @@ static void ApolloMarkdownGifSetActiveComposeController(UIViewController *contro
 // a plain link rather than a native Reddit media upload (which some subreddits
 // disallow). The upload interception lives at the network layer
 // (ApolloImageUploadHost.xm) where no editor context exists, so — like the chat
-// photo flag in ApolloChatComposer.xm — we arm a short wall-clock window when the
-// markdown toolbar's photo button is tapped in a comment-kind composer.
+// photo flag in ApolloChatComposer.xm — we arm a window when the markdown
+// toolbar's photo button is tapped in a comment-kind composer.
 //
 // Unlike the chat flag, the window is NOT cleared when an upload consumes it: one
-// picker session can upload several images. Instead it is cleared when the arming
-// composer is torn down, when the photo button is tapped in a non-comment
-// composer, and by the deadline itself.
+// picker session can upload several images. Its real scope is the arming
+// composer's LIFETIME — the weak ref zeroes on dealloc, so the window dies with
+// the composer no matter how it was torn down — plus an explicit clear on
+// teardown (below) and on a non-comment photo tap. The wall-clock deadline is
+// only a long backstop: a short one quietly expired mid photo-pick and reverted
+// the upload to native media routing, exactly in the gated subreddits where the
+// image button was enabled on the promise of a link.
 static double sApolloCommentLinkUploadUntil = 0.0;
 static __weak UIViewController *sApolloCommentLinkArmedComposer = nil;
 static char kApolloCommentLinkToastShownKey;
 
 static void ApolloCommentLinkMarkUpload(UIViewController *composer) {
-    sApolloCommentLinkUploadUntil = [NSDate timeIntervalSinceReferenceDate] + 180.0;   // generous window for the picker
+    sApolloCommentLinkUploadUntil = [NSDate timeIntervalSinceReferenceDate] + 1800.0;   // backstop only; scope = composer lifetime
     sApolloCommentLinkArmedComposer = composer;
 }
 
@@ -1447,6 +1452,7 @@ extern "C" {
 #endif
 BOOL ApolloCommentLinkUploadPending(void) {
     return sCommentLinkHost != CommentLinkHostOff &&
+           sApolloCommentLinkArmedComposer != nil &&   // weak: dies with the arming composer
            [NSDate timeIntervalSinceReferenceDate] < sApolloCommentLinkUploadUntil;
 }
 void ApolloCommentLinkClearUpload(void) {
@@ -1565,11 +1571,17 @@ void ApolloMarkdownGifInstall(void) {
     // A torn-down comment editor takes its comment-link upload window with it, so
     // the plain-link routing can't leak onto uploads from a later composer. Only
     // on real teardown — a fullscreen picker presented OVER the editor also
-    // triggers viewDidDisappear, and the upload it produces still needs the window.
+    // triggers viewDidDisappear, and the upload it produces still needs the
+    // window. Apollo presents the composer wrapped in a UINavigationController,
+    // and UIKit sets the dismissal flag on the presented CONTAINER, not its
+    // children — so walk the ancestor chain rather than checking only self.
     UIViewController *controller = (UIViewController *)self;
-    if ((controller.isBeingDismissed || controller.isMovingFromParentViewController) &&
-        controller == sApolloCommentLinkArmedComposer) {
-        ApolloCommentLinkClearUpload();
+    if (controller != sApolloCommentLinkArmedComposer) return;
+    for (UIViewController *ancestor = controller; ancestor; ancestor = ancestor.parentViewController) {
+        if (ancestor.isBeingDismissed || ancestor.isMovingFromParentViewController) {
+            ApolloCommentLinkClearUpload();
+            return;
+        }
     }
 }
 
@@ -1679,5 +1691,12 @@ void ApolloMarkdownGifInstall(void) {
     }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         ApolloMarkdownGifKeyboardHidden(note);
+    }];
+    // Comment Link Host toggled while a composer is open (e.g. iPad multitasking):
+    // re-apply the media gating so the image button's blocked/enabled state
+    // reflects the new setting immediately instead of after the next appearance.
+    [[NSNotificationCenter defaultCenter] addObserverForName:ApolloCommentLinkHostChangedNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        UIViewController *composer = ApolloMarkdownGifActiveComposeController();
+        if (composer) ApolloMarkdownGifApplyMediaGating(composer);
     }];
 }

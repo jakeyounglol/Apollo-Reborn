@@ -435,6 +435,9 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)setCommentLinkHost:(NSInteger)host {
     sCommentLinkHost = host;
     [[NSUserDefaults standardUserDefaults] setInteger:sCommentLinkHost forKey:UDKeyCommentLinkHost];
+    // An open comment composer's image-button gate depends on this (the button
+    // un-blocks while a link host is set) — let it re-apply immediately.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloCommentLinkHostChangedNotification object:nil];
 
     NSIndexPath *indexPath = [NSIndexPath indexPathForRow:3 inSection:SectionMedia];
     if ([[self.tableView indexPathsForVisibleRows] containsObject:indexPath]) {
@@ -455,6 +458,13 @@ typedef NS_ENUM(NSInteger, Tag) {
         [self setCommentLinkHost:CommentLinkHostOff];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploads are signed with the Imgur client id at the request chokepoint;
+        // keyless ones just 401 — refuse the host rather than fail silently later.
+        if (sImgurClientId.length == 0) {
+            [self showAlertWithTitle:@"Imgur API Key Required"
+                             message:@"Add your Imgur API key in the API Keys section first, then select Imgur as the comment link host."];
+            return;
+        }
         [self setCommentLinkHost:CommentLinkHostImgur];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
