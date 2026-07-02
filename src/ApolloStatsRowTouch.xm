@@ -258,7 +258,9 @@ static NSInteger SRTNearestTargetIndex(NSArray<ApolloSRTTarget *> *targets, CGFl
 // The "glass slider" loupe: a floating Liquid Glass card showing the icon row
 // zoomed, with an accent pill that springs from icon to icon as the finger
 // slides. Uses UIGlassEffect when the app runs with Liquid Glass, otherwise a
-// system blur — same layout either way.
+// system blur — same layout either way. Dragging well away from the row dims
+// the card into "Release to Cancel" (releasing there activates nothing);
+// sliding back re-engages.
 @interface ApolloSRTLoupeView : UIView
 @property (nonatomic, strong) UIVisualEffectView *card;
 @property (nonatomic, strong) UIImageView *stripImageView;
@@ -271,6 +273,7 @@ static NSInteger SRTNearestTargetIndex(NSArray<ApolloSRTTarget *> *targets, CGFl
 - (instancetype)initWithImage:(UIImage *)img stripSize:(CGSize)stripSize zoom:(CGFloat)zoom;
 - (void)selectRect:(CGRect)rectInStrip caption:(NSString *)caption tint:(UIColor *)tint;
 - (void)positionAboveScreenPoint:(CGPoint)p inHost:(UIView *)host;
+- (void)setCancelledAppearance:(BOOL)cancelled;
 @end
 
 @implementation ApolloSRTLoupeView
@@ -374,6 +377,22 @@ static NSInteger SRTNearestTargetIndex(NSArray<ApolloSRTTarget *> *targets, CGFl
                          animations:apply completion:nil];
     }
     self.captionLabel.text = caption;
+}
+
+// Drag-away-to-cancel state: dim + shrink the card, hide the selection pill, and
+// caption the escape hatch. Fully reversible — sliding back re-engages (selectRect
+// restores the caption and the pill springs back to the nearest icon).
+- (void)setCancelledAppearance:(BOOL)cancelled {
+    UIView *ring = [self.highlightView.superview viewWithTag:0x5254];
+    if (cancelled) self.captionLabel.text = @"Release to Cancel";
+    [UIView animateWithDuration:0.18 delay:0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        self.alpha = cancelled ? 0.45 : 1.0;
+        self.transform = cancelled ? CGAffineTransformMakeScale(0.9, 0.9) : CGAffineTransformIdentity;
+        self.highlightView.alpha = cancelled ? 0.0 : 1.0;
+        ring.alpha = cancelled ? 0.0 : 1.0;
+    } completion:nil];
 }
 
 // Center horizontally on p.x (clamped). The VERTICAL position is anchored above
@@ -578,6 +597,7 @@ static const void *kSRTLoupeTargetsKey = &kSRTLoupeTargetsKey; // RETAIN: NSArra
 static const void *kSRTLoupeStripOriginKey = &kSRTLoupeStripOriginKey; // NSValue CGPoint: strip origin in cell coords
 static const void *kSRTLoupeSelKey = &kSRTLoupeSelKey;         // NSNumber: selected index
 static const void *kSRTLoupeScrollLockKey = &kSRTLoupeScrollLockKey; // RETAIN: UIScrollView we disabled while the loupe is up
+static const void *kSRTLoupeCancelKey = &kSRTLoupeCancelKey;   // NSNumber BOOL: finger dragged away — release cancels
 
 enum { kSRTGestureTypeCommentTap = 1, kSRTGestureTypeLoupe = 2 };
 
@@ -654,6 +674,7 @@ static void SRTDismissLoupe(UIGestureRecognizer *gr, BOOL animated) {
     objc_setAssociatedObject(gr, kSRTLoupeStripOriginKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeScrollLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeDisabledPansKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 @implementation ApolloSRTGestureDelegate
@@ -792,6 +813,13 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
     ApolloLog(@"[StatsRow] comment bubble tapped — arming jump-to-comments");
 }
 
+// How far past the interactive band (claim ∪ strip) the finger may wander before
+// the hold flips into "release to cancel". Generous enough that normal sliding
+// (which drifts vertically) never trips it; small enough that a deliberate
+// drag-away reads instantly. Fully reversible until the finger lifts.
+static const CGFloat kSRTCancelSlopX = 48.0;
+static const CGFloat kSRTCancelSlopY = 64.0;
+
 // Refresh the loupe's selection + position from the current finger location.
 - (void)srtSyncLoupeForGesture:(UIGestureRecognizer *)gr cell:(id)cell cellView:(UIView *)cellView {
     ApolloSRTLoupeView *loupe = objc_getAssociatedObject(gr, kSRTLoupeViewKey);
@@ -799,6 +827,25 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
     UIView *host = cellView.window;
     if (!loupe || targets.count == 0 || !host) return;
     CGPoint pCell = [gr locationInView:cellView];
+
+    // Drag-away-to-cancel: outside the escape band the loupe dims into a
+    // "Release to Cancel" state and releasing activates nothing; sliding back
+    // re-engages. The band is the whole interactive area a hold can start in
+    // (claim ∪ strip) plus slop, so the loupe can never SPAWN cancelled.
+    CGRect band = CGRectUnion(SRTStripRect(targets), SRTClaimRect(cell, cellView, targets));
+    BOOL cancelled = !CGRectContainsPoint(CGRectInset(band, -kSRTCancelSlopX, -kSRTCancelSlopY), pCell);
+    BOOL wasCancelled = [objc_getAssociatedObject(gr, kSRTLoupeCancelKey) boolValue];
+    if (cancelled != wasCancelled) {
+        objc_setAssociatedObject(gr, kSRTLoupeCancelKey, @(cancelled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [loupe setCancelledAppearance:cancelled];
+        [[[UISelectionFeedbackGenerator alloc] init] selectionChanged];
+        ApolloLog(@"[StatsRow] loupe %@", cancelled ? @"dragged away — release to cancel" : @"re-engaged");
+    }
+    if (cancelled) {   // keep tracking the finger (dimmed) but hold the last selection
+        [loupe positionAboveScreenPoint:[gr locationInView:host] inHost:host];
+        return;
+    }
+
     NSInteger sel = SRTNearestTargetIndex(targets, pCell.x);
     NSNumber *prev = objc_getAssociatedObject(gr, kSRTLoupeSelKey);
     objc_setAssociatedObject(gr, kSRTLoupeSelKey, @(sel), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -852,6 +899,7 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
             objc_setAssociatedObject(gr, kSRTLoupeViewKey, loupe, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeTargetsKey, targets, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeStripOriginKey, [NSValue valueWithCGPoint:stripRect.origin], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // fresh hold, fresh escape state
             // Lock the feed's scroll while the loupe is up so sliding to pick an icon
             // never scrolls the list; restored in SRTDismissLoupe.
             for (UIView *v = cellView; v; v = v.superview) {
@@ -882,11 +930,14 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
         case UIGestureRecognizerStateEnded: {
             NSArray<ApolloSRTTarget *> *targets = objc_getAssociatedObject(gr, kSRTLoupeTargetsKey);
             NSInteger sel = [objc_getAssociatedObject(gr, kSRTLoupeSelKey) integerValue];
-            ApolloSRTTarget *t = (sel >= 0 && sel < (NSInteger)targets.count) ? targets[sel] : nil;
+            BOOL cancelled = [objc_getAssociatedObject(gr, kSRTLoupeCancelKey) boolValue];
+            ApolloSRTTarget *t = (!cancelled && sel >= 0 && sel < (NSInteger)targets.count) ? targets[sel] : nil;
             SRTDismissLoupe(gr, YES);
             if (t) {
                 ApolloLog(@"[StatsRow] loupe released on %@", t.caption);
                 SRTActivateTarget(cell, cellView, t);
+            } else if (cancelled) {
+                ApolloLog(@"[StatsRow] loupe released in cancel zone — dismissed, no action");
             }
             break;
         }
