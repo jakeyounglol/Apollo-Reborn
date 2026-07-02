@@ -194,6 +194,7 @@ static NSAttributedString *ApolloAttributedStringByAppendingTranslationMarker(NS
 static BOOL ApolloShouldShowTranslationMarkerForSource(NSString *sourceText, NSString **outCode);
 static void ApolloToggleTranslationForCommentTextNode(id textNode);
 static void ApolloEnsureMarkerTappableOnNode(id textNode);
+static void ApolloEnsureCommentsTableBreathingRoom(void);
 static void ApolloAppendTranslateAffordanceForCellNode(id cellNode, RDKComment *comment);
 static BOOL ApolloAttributedStringEndsWithMarker(NSAttributedString *attr);
 static void ApolloApplyTranslationToTitleNode(id titleNode, id textNode, NSString *sourceText, NSString *translatedText);
@@ -1679,7 +1680,10 @@ static void ApolloApplyTranslationToCellNode(id commentCellNode, RDKComment *com
         ((void (*)(id, SEL))objc_msgSend)(textNode, @selector(setNeedsDisplay));
     }
     ApolloForceRelayoutForTextNodeAndOwner(commentCellNode, textNode);
-    if (displayAttr != translatedAttr) ApolloEnsureMarkerTappableOnNode(textNode);
+    if (displayAttr != translatedAttr) {
+        ApolloEnsureMarkerTappableOnNode(textNode);
+        ApolloEnsureCommentsTableBreathingRoom();
+    }
 
     objc_setAssociatedObject(commentCellNode, kApolloTranslatedTextNodeKey, textNode, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -4059,6 +4063,26 @@ static void ApolloShowOriginalWithRetranslateAffordanceForCellNode(id cellNode, 
     @catch (__unused NSException *e) { return; }
     ApolloEnsureMarkerTappableOnNode(textNode);
     ApolloForceRelayoutForTextNodeAndOwner(cellNode, textNode);
+    ApolloEnsureCommentsTableBreathingRoom();
+}
+
+// The per-item marker/affordance adds a final line to comment cells; on the
+// LAST comment that line ends exactly at the table's content end, which under
+// the Liquid Glass floating tab bar sits right at the pill's top edge (Apollo's
+// 83pt bottom inset matches the classic docked bar, not the pill + its blur
+// halo). Give the table a small transparent footer so max-scroll lifts the last
+// marker clear of the glass. Idempotent; never clobbers an existing footer.
+static NSInteger const kApolloMarkerFooterTag = 0x41504d46;   // 'APMF'
+static void ApolloEnsureCommentsTableBreathingRoom(void) {
+    UITableView *table = GetCommentsTableView(sVisibleCommentsViewController);
+    if (!table) return;
+    UIView *footer = table.tableFooterView;
+    if (footer.tag == kApolloMarkerFooterTag) return;          // already ours
+    if (footer && footer.frame.size.height > 0.5) return;      // Apollo's own footer — leave it
+    UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 24.0)];
+    pad.backgroundColor = [UIColor clearColor];
+    pad.tag = kApolloMarkerFooterTag;
+    table.tableFooterView = pad;
 }
 
 // YES if the attributed string already ends with one of our marker/affordance runs.
@@ -4096,6 +4120,7 @@ static void ApolloAppendTranslateAffordanceForCellNode(id cellNode, RDKComment *
     @catch (__unused NSException *e) { return; }
     ApolloEnsureMarkerTappableOnNode(textNode);
     ApolloForceRelayoutForTextNodeAndOwner(cellNode, textNode);
+    ApolloEnsureCommentsTableBreathingRoom();
 }
 
 // Toggle a single comment between translated (with "Translated from X" marker)
@@ -7266,6 +7291,40 @@ static void ApolloDbgTapComment(CFNotificationCenterRef c, void *o, CFStringRef 
         ApolloLog(@"[Tw/dbg] no comment affordance visible");
     });
 }
+static void ApolloDbgDumpInsets(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *tv = GetCommentsTableView(sVisibleCommentsViewController);
+        if (!tv) { ApolloLog(@"[Tw/dbg] no comments table"); return; }
+        // Clamp to the true max scroll position first (dbg.scroll overshoots).
+        CGFloat maxOff = MAX(0, tv.contentSize.height - tv.bounds.size.height + tv.adjustedContentInset.bottom);
+        [tv setContentOffset:CGPointMake(0, maxOff) animated:NO];
+        UITableViewCell *last = tv.visibleCells.lastObject;
+        CGRect lastF = last ? [last convertRect:last.bounds toView:tv] : CGRectZero;
+        ApolloLog(@"[Tw/dbg] contentSize=%.0f bounds=%.0f offset=%.0f inset(b)=%.0f adj(b)=%.0f lastCellMaxY=%.0f",
+                  tv.contentSize.height, tv.bounds.size.height, tv.contentOffset.y,
+                  tv.contentInset.bottom, tv.adjustedContentInset.bottom, CGRectGetMaxY(lastF));
+        // and the deepest text node inside the last cell (our marker lives in it)
+        if (last) {
+            NSMutableArray *nodes = [NSMutableArray array];
+            NSHashTable *visited = [[NSHashTable alloc] initWithOptions:NSHashTableObjectPointerPersonality capacity:64];
+            ApolloCollectAttributedTextNodes(last, 8, visited, nodes);
+            CGFloat maxY = 0; NSString *tail = @"";
+            for (id node in nodes) {
+                UIView *v = nil;
+                @try { if ([node respondsToSelector:@selector(view)]) v = ((UIView *(*)(id, SEL))objc_msgSend)(node, @selector(view)); } @catch (__unused NSException *e) {}
+                if (!v.window) continue;
+                CGRect f = [v convertRect:v.bounds toView:tv];
+                if (CGRectGetMaxY(f) > maxY) {
+                    maxY = CGRectGetMaxY(f);
+                    NSAttributedString *a = nil;
+                    @try { a = ((id (*)(id, SEL))objc_msgSend)(node, @selector(attributedText)); } @catch (__unused NSException *e) {}
+                    tail = a.string.length > 24 ? [a.string substringFromIndex:a.string.length - 24] : (a.string ?: @"");
+                }
+            }
+            ApolloLog(@"[Tw/dbg] deepest textNode maxY=%.0f tail='%@'", maxY, tail);
+        }
+    });
+}
 static void ApolloDbgOpenFirstPost(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
     dispatch_async(dispatch_get_main_queue(), ^{
         for (UIWindow *w in ApolloAllWindows()) {
@@ -7365,6 +7424,7 @@ static void ApolloDbgOpenFirstPost(CFNotificationCenterRef c, void *o, CFStringR
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgOpenFirstPost, CFSTR("apollofix.dbg.open"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgFlipTapMode, CFSTR("apollofix.dbg.tapmode"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgTapComment, CFSTR("apollofix.dbg.tapcomment"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgDumpInsets, CFSTR("apollofix.dbg.insets"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 #endif
 
     // Memory-warning handler: only drop the raw key->text cache (cheap to
