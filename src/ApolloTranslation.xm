@@ -353,7 +353,12 @@ static const void *kApolloMarkerCellGestureKey = &kApolloMarkerCellGestureKey;
     self.pendingLabel = nil;
     if (![label isKindOfClass:[UILabel class]]) return;
     id titleNode = objc_getAssociatedObject(label, kApolloMarkerTitleNodeKey);
-    if (titleNode) ApolloToggleTranslationForTitleNode(titleNode);
+    if (titleNode) {
+        // Match the info-row taps (comment bubble / timestamp): a light tick
+        // acknowledging the tap before the title text swaps.
+        [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+        ApolloToggleTranslationForTitleNode(titleNode);
+    }
 }
 @end
 static void ApolloHideAllPostInfoMarkers(void);
