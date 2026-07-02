@@ -53,6 +53,15 @@ static NSString *const UDKeyLegacyRevealDeletedComments = @"RevealDeletedComment
 static NSString *const UDKeyFilterNSFWRecentlyRead = @"FilterNSFWRecentlyRead";
 static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 static NSString *const UDKeyImageUploadProvider = @"ImageUploadProvider";
+// Secondary host for images added in the COMMENT/REPLY editor (CommentLinkHost
+// enum). Off (default) keeps comment uploads on the Media Upload Host above;
+// Imgur/Img Chest route comment-editor uploads there and post the result as a
+// plain link (no native Reddit media) so they work in subreddits that disallow
+// image/GIF comments. See ApolloMarkdownToolbarGif.xm + ApolloImageUploadHost.xm.
+static NSString *const UDKeyCommentLinkHost = @"CommentLinkHost";
+// Posted after sCommentLinkHost changes so open composers re-apply the comment
+// media-permission gating (the image button un-blocks while a link host is set).
+static NSString *const ApolloCommentLinkHostChangedNotification = @"ApolloCommentLinkHostChangedNotification";
 static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
 // When ON (default), profile pages show Reborn's detailed profile — the banner,

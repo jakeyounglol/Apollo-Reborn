@@ -54,6 +54,7 @@ NSInteger sLinkPreviewCardColor = ApolloLinkPreviewCardColorNeutral;
 NSString *sLinkPreviewCardColorHex = nil;
 volatile uint32_t sLinkPreviewCardColorPacked = 0;
 NSInteger sImageUploadProvider = ImageUploadProviderImgur;
+NSInteger sCommentLinkHost = CommentLinkHostOff;
 
 NSString *sLatestRedditBearerToken = nil;
 
