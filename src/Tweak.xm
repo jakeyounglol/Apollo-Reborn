@@ -1388,6 +1388,43 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 }
 %end
 
+// Bark notifications carry the user's selected Apollo app icon via an
+// ?icon= parameter on the push URL (see ApolloBarkEffectivePushURL). The
+// selection lives in UIApplication.alternateIconName, which is main-thread
+// UI state — mirror it into defaults so the URL builders can read it from
+// the URLSession rewrite queue, and re-sync the backend device row the
+// moment the user picks a new icon so the very next notification wears it.
+%hook UIApplication
+- (void)setAlternateIconName:(NSString *)name completionHandler:(void (^)(NSError *error))completionHandler {
+    void (^wrapped)(NSError *) = ^(NSError *error) {
+        if (!error) {
+            BOOL changed = ApolloBarkNoteSelectedIconName(name);
+            if (changed && ApolloBarkModeActive()) {
+                ApolloBarkSyncBackendDeviceTransport();
+            }
+        }
+        if (completionHandler) {
+            completionHandler(error);
+        }
+    };
+    %orig(name, wrapped);
+}
+%end
+
+// Launch-time capture of the icon selection: covers the first run after the
+// tweak update (nothing mirrored yet) and any change that didn't go through
+// the hook above. Runs on the main queue because alternateIconName is UI
+// state; a same-launch registration racing ahead of this simply uses the
+// previous launch's mirrored value, which the sync below then corrects.
+static void ApolloBarkCaptureInitialIconSelection(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL changed = ApolloBarkNoteSelectedIconName([UIApplication sharedApplication].alternateIconName);
+        if (changed && ApolloBarkModeActive()) {
+            ApolloBarkSyncBackendDeviceTransport();
+        }
+    });
+}
+
 // On a build that can never receive push (a free-account sideload with no
 // `aps-environment` entitlement), Apollo's Notifications settings are a dead end:
 // every toggle ends in the suppressed registration error above, and nothing the
@@ -1937,6 +1974,9 @@ static void initializeRandomSources() {
     // over from a mid-session web login is now resolved — clear the indicator.
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestart];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestartUsername];
+
+    // Mirror the selected app icon for Bark notification icon passthrough.
+    ApolloBarkCaptureInitialIconSelection();
 
     // Redirect user to Custom API settings if no API credentials are set — but not
     // when at least one web-session account is configured (no API key is expected

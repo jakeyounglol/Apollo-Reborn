@@ -45,6 +45,27 @@ BOOL ApolloBarkModeActive(void);
 // nil. Cached; invalidated on NSUserDefaultsDidChangeNotification.
 NSURL *ApolloBarkPushURL(void);
 
+// The push URL the backend should actually POST to: ApolloBarkPushURL() plus
+// an ?icon= query parameter pinning the repo-hosted PNG of the user's
+// selected alternate app icon. bark-server merges query parameters over the
+// JSON body, so the pin wins on every push to that device. Stock-icon users
+// get the plain URL — pinning the default would also stomp the per-post
+// thumbnail icons, which the backend's fallback handles instead.
+NSURL *ApolloBarkEffectivePushURL(void);
+
+// https URL string of the hosted PNG for the currently selected app icon
+// (assets/bark-icons/<name>.png on the repo's main branch), falling back to
+// the stock Apollo icon (default.png). Used for ?icon= pinning and for the
+// client-side test notification.
+NSString *ApolloBarkNotificationIconURLString(void);
+
+// Record UIApplication.alternateIconName (nil/empty = stock icon) in
+// defaults, from where all Bark URL construction reads it (any thread).
+// Returns YES when the stored value changed — callers use that to re-sync
+// the backend device row. Called by the setAlternateIconName hook and the
+// launch-time capture in Tweak.xm.
+BOOL ApolloBarkNoteSelectedIconName(NSString *name);
+
 // The persistent synthetic device token as a lowercase 64-hex string.
 // Generated on first use (32 bytes via SecRandomCopyBytes) and stored in
 // standard defaults. On unentitled builds this is the device's identity on

@@ -64,6 +64,66 @@ NSURL *ApolloBarkPushURL(void) {
     return sCachedBarkPushURL;
 }
 
+// MARK: - Notification icon passthrough
+//
+// Bark's `icon` push parameter takes an image URL (downloaded once, cached
+// per URL) that replaces the Bark icon on the notification. The repo hosts
+// Apollo's icon set at assets/bark-icons/<name>.png, keyed by the
+// CFBundleAlternateIcons names, so the icon the user picked in Apollo shows
+// on Bark notifications too. bark-server merges query parameters over the
+// JSON body, so appending ?icon= to the stored push URL pins it per-device
+// with no backend schema involvement.
+static NSString *const kApolloBarkIconBaseURL = @"https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/assets/bark-icons/";
+
+NSString *ApolloBarkNotificationIconURLString(void) {
+    NSString *name = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSelectedIconName];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+        name = @"default";
+    }
+    NSString *escaped = [name stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    return [NSString stringWithFormat:@"%@%@.png", kApolloBarkIconBaseURL, escaped];
+}
+
+BOOL ApolloBarkNoteSelectedIconName(NSString *name) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *stored = [defaults stringForKey:UDKeyBarkSelectedIconName];
+    if (name.length == 0) {
+        if (stored.length == 0) return NO;
+        [defaults removeObjectForKey:UDKeyBarkSelectedIconName];
+    } else {
+        if ([stored isEqualToString:name]) return NO;
+        [defaults setObject:name forKey:UDKeyBarkSelectedIconName];
+    }
+    ApolloLog(@"[Bark] Selected app icon is now %@", name.length > 0 ? name : @"(default)");
+    return YES;
+}
+
+NSURL *ApolloBarkEffectivePushURL(void) {
+    NSURL *pushURL = ApolloBarkPushURL();
+    if (!pushURL) return nil;
+
+    // Pin the icon only when the user actually picked an alternate icon —
+    // query parameters override the JSON body on bark-server, so pinning the
+    // default here would also stomp the per-post thumbnail icons the backend
+    // sends. Stock-icon users get thumbnails when available and the backend's
+    // default-icon fallback otherwise.
+    NSString *name = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSelectedIconName];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+        return pushURL;
+    }
+
+    NSURLComponents *components = [NSURLComponents componentsWithURL:pushURL resolvingAgainstBaseURL:NO];
+    if (!components) return pushURL;
+    NSMutableArray<NSURLQueryItem *> *items = [components.queryItems mutableCopy] ?: [NSMutableArray array];
+    // Drop any stale icon param (e.g. hand-added by the user) before pinning.
+    [items filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSURLQueryItem *item, NSDictionary * __unused bindings) {
+        return ![item.name isEqualToString:@"icon"];
+    }]];
+    [items addObject:[[NSURLQueryItem alloc] initWithName:@"icon" value:ApolloBarkNotificationIconURLString()]];
+    components.queryItems = items;
+    return components.URL ?: pushURL;
+}
+
 BOOL ApolloBarkModeActive(void) {
     // Deliberately entitlement-agnostic: Bark is an explicit user choice on
     // any build. Without a push entitlement it's the only delivery path (the
@@ -134,6 +194,9 @@ void ApolloBarkSendTestNotification(void (^completion)(BOOL ok, NSString *messag
         @"body": @"Bark delivery works! Notifications from your backend will arrive like this one.",
         @"url": @"apollo://reborn/settings",
         @"group": @"apollo",
+        // Selected app icon, or Apollo's stock icon — so the test previews
+        // the icon real notifications will carry.
+        @"icon": ApolloBarkNotificationIconURLString(),
     };
     NSData *json = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
@@ -228,9 +291,11 @@ void ApolloBarkSyncBackendDeviceTransport(void) {
     }
     // Same authoritative transport channel the rewrite layer uses for
     // Apollo's own registrations (headers win over the body server-side).
+    // The effective URL carries the ?icon= pin when a custom app icon is
+    // selected.
     [request setValue:(bark ? @"bark" : @"apns") forHTTPHeaderField:@"X-Apollo-Transport"];
     if (bark) {
-        [request setValue:ApolloBarkPushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
+        [request setValue:ApolloBarkEffectivePushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
     }
 
     NSString *prefix = [tokenHex substringToIndex:MIN((NSUInteger)8, tokenHex.length)];

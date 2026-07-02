@@ -241,7 +241,7 @@ static NSData *ApolloAugmentDeviceRegistrationBody(NSData *originalBody) {
     NSMutableDictionary *augmented = [(NSDictionary *)parsed mutableCopy];
     if (ApolloBarkModeActive()) {
         augmented[@"transport"] = @"bark";
-        augmented[@"transport_endpoint"] = ApolloBarkPushURL().absoluteString;
+        augmented[@"transport_endpoint"] = ApolloBarkEffectivePushURL().absoluteString;
     } else {
         augmented[@"transport"] = @"apns";
     }
@@ -323,7 +323,9 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
             BOOL bark = ApolloBarkModeActive();
             [mutable setValue:(bark ? @"bark" : @"apns") forHTTPHeaderField:@"X-Apollo-Transport"];
             if (bark) {
-                [mutable setValue:ApolloBarkPushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
+                // Effective URL = push URL + ?icon= pin for the user's
+                // selected app icon (see ApolloBarkEffectivePushURL).
+                [mutable setValue:ApolloBarkEffectivePushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
             }
             NSData *augmented = ApolloAugmentDeviceRegistrationBody(mutable.HTTPBody);
             if (augmented) {

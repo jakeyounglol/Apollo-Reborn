@@ -228,6 +228,12 @@ static NSString *const UDKeyBarkSyntheticDeviceToken = @"BarkSyntheticDeviceToke
 // free sideloads). Stashed by the didRegister hook so the settings UI can
 // address the backend device row directly when flipping transports.
 static NSString *const UDKeyLastDeviceTokenHex = @"BarkLastDeviceTokenHex";
+// The CFBundleAlternateIcons key of the app icon the user selected in
+// Apollo's settings (absent = stock icon). Mirrored from
+// UIApplication.alternateIconName by the setAlternateIconName hook so Bark
+// URL construction can read it from any thread; used to pin the matching
+// hosted icon on Bark notifications via the push URL's ?icon= parameter.
+static NSString *const UDKeyBarkSelectedIconName = @"BarkSelectedIconName";
 
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
