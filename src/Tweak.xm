@@ -1474,6 +1474,7 @@ static void initializeRandomSources() {
                                     UDKeyLinkPreviewCommentsMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewCardColor: @(ApolloLinkPreviewCardColorNeutral),
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
+                                    UDKeyCommentLinkHost: @(CommentLinkHostOff),
                                     UDKeyShowUserAvatars: @NO,
                                     UDKeyUseProfileAvatarTabIcon: @NO,
                                     UDKeyShowDetailedProfiles: @YES,
@@ -1582,6 +1583,8 @@ static void initializeRandomSources() {
     ApolloSetLinkPreviewCardColorHex(cardColorHex);
     ApolloLog(@"[LinkPreviews] settings loaded bodyMode=%ld commentsMode=%ld cardColor=%ld cardColorHex=%@", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor, sLinkPreviewCardColorHex ?: @"(default)");
     sImageUploadProvider = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyImageUploadProvider];
+    sCommentLinkHost = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyCommentLinkHost];
+    if (sCommentLinkHost < CommentLinkHostOff || sCommentLinkHost > CommentLinkHostImgChest) sCommentLinkHost = CommentLinkHostOff;
     sShowUserAvatars = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
     sShowDetailedProfiles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDetailedProfiles];

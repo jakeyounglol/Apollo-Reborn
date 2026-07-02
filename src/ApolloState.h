@@ -183,6 +183,19 @@ typedef NS_ENUM(NSInteger, ImageUploadProvider) {
 };
 extern NSInteger sImageUploadProvider;
 
+// Comment Link Host: secondary host for images added in the COMMENT/REPLY editor.
+// Off (default) keeps comment uploads on the Media Upload Host above. Imgur/ImgChest
+// route comment-editor uploads to that host and post the result as a plain link in
+// the comment body (no native Reddit media), so image/GIF replies still work in
+// subreddits that disallow media comments. Posts and chat are unaffected. Armed per
+// photo-button tap in ApolloMarkdownToolbarGif.xm; routed in ApolloImageUploadHost.xm.
+typedef NS_ENUM(NSInteger, CommentLinkHost) {
+    CommentLinkHostOff = 0,
+    CommentLinkHostImgur = 1,
+    CommentLinkHostImgChest = 2,
+};
+extern NSInteger sCommentLinkHost;
+
 // Most recently observed Reddit bearer token, captured from outgoing Authorization
 // headers. Used by the native Reddit image upload path. nil if Apollo hasn't made an
 // authenticated Reddit API call yet.
