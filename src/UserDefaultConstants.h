@@ -46,6 +46,16 @@ static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
 static NSString *const UDKeyVideoHoldSpeedEnabled = @"VideoHoldSpeedEnabled";
 static NSString *const UDKeyVideoHoldSpeed = @"VideoHoldSpeed";
 static NSString *const UDKeyOpenLinksInSteamApp = @"OpenLinksInSteamApp";
+// Apollo NATIVE key, mirrored by Reborn's "Open in App" settings screen
+// (ApolloOpenInAppViewController) so the scattered native "open in app" rows can
+// be gathered in one place and hidden from Apollo's own General settings. We
+// read/write the same key Apollo uses, so the two stay in sync.
+static NSString *const UDKeyOpenVideosInYouTubeApp = @"OpenVideosInYouTubeApp";
+// Reborn "Open in App" deep-link toggles — open these services' links in their
+// app via Universal Links (see ApolloShareLinks.xm). Default OFF (opt-in). The
+// key string literals are duplicated in ApolloShareLinks.xm; keep them in sync.
+static NSString *const UDKeyOpenLinksInGitHubApp  = @"OpenLinksInGitHubApp";
+static NSString *const UDKeyOpenLinksInBlueskyApp = @"OpenLinksInBlueskyApp";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
 static NSString *const UDKeyShowDeletedComments = @"ShowDeletedComments";
 static NSString *const UDKeyTapToRevealDeletedComments = @"TapToRevealDeletedComments";
@@ -144,6 +154,11 @@ static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummarie
 // When on, summaries are generated only when the user taps the card (rather than
 // automatically on open). Off by default. Cached summaries still show instantly.
 static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
+// When on, a summary card opens (expands) by itself as soon as its summary is
+// ready, instead of staying collapsed until the user taps it. Off by default
+// (current behaviour: cards open on tap). Tapping an idle "Tap to summarize"
+// card always opens it once loaded, regardless of this setting.
+static NSString *const UDKeyEnableAIAutoExpandSummaries = @"EnableAIAutoExpandSummaries";
 
 // Picture-in-Picture: floating in-app mini-player for comments-page videos.
 static NSString *const UDKeyPictureInPictureEnabled = @"PictureInPictureEnabled";       // master switch

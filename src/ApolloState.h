@@ -109,6 +109,7 @@ extern BOOL sEnableAISummaries;
 extern BOOL sEnableAIPostSummaries;     // post / link / both summaries
 extern BOOL sEnableAICommentSummaries;  // the "Discussion so far" summary
 extern BOOL sEnableTapToSummarize;      // generate only on tap (off = automatic)
+extern BOOL sEnableAIAutoExpandSummaries; // auto-open a summary card once it's ready (off = stay collapsed)
 
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.
