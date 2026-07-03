@@ -160,29 +160,14 @@ static OSStatus SimKeychainServe(NSDictionary *q, NSData *data, CFTypeRef *resul
 }
 #endif
 
-// Fix for a report of the signed-in account getting silently wiped within
-// ~1-2ms of a successful sign-in or cold launch -- no relaunch or network
-// round-trip involved (confirmed via temporary request logging that no
-// access_token call ever happened in that window) -- also independently
-// reported by another user on the same Signulous + shared-"dystopia"-key
-// setup (apollo-reborn#567), so this isn't specific to one device.
-//
-// Root cause: Valet's read of its own account-secrets keychain item (service
-// contains "com.christianselig.Apollo", account "2RedditAccounts2") comes
-// back errSecItemNotFound, but the very next SecItemAdd for the SAME item
-// fails errSecDuplicateItem. Apollo's AccountManager doesn't retry the add
-// with an update on that failure; it just wipes the signed-in account on the
-// spot. The classic cause for exactly this "not found on read, duplicate on
-// add" pattern is an item that's iCloud-Keychain-synced
-// (kSecAttrSynchronizable): a plain read without that attribute only
-// searches non-synced items, but a synced item still collides as a duplicate
-// on add.
-//
-// Two complementary fixes: broaden every Valet read to explicitly include
-// synced items (prevents the false "not found" to begin with), and self-heal
-// a duplicate-add by deleting the stale conflicting item (whatever its actual
-// attributes are) and retrying, so Apollo always sees the successful add path
-// it expects.
+// Fixes the signed-in account getting silently wiped seconds after sign-in
+// (apollo-reborn#567): Valet's read of its account-secrets keychain item
+// ("2RedditAccounts2") comes back errSecItemNotFound, but the next SecItemAdd
+// for the same item fails errSecDuplicateItem -- the signature of an
+// iCloud-synced item a plain read won't find but still collides with on add.
+// AccountManager doesn't retry with an update, it just wipes the account.
+// Fix: broaden reads to include synced items, and self-heal a stuck duplicate
+// by deleting the stale item and retrying the add.
 static NSDictionary *ApolloQueryByBroadeningSynchronizable(NSDictionary *query) {
     if (query[(__bridge id)kSecAttrSynchronizable]) return query;
     NSMutableDictionary *broadened = [query mutableCopy];
