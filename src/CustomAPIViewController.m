@@ -1,6 +1,8 @@
 #import "CustomAPIViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloNotificationBackend.h"
+#import "ApolloBarkNotifications.h"
+#import "ApolloPushNotifications.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
@@ -58,6 +60,20 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
     }
     return logicalRow;
 }
+
+// Row indices within SectionNotificationBackend. The Bark rows are always
+// visible: on builds without a push entitlement Bark is the only delivery
+// path, and on entitled builds it's an optional alternative transport (the
+// backend flips the device row between apns and bark on re-registration).
+typedef NS_ENUM(NSInteger, ApolloNotifBackendRow) {
+    kNotifBackendRowURL = 0,
+    kNotifBackendRowToken,
+    kNotifBackendRowBarkSwitch,
+    kNotifBackendRowBarkURL,
+    kNotifBackendRowTestConnection,
+    kNotifBackendRowTestBark,
+    kNotifBackendRowCount
+};
 
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
@@ -130,6 +146,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     TagReadPostMaxCount,
     TagNotificationBackendURL,
     TagNotificationBackendRegistrationToken,
+    TagBarkPushURL,
 };
 
 #pragma mark - Helpers
@@ -630,7 +647,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // 14) when that toggle is on.
         case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows) + (sVideoHoldSpeedEnabled ? 1 : 0);
         case SectionSubreddits: return 10 - (sSubredditListEnhancements ? 0 : 1) - (sCommunityHighlights ? 0 : 1);
-        case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
+        case SectionNotificationBackend: return kNotifBackendRowCount;
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
     }
@@ -1357,7 +1374,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (UITableViewCell *)notificationBackendCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
-    if (row == 0) {
+    if (row == kNotifBackendRowURL) {
         NSString *currentURL = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendURL] ?: @"";
         UITableViewCell *cell = [self stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_URL"
                                                                    label:@"Backend URL"
@@ -1376,7 +1393,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         return cell;
     }
 
-    if (row == 1) {
+    if (row == kNotifBackendRowToken) {
         NSString *currentToken = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendRegistrationToken] ?: @"";
         return [self stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_Token"
                                                   label:@"Registration Token"
@@ -1384,6 +1401,45 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                    text:currentToken
                                                     tag:TagNotificationBackendRegistrationToken
                                                  detail:@"Required only if the backend has REGISTRATION_SECRET set."];
+    }
+
+    if (row == kNotifBackendRowBarkSwitch) {
+        return [self switchCellWithIdentifier:@"Cell_NotifBackend_BarkSwitch"
+                                        label:@"Bark Delivery"
+                                       detail:@"Deliver notifications through the free Bark app instead of native push. Works without a push entitlement."
+                                           on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBarkNotificationsEnabled]
+                                       action:@selector(barkNotificationsSwitchToggled:)];
+    }
+
+    if (row == kNotifBackendRowBarkURL) {
+        NSString *currentURL = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkPushURL] ?: @"";
+        UITableViewCell *cell = [self stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_BarkURL"
+                                                                   label:@"Bark Push URL"
+                                                             placeholder:@"https://api.day.app/yourdevicekey"
+                                                                    text:currentURL
+                                                                     tag:TagBarkPushURL
+                                                                  detail:@"From the Bark app's server list. Treat the key like a password."];
+        for (UIView *subview in cell.contentView.subviews) {
+            if ([subview isKindOfClass:[UITextField class]]) {
+                UITextField *tf = (UITextField *)subview;
+                tf.keyboardType = UIKeyboardTypeURL;
+                tf.textColor = [self isNotificationBackendURLValid:currentURL] ? [UIColor labelColor] : [UIColor systemRedColor];
+                break;
+            }
+        }
+        return cell;
+    }
+
+    if (row == kNotifBackendRowTestBark) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_NotifBackend_TestBark"];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_NotifBackend_TestBark"];
+            cell.textLabel.textAlignment = NSTextAlignmentCenter;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+        cell.textLabel.text = @"Test Bark Notification";
+        [self apollo_applyAccentActionTextColorToCell:cell];
+        return cell;
     }
 
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_NotifBackend_Test"];
@@ -1604,8 +1660,19 @@ typedef NS_ENUM(NSInteger, Tag) {
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"forked apollo-backend"
             attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/nickclyde/apollo-backend"]}]];
-        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" instance. Requires a paid Apple Developer account on the signing side for APNs to function. Leave empty to disable."
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" instance. APNs delivery requires a paid Apple Developer account on the signing side. Leave empty to disable."
             attributes:plainAttrs]];
+        NSString *barkLead = ApolloPushNotificationsSupported()
+            ? @"\n\nThis build has working native push, but Bark Delivery can reroute notifications through the free "
+            : @"\n\nThis build has no push entitlement, so APNs can never deliver — Bark Delivery works around that: install the free ";
+        NSString *barkTail = ApolloPushNotificationsSupported()
+            ? @" instead; toggling flips the delivery transport immediately, and native push resumes when turned off. Note: notification content passes through the Bark relay unencrypted."
+            : @", copy its push URL, and notifications arrive via Bark with a tap-through back into Apollo (after setup, open Apollo's Notifications settings once to finish registering). Note: notification content passes through the Bark relay unencrypted.";
+        barkTail = [barkTail stringByAppendingString:@" Notifications show your selected app icon automatically; to also hear Apollo's notification sounds, import the matching .caf from the project's assets/bark-sounds via the Bark app's Service tab → Alert Sound → view all sounds → Upload Sound."];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkLead attributes:plainAttrs]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkTail attributes:plainAttrs]];
     } else {
         return nil;
     }
@@ -1737,8 +1804,13 @@ typedef NS_ENUM(NSInteger, Tag) {
         } else if (row == 14) {
             [self presentVideoHoldSpeedSheetFromSourceView:cell];
         }
-    } else if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) {
-        [self testNotificationBackendConnection];
+    } else if (indexPath.section == SectionNotificationBackend) {
+        NSInteger row = indexPath.row;
+        if (row == kNotifBackendRowTestConnection) {
+            [self testNotificationBackendConnection];
+        } else if (row == kNotifBackendRowTestBark) {
+            [self testBarkNotification];
+        }
     }
 }
 
@@ -1771,6 +1843,41 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     [self showAlertWithTitle:@"Copied"
                      message:@"Setup code copied. On your Home Screen, add the Apollo “Showerthoughts” widget, long-press it → Edit Widget, and paste this code into Setup Code."];
+}
+
+- (void)testBarkNotification {
+    if (!ApolloBarkConfigured()) {
+        NSString *why = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBarkNotificationsEnabled]
+            ? @"Enter a valid Bark push URL (from the Bark app's server list) before testing."
+            : @"Turn on Bark Delivery and enter your Bark push URL before testing.";
+        [self showAlertWithTitle:@"Bark Not Configured" message:why];
+        return;
+    }
+
+    UIAlertController *spinner = [UIAlertController alertControllerWithTitle:@"Sending test notification…"
+                                                                     message:@"\n"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *indicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    indicator.translatesAutoresizingMaskIntoConstraints = NO;
+    [indicator startAnimating];
+    [spinner.view addSubview:indicator];
+    [NSLayoutConstraint activateConstraints:@[
+        [indicator.centerXAnchor constraintEqualToAnchor:spinner.view.centerXAnchor],
+        [indicator.bottomAnchor constraintEqualToAnchor:spinner.view.bottomAnchor constant:-20],
+    ]];
+
+    [self presentViewController:spinner animated:YES completion:^{
+        ApolloBarkSendTestNotification(^(BOOL ok, NSString *message) {
+            [spinner dismissViewControllerAnimated:YES completion:^{
+                NSString *finalMessage = message;
+                if (ok && !ApolloIsNotificationBackendConfigured()) {
+                    finalMessage = [message stringByAppendingString:
+                        @"\n\nNote: Bark delivery also needs a Backend URL above — without one there is no server watching your Reddit account."];
+                }
+                [self showAlertWithTitle:ok ? @"Success" : @"Failed" message:finalMessage];
+            }];
+        });
+    }];
 }
 
 - (void)testNotificationBackendConnection {
@@ -1814,7 +1921,9 @@ typedef NS_ENUM(NSInteger, Tag) {
         return (row == 0 || row == 1 || row == 2 || row == 3 || row == 6 || row == 7 || row == 14);
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
-    if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) return YES;
+    if (indexPath.section == SectionNotificationBackend) {
+        return (indexPath.row == kNotifBackendRowTestConnection || indexPath.row == kNotifBackendRowTestBark);
+    }
     return NO;
 }
 
@@ -2082,6 +2191,21 @@ typedef NS_ENUM(NSInteger, Tag) {
         NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         textField.text = trimmed;
         [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyNotificationBackendRegistrationToken];
+    } else if (textField.tag == TagBarkPushURL) {
+        NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        while ([trimmed hasSuffix:@"/"]) {
+            trimmed = [trimmed substringToIndex:trimmed.length - 1];
+        }
+        textField.text = trimmed;
+        [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyBarkPushURL];
+        textField.textColor = [self isNotificationBackendURLValid:trimmed] ? [UIColor labelColor] : [UIColor systemRedColor];
+        if (ApolloBarkModeActive()) {
+            // Bark is on and the URL is usable — sync the backend device row
+            // so the (new) endpoint applies immediately. Covers both
+            // first-time setup (toggle flipped before the URL existed) and
+            // endpoint edits on an already-registered device.
+            ApolloBarkSyncBackendDeviceTransport();
+        }
     }
 
     if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
@@ -2090,6 +2214,37 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 #pragma mark - Switch Actions
+
+- (void)barkNotificationsSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyBarkNotificationsEnabled];
+
+    if (sender.isOn) {
+        // Flip the backend device row to transport=bark right away. With no
+        // valid Bark URL yet, Bark mode is inactive and this would register
+        // an undeliverable row — skip; saving the URL syncs instead.
+        if (ApolloBarkModeActive()) {
+            ApolloBarkSyncBackendDeviceTransport();
+        }
+        return;
+    }
+
+    if (ApolloPushNotificationsSupported()) {
+        // Entitled build turning Bark off: same device row (the real APNs
+        // token), flip it back to transport=apns — native push resumes
+        // immediately.
+        ApolloBarkSyncBackendDeviceTransport();
+        return;
+    }
+
+    // Unentitled build turning Bark off: nothing can deliver to this build
+    // anymore, and Bark send failures never delete device rows server-side
+    // (by design), so retiring the synthetic registration explicitly is the
+    // only way to stop the backend pushing to the Bark app forever.
+    NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
+    if (synthetic.length > 0 && ApolloIsNotificationBackendConfigured()) {
+        ApolloBarkDeleteBackendDevice(synthetic);
+    }
+}
 
 - (void)blockAnnouncementsSwitchToggled:(UISwitch *)sender {
     sBlockAnnouncements = sender.isOn;
