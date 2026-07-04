@@ -25,6 +25,7 @@
 
 #import "ApolloCommon.h"
 #import "ApolloAISummary.h"
+#import "ApolloThemeRuntime.h"
 #import "ApolloState.h"
 #import "Tweak.h"
 
@@ -1593,16 +1594,12 @@ static void ApolloAIApplyRestoredState(id headerNode, NSString *fullName);
 static UIColor *ApolloAISummaryThemeAccent(id headerNode) {
     NSString *fullName = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
     UIViewController *vc = [sControllerByFullName objectForKey:fullName];
-    NSArray<UIColor *> *candidates = @[
-        vc.navigationController.navigationBar.tintColor ?: UIColor.clearColor,
-        vc.tabBarController.tabBar.tintColor ?: UIColor.clearColor,
-        vc.view.tintColor ?: UIColor.clearColor,
-        vc.view.window.tintColor ?: UIColor.clearColor,
-    ];
-    for (UIColor *candidate in candidates) {
-        if (candidate && candidate != UIColor.clearColor) return candidate;
-    }
-    return UIColor.systemBlueColor;
+    UIColor *accent = ApolloThemeAccentColor() ?: vc.viewIfLoaded.tintColor ?: UIColor.systemBlueColor;
+    // Consumers take .CGColor on ASDK's background layout thread, where the
+    // ambient trait collection is unspecified — resolve against the owning
+    // view's traits now so light/dark can't flip per-thread.
+    UITraitCollection *tc = vc.viewIfLoaded.traitCollection;
+    return tc ? [accent resolvedColorWithTraitCollection:tc] : accent;
 }
 
 // A baseline-aligned SF Symbol as an attributed string, sized to `font` and

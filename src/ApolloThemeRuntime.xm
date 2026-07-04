@@ -746,13 +746,32 @@ static NSString * const kAppGroupSuite  = @"group.com.christianselig.apollo";
 static NSString * const kAppColorThemeKey = @"AppColorTheme";
 static const uint8_t kDonorThemeRawValue = 5; // outrun
 
-// AppColorTheme enum case names, indexed by raw value (docs/theme-builder-RE.md).
-static const char * const kAppColorThemeNames[] = {
-    "default", "nefertiti", "fieryStare", "spookyPumpkin", "solarized",
-    "outrun", "sunset", "sepia", "monochromatic", "navy", "skiesOnSkies",
-    "majesticPurple", "magentasplosion", "sniffingWalnut", "fisherKing",
-    "chumbus", "dracula", "mint",
+// Stock AppColorTheme metadata, indexed by raw value: enum case name + accent
+// {light, dark} (docs/theme-builder-RE.md; accents recovered from the 1.15.11
+// binary's accent switch — jump table 0x100ae3c14, arms off 0x10068b6bc). One
+// table so names and accents cannot drift out of index sync. chumbus dark
+// ignores the UsePureBlackDarkMode variants (000000/050505 — imperceptible).
+static const struct { const char *name; uint32_t light, dark; } kStockThemes[] = {
+    {"default",         0x007AFF, 0x2399FF},
+    {"nefertiti",       0x01A200, 0x01A200},
+    {"fieryStare",      0xFF0000, 0xFD0000},
+    {"spookyPumpkin",   0xFF6200, 0xF25D00},
+    {"solarized",       0x268BD2, 0x268BD2},
+    {"outrun",          0xC400A6, 0xFF00D8},
+    {"sunset",          0xFF6600, 0xFF7D00},
+    {"sepia",           0xB88023, 0xD3AC72},
+    {"monochromatic",   0x000000, 0xFFFFFF},
+    {"navy",            0x0058B8, 0x0060C9},
+    {"skiesOnSkies",    0x00B5F2, 0x01ADE8},
+    {"majesticPurple",  0x8800FF, 0x9C2CFF},
+    {"magentasplosion", 0xFF00B2, 0xE800A2},
+    {"sniffingWalnut",  0xA74E00, 0xA74E00},
+    {"fisherKing",      0x808286, 0x76787D},
+    {"chumbus",         0xF8F8F8, 0x20242B},
+    {"dracula",         0x9760FF, 0xAD81FF},
+    {"mint",            0x37BB98, 0x62DFA7},
 };
+enum { kStockThemeCount = sizeof(kStockThemes) / sizeof(kStockThemes[0]) };
 
 static NSUserDefaults *GroupDefaults(void) {
     static NSUserDefaults *g;
@@ -763,8 +782,8 @@ static NSUserDefaults *GroupDefaults(void) {
 
 static BOOL RawForThemeName(NSString *name, uint8_t *outRaw) {
     if (!name.length) return NO;
-    for (uint8_t i = 0; i < sizeof(kAppColorThemeNames) / sizeof(kAppColorThemeNames[0]); i++) {
-        if ([name isEqualToString:@(kAppColorThemeNames[i])]) { if (outRaw) *outRaw = i; return YES; }
+    for (uint8_t i = 0; i < kStockThemeCount; i++) {
+        if ([name isEqualToString:@(kStockThemes[i].name)]) { if (outRaw) *outRaw = i; return YES; }
     }
     return NO;
 }
@@ -788,6 +807,41 @@ static BOOL SetLiveAppColorThemeRaw(uint8_t raw) {
     *((uint8_t *)(__bridge void *)tm + ivar_getOffset(ivar)) = raw;
     ApolloLog(@"ThemeRuntime: live appColorTheme ivar set to raw %d", raw);
     return YES;
+}
+
+// Read the live appColorTheme raw byte (counterpart of SetLiveAppColorThemeRaw);
+// falls back to the persisted group-defaults selection pre-capture.
+static BOOL GetLiveAppColorThemeRaw(uint8_t *outRaw) {
+    NSObject *tm = sThemeManager;
+    if (tm) {
+        static Ivar sIvar;   // resolved once — this sits on per-cell accent paths
+        if (!sIvar) sIvar = class_getInstanceVariable(object_getClass(tm), "appColorTheme");
+        if (sIvar) { *outRaw = *((uint8_t *)(__bridge void *)tm + ivar_getOffset(sIvar)); return YES; }
+    }
+    return RawForThemeName([GroupDefaults() stringForKey:kAppColorThemeKey], outRaw);
+}
+
+// Accent of the currently-selected stock Apollo theme; nil while the custom
+// runtime is active (stock slot hijacked to the donor) or theme unknown.
+// Internal — external callers go through ApolloThemeAccentColor().
+static UIColor *ApolloThemeStockAccentColor(void) {
+    if (sEnabled) return nil;   // stock slot is hijacked to the donor theme
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return nil;
+    if (raw >= kStockThemeCount) return nil;
+    uint32_t light = kStockThemes[raw].light, dark = kStockThemes[raw].dark;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        uint32_t rgb = (tc.userInterfaceStyle == UIUserInterfaceStyleDark) ? dark : light;
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+UIColor *ApolloThemeAccentColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenAccent);
+    return custom ?: ApolloThemeStockAccentColor();
 }
 
 void ApolloThemeRuntimeEnable(void) {

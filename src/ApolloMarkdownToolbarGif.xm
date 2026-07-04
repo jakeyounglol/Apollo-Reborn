@@ -1,5 +1,6 @@
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloCommon.h"
+#import "ApolloThemeRuntime.h"
 #import "ApolloGiphyClient.h"
 #import "ApolloState.h"
 #import "ApolloSubredditInfoCache.h"
@@ -593,7 +594,7 @@ static void ApolloMarkdownGifApplyButtonChrome(UIButton *gifButton, UIColor *tin
 
 static UIButton *ApolloMarkdownGifMakeButton(UIControl *imageControl) {
     CGFloat slot = ApolloMarkdownGifSlotDimension(imageControl);
-    UIColor *tint = imageControl.tintColor ?: UIColor.systemTealColor;
+    UIColor *tint = ApolloThemeAccentColor() ?: imageControl.tintColor ?: UIColor.systemTealColor;
     UIButton *gifButton = [UIButton buttonWithType:UIButtonTypeSystem];
     gifButton.translatesAutoresizingMaskIntoConstraints = NO;
     gifButton.accessibilityIdentifier = kApolloMarkdownGifButtonIdentifier;

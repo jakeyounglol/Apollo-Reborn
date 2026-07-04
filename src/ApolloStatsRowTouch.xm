@@ -650,6 +650,7 @@ static const void *kSRTLoupeSelKey = &kSRTLoupeSelKey;         // NSNumber: sele
 static const void *kSRTLoupeScrollLockKey = &kSRTLoupeScrollLockKey; // RETAIN: UIScrollView we disabled while the loupe is up
 static const void *kSRTLoupeCancelKey = &kSRTLoupeCancelKey;   // NSNumber BOOL: finger dragged away — release cancels
 static const void *kSRTLoupeTouchStartKey = &kSRTLoupeTouchStartKey; // NSValue CGPoint: touch-down point (window coords)
+static const void *kSRTLoupeTintKey = &kSRTLoupeTintKey;       // RETAIN: accent resolved once per hold
 
 enum { kSRTGestureTypeCommentTap = 1, kSRTGestureTypeLoupe = 2 };
 
@@ -673,13 +674,13 @@ static UIImage *SRTSnapshotStrip(UIView *cellView, CGRect stripRect) {
     }];
 }
 
-// Selection pill tint: the custom theme's accent when one is active (dynamic,
-// nil otherwise), else the window tint (Apollo's own accent), else system blue.
+// Selection pill tint: the theme accent (custom or stock Apollo theme — Mint →
+// mint, etc.), else the cell's tint, else system blue. Resolved against the
+// cell's traits now: the pill's ring paints via layer borderColor (.CGColor),
+// which would otherwise resolve against the ambient traits, not the cell's.
 static UIColor *SRTAccentTint(UIView *cellView) {
-    UIColor *themed = ApolloThemeRuntimeColor(ApolloThemeTokenAccent);
-    if (themed) return themed;
-    UIColor *t = cellView.window.tintColor ?: cellView.tintColor;
-    return t ?: [UIColor systemBlueColor];
+    UIColor *accent = ApolloThemeAccentColor() ?: cellView.tintColor ?: [UIColor systemBlueColor];
+    return [accent resolvedColorWithTraitCollection:cellView.traitCollection];
 }
 
 // Pans we force-disabled while the loupe is up (edge-swipe back, parallax
@@ -731,6 +732,7 @@ static void SRTDismissLoupe(UIGestureRecognizer *gr, BOOL animated) {
     objc_setAssociatedObject(gr, kSRTLoupeScrollLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeDisabledPansKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(gr, kSRTLoupeTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 @implementation ApolloSRTGestureDelegate
@@ -942,7 +944,8 @@ static const CGFloat kSRTCancelSlopY = 64.0;
     ApolloSRTTarget *t = targets[sel];
     CGPoint stripOrigin = [(NSValue *)objc_getAssociatedObject(gr, kSRTLoupeStripOriginKey) CGPointValue];
     CGRect rectInStrip = CGRectOffset(t.rect, -stripOrigin.x, -stripOrigin.y);
-    [loupe selectRect:rectInStrip caption:t.caption tint:SRTAccentTint(cellView)];
+    UIColor *tint = objc_getAssociatedObject(gr, kSRTLoupeTintKey) ?: SRTAccentTint(cellView);
+    [loupe selectRect:rectInStrip caption:t.caption tint:tint];
     [loupe positionAboveScreenPoint:[gr locationInView:host] inHost:host];
     if (prev && prev.integerValue != sel) {
         [[[UISelectionFeedbackGenerator alloc] init] selectionChanged];
@@ -990,6 +993,7 @@ static const CGFloat kSRTCancelSlopY = 64.0;
             objc_setAssociatedObject(gr, kSRTLoupeTargetsKey, targets, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeStripOriginKey, [NSValue valueWithCGPoint:stripRect.origin], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // fresh hold, fresh escape state
+            objc_setAssociatedObject(gr, kSRTLoupeTintKey, SRTAccentTint(cellView), OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // resolve once per hold, not per touch-move
             // Lock the feed's scroll while the loupe is up so sliding to pick an icon
             // never scrolls the list; restored in SRTDismissLoupe.
             for (UIView *v = cellView; v; v = v.superview) {
