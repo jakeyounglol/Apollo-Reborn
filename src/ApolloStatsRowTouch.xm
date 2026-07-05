@@ -39,6 +39,7 @@
 
 #import "ApolloCommon.h"
 #import "ApolloState.h"
+#import "ApolloThemeRuntime.h"
 #import "UIWindow+Apollo.h"
 
 // MARK: - Minimal AsyncDisplayKit forward declarations
@@ -207,21 +208,20 @@ static CGRect SRTStripRect(NSArray<ApolloSRTTarget *> *targets) {
 }
 
 // The claim = where a press-and-hold belongs to the magnifier (and the context
-// menu is suppressed). Deliberately MUCH fatter than the strip — a thumb press
-// anywhere along the row band must activate:
-//   * horizontally: from the cell's left edge (the ↑ hugs the screen edge)
-//     to well past the last icon (room for the +N chip / 🌐 marker growing);
-//   * vertically: a fat band around the icons, at least 56pt tall, and on feed
-//     cells all the way down to the cell's bottom (the info row is the last
-//     line — the padding under it reads as "that corner" to a thumb).
+// menu is suppressed). Fatter than the strip, but tight against neighbours:
+// reaches the screen edge only when the ↑ actually hugs the margin (in compact
+// layouts the thumbnail/username share the line), stays clear of the ••• past
+// the last icon, and pads generously below but only slightly above (the
+// username/subreddit line sits right on top of the row).
 static CGRect SRTClaimRect(id cell, UIView *cellView, NSArray<ApolloSRTTarget *> *targets) {
     if (targets.count == 0) return CGRectNull;
     CGRect u = targets.firstObject.rect;
     for (ApolloSRTTarget *t in targets) u = CGRectUnion(u, t.rect);
 
-    CGFloat left = 0.0;                                   // reach the screen edge
-    CGFloat right = CGRectGetMaxX(u) + 32.0;
-    CGFloat top = CGRectGetMinY(u) - 20.0;
+    CGFloat minX = CGRectGetMinX(u);
+    CGFloat left = (minX <= 28.0) ? 0.0 : minX - 12.0;   // screen edge only when the row starts there
+    CGFloat right = CGRectGetMaxX(u) + 10.0;
+    CGFloat top = CGRectGetMinY(u) - 6.0;
     CGFloat bottom = CGRectGetMaxY(u) + 20.0;
 
     // Feed cells: the row is the cell's last line — claim the trailing padding.
@@ -232,13 +232,64 @@ static CGRect SRTClaimRect(id cell, UIView *cellView, NSArray<ApolloSRTTarget *>
     CGFloat cellBottom = CGRectGetHeight(cellView.bounds);
     if (!isHeader && cellBottom - CGRectGetMaxY(u) < 44.0) bottom = cellBottom;
 
-    // Comfortable minimum height, centered on the row.
-    if (bottom - top < 56.0) {
-        CGFloat mid = CGRectGetMidY(u);
-        top = mid - 28.0;
-        bottom = MAX(bottom, mid + 28.0);
-    }
+    // Comfort height is gained downward only (above is the username line).
+    if (bottom - top < 44.0) bottom = top + 44.0;
     return CGRectMake(left, top, right - left, bottom - top);
+}
+
+// X-axis distance from x to rect's horizontal span (0 when within it).
+static CGFloat SRTXEdgeDistance(CGRect rect, CGFloat x) {
+    if (x < CGRectGetMinX(rect)) return CGRectGetMinX(rect) - x;
+    if (x > CGRectGetMaxX(rect)) return x - CGRectGetMaxX(rect);
+    return 0.0;
+}
+
+// Neighbours rendered by PostInfoNode that are NOT loupe territory: the
+// subreddit/author line and the ••• button. Containment alone can't decide —
+// node rects run much bigger than their glyphs (the author line often spans
+// the whole stats row below it) — so a neighbour's grown rect only NOMINATES
+// the press and proximity decides, ties going to the loupe: on its own line,
+// the vertically nearer midline wins (crossover = mid-gap); on the stats line
+// (•••), the nearer horizontal span wins.
+static BOOL SRTPointOnExcludedNeighbour(id cell, UIView *cellView, NSArray<ApolloSRTTarget *> *targets, CGPoint pt) {
+    id postInfoNode = SRTIvar(cell, "postInfoNode");
+    if (!postInfoNode || !cellView.layer || targets.count == 0) return NO;
+    CGRect u = targets.firstObject.rect;
+    for (ApolloSRTTarget *t in targets) u = CGRectUnion(u, t.rect);
+    CGFloat statsMidY = CGRectGetMidY(u);
+    static const char *neighbours[] = {
+        "subredditIconNode", "subredditButtonNode", "authorButtonNode",
+        "flairNode", "cakedayNode", "moreOptionsButtonNode",
+    };
+    for (size_t i = 0; i < sizeof(neighbours) / sizeof(neighbours[0]); i++) {
+        ApolloSRTNode *node = (ApolloSRTNode *)SRTIvar(postInfoNode, neighbours[i]);
+        if (!node || node.isHidden) continue;
+        CALayer *layer = nil;
+        @try { layer = node.layer; } @catch (__unused id e) {}
+        if (!layer) continue;
+        CGRect rect = [layer convertRect:layer.bounds toLayer:cellView.layer];
+        if (CGRectIsEmpty(rect) || CGRectIsNull(rect) || CGRectIsInfinite(rect)) continue;
+        CGRect grown = UIEdgeInsetsInsetRect(rect, (UIEdgeInsets){-4.0, -4.0, -8.0, -4.0});
+        if (!CGRectContainsPoint(grown, pt)) continue;
+        if (fabs(CGRectGetMidY(rect) - statsMidY) > 8.0) {
+            // Own line above the stats: vertical midline proximity decides.
+            if (fabs(pt.y - CGRectGetMidY(rect)) < fabs(pt.y - statsMidY)) return YES;
+        } else {
+            // On the stats line: nearer horizontal span decides.
+            CGFloat statDist = CGFLOAT_MAX;
+            for (ApolloSRTTarget *t in targets) statDist = MIN(statDist, SRTXEdgeDistance(t.rect, pt.x));
+            if (SRTXEdgeDistance(rect, pt.x) < statDist) return YES;
+        }
+    }
+    return NO;
+}
+
+// Single source of truth for both the gesture's touch gating and the
+// context-menu suppression: inside the claim and not on an excluded neighbour.
+static BOOL SRTPointClaimedForLoupe(id cell, UIView *cellView, NSArray<ApolloSRTTarget *> *targets, CGPoint pt) {
+    CGRect claim = SRTClaimRect(cell, cellView, targets);
+    if (CGRectIsNull(claim) || !CGRectContainsPoint(claim, pt)) return NO;
+    return !SRTPointOnExcludedNeighbour(cell, cellView, targets, pt);
 }
 
 // Nearest target to a point's X (Voronoi on centers). Fills the gaps so every
@@ -598,6 +649,8 @@ static const void *kSRTLoupeStripOriginKey = &kSRTLoupeStripOriginKey; // NSValu
 static const void *kSRTLoupeSelKey = &kSRTLoupeSelKey;         // NSNumber: selected index
 static const void *kSRTLoupeScrollLockKey = &kSRTLoupeScrollLockKey; // RETAIN: UIScrollView we disabled while the loupe is up
 static const void *kSRTLoupeCancelKey = &kSRTLoupeCancelKey;   // NSNumber BOOL: finger dragged away — release cancels
+static const void *kSRTLoupeTouchStartKey = &kSRTLoupeTouchStartKey; // NSValue CGPoint: touch-down point (window coords)
+static const void *kSRTLoupeTintKey = &kSRTLoupeTintKey;       // RETAIN: accent resolved once per hold
 
 enum { kSRTGestureTypeCommentTap = 1, kSRTGestureTypeLoupe = 2 };
 
@@ -621,9 +674,13 @@ static UIImage *SRTSnapshotStrip(UIView *cellView, CGRect stripRect) {
     }];
 }
 
+// Selection pill tint: the theme accent (custom or stock Apollo theme — Mint →
+// mint, etc.), else the cell's tint, else system blue. Resolved against the
+// cell's traits now: the pill's ring paints via layer borderColor (.CGColor),
+// which would otherwise resolve against the ambient traits, not the cell's.
 static UIColor *SRTAccentTint(UIView *cellView) {
-    UIColor *t = cellView.window.tintColor ?: cellView.tintColor;
-    return t ?: [UIColor systemBlueColor];
+    UIColor *accent = ApolloThemeAccentColor() ?: cellView.tintColor ?: [UIColor systemBlueColor];
+    return [accent resolvedColorWithTraitCollection:cellView.traitCollection];
 }
 
 // Pans we force-disabled while the loupe is up (edge-swipe back, parallax
@@ -675,16 +732,17 @@ static void SRTDismissLoupe(UIGestureRecognizer *gr, BOOL animated) {
     objc_setAssociatedObject(gr, kSRTLoupeScrollLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeDisabledPansKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(gr, kSRTLoupeTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 @implementation ApolloSRTGestureDelegate
 
-// A touch that starts inside the claim belongs to the magnifier, full stop.
+// A touch the loupe claims (SRTPointClaimedForLoupe) belongs to the magnifier.
 // Enforced with UIKit's own priority primitive: every competing press/pan on
 // the ancestor chain is wired (once, permanently) to REQUIRE THE LOUPE TO FAIL
-// before it may begin. Outside the claim the loupe never tracks the touch, so
-// it counts as failed and everything behaves stock; inside the claim the loupe
-// begins at 0.3s, the requirement is never satisfied, and the context menu /
+// before it may begin. On unclaimed touches the loupe never tracks, counts as
+// failed, and everything behaves stock; on claimed ones it begins at 0.3s
+// (unless the swipe veto fails it, releasing everyone) and the context menu /
 // swipe-back / swipe actions simply cannot start. Deterministic — no
 // enable/disable churn, no delivery-order races. (A hard disable is NOT usable
 // here: a disabled recognizer wedges UIKit's arbitration and the loupe itself
@@ -735,22 +793,24 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
     if (!cell) return NO;
     if (type.integerValue == kSRTGestureTypeLoupe) {
         if (!sIconRowMagnifier) return NO;
-        // Claim + clear the field ONLY when the touch starts on the icon strip:
-        // the system press recognizers are reset there (they'd otherwise stall us
-        // and pop the context menu); outside the strip we take no touches and the
-        // context menu behaves stock.
+        // Take the touch only where the loupe owns it (in the row band, not on
+        // a subreddit/author/••• neighbour); anywhere else everything — context
+        // menu included — behaves stock.
         UIView *cellView = nil;
         @try { cellView = [(ApolloSRTNode *)cell view]; } @catch (__unused id e) {}
         if (!cellView) return NO;
         NSArray<ApolloSRTTarget *> *targets = SRTTargetsForCell(cell, cellView);
         if (targets.count == 0) return NO;
-        // A hold anywhere along the row band belongs to the magnifier — the
-        // context menu never fires there while the toggle is on; outside the
-        // band everything behaves stock.
-        CGRect claim = SRTClaimRect(cell, cellView, targets);
         CGPoint pt = [touch locationInView:cellView];
-        BOOL inside = CGRectContainsPoint(claim, pt);
-        if (inside) SRTWireCornerFailureRequirements(gr, cellView);
+        BOOL inside = SRTPointClaimedForLoupe(cell, cellView, targets, pt);
+        if (inside) {
+            // Touch-down point (window coords) — shouldBegin measures travel
+            // against it to tell a hold from a swipe.
+            objc_setAssociatedObject(gr, kSRTLoupeTouchStartKey,
+                                     [NSValue valueWithCGPoint:[touch locationInView:nil]],
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            SRTWireCornerFailureRequirements(gr, cellView);
+        }
         return inside;
     }
     // The comment tap only cares about the comment-bubble region.
@@ -760,13 +820,45 @@ static void SRTWireCornerFailureRequirements(UIGestureRecognizer *loupe, UIView 
     return SRTTouchHitsNode(commentsNode, cellView, touch, kSRTCommentInsets);
 }
 
-// Touch delivery already gated to the strip in shouldReceiveTouch; re-check the
-// flag and cell wiring at transition time.
+// Max finger travel between touch-down and the 0.3s mark that still reads as a
+// hold. Vertical is strict (a slow swipe must not pop the loupe); horizontal
+// gets more room (sliding along the row is the loupe's own axis).
+static const CGFloat kSRTHoldMaxTravelY = 16.0;
+static const CGFloat kSRTHoldMaxTravel  = 40.0;
+
+// Touch delivery already gated to the strip in shouldReceiveTouch; at transition
+// time re-check the flag/cell wiring and veto swipe-intent touches. Returning NO
+// fails the press cleanly, releasing every recognizer wired to wait on us.
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
     NSNumber *type = objc_getAssociatedObject(gr, kSRTGestureTypeKey);
     if (type.integerValue != kSRTGestureTypeLoupe) return YES;
-    BOOL ok = sIconRowMagnifier && objc_getAssociatedObject(gr, kSRTCommentGestureCellKey) != nil;
-    return ok;
+    id cell = objc_getAssociatedObject(gr, kSRTCommentGestureCellKey);
+    if (!sIconRowMagnifier || !cell) return NO;
+
+    // The feed is already scrolling under this touch — that's a swipe, not a hold.
+    UIView *cellView = nil;
+    @try { cellView = [(ApolloSRTNode *)cell view]; } @catch (__unused id e) {}
+    for (UIView *v = cellView; v; v = v.superview) {
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            if (((UIScrollView *)v).isDragging) {
+                ApolloLog(@"[StatsRow] loupe vetoed — feed is scrolling");
+                return NO;
+            }
+            break;
+        }
+    }
+    // The finger has visibly travelled since touch-down — swipe intent.
+    NSValue *startVal = objc_getAssociatedObject(gr, kSRTLoupeTouchStartKey);
+    if (startVal) {
+        CGPoint start = startVal.CGPointValue;
+        CGPoint now = [gr locationInView:nil];
+        CGFloat dx = now.x - start.x, dy = now.y - start.y;
+        if (fabs(dy) > kSRTHoldMaxTravelY || hypot(dx, dy) > kSRTHoldMaxTravel) {
+            ApolloLog(@"[StatsRow] loupe vetoed — finger travelled (%.0f, %.0f)", dx, dy);
+            return NO;
+        }
+    }
+    return YES;
 }
 
 // Always allow simultaneous recognition. Exclusivity CANNOT be used here: if any
@@ -852,7 +944,8 @@ static const CGFloat kSRTCancelSlopY = 64.0;
     ApolloSRTTarget *t = targets[sel];
     CGPoint stripOrigin = [(NSValue *)objc_getAssociatedObject(gr, kSRTLoupeStripOriginKey) CGPointValue];
     CGRect rectInStrip = CGRectOffset(t.rect, -stripOrigin.x, -stripOrigin.y);
-    [loupe selectRect:rectInStrip caption:t.caption tint:SRTAccentTint(cellView)];
+    UIColor *tint = objc_getAssociatedObject(gr, kSRTLoupeTintKey) ?: SRTAccentTint(cellView);
+    [loupe selectRect:rectInStrip caption:t.caption tint:tint];
     [loupe positionAboveScreenPoint:[gr locationInView:host] inHost:host];
     if (prev && prev.integerValue != sel) {
         [[[UISelectionFeedbackGenerator alloc] init] selectionChanged];
@@ -900,6 +993,7 @@ static const CGFloat kSRTCancelSlopY = 64.0;
             objc_setAssociatedObject(gr, kSRTLoupeTargetsKey, targets, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeStripOriginKey, [NSValue valueWithCGPoint:stripRect.origin], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(gr, kSRTLoupeCancelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // fresh hold, fresh escape state
+            objc_setAssociatedObject(gr, kSRTLoupeTintKey, SRTAccentTint(cellView), OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // resolve once per hold, not per touch-move
             // Lock the feed's scroll while the loupe is up so sliding to pick an icon
             // never scrolls the list; restored in SRTDismissLoupe.
             for (UIView *v = cellView; v; v = v.superview) {
@@ -980,11 +1074,9 @@ static void SRTInstallInfoRowGestures(id cell) {
     UILongPressGestureRecognizer *loupe = [[UILongPressGestureRecognizer alloc] initWithTarget:SRTDelegate()
                                                                                         action:@selector(srtLoupeLongPress:)];
     loupe.minimumPressDuration = 0.3;
-    // Default allowableMovement is a strict 10pt — a thumb wobbles more than
-    // that in 0.3s, silently failing the press (and with the context menu
-    // neutralized in the band, "nothing happens"). Real scroll intent still
-    // wins: the scroll pan recognizes long before this threshold matters and
-    // the loupe is exclusive, so it can't begin once a pan is active.
+    // The default 10pt is strict enough that a wobbly thumb silently fails the
+    // press. Keep it loose; swipe intent is vetoed at begin time instead
+    // (gestureRecognizerShouldBegin:).
     loupe.allowableMovement = 60.0;
     loupe.cancelsTouchesInView = YES;   // own the touch while the loupe is up
     loupe.delegate = SRTDelegate();
@@ -1204,8 +1296,8 @@ static void SRTScheduleTick(__weak UIViewController *weakVC, long gen, NSDate *d
 // (PostCellActionTaker for feed posts, CommentsHeaderSectionController for the
 // comments header) is asked for a configuration WHEN the press is recognized.
 // Return nil there and no menu appears — no timing, no arbitration. We return
-// nil only when the press lands in the icon-row claim and the magnifier is on;
-// everywhere else %orig runs and the menu behaves exactly as stock.
+// nil only where the loupe would claim the press (SRTPointClaimedForLoupe) and
+// the magnifier is on; everywhere else %orig runs and the menu behaves stock.
 static BOOL SRTShouldSuppressMenu(id interaction, CGPoint location) {
     if (!sIconRowMagnifier) return NO;
     UIView *iview = nil;
@@ -1226,9 +1318,8 @@ static BOOL SRTShouldSuppressMenu(id interaction, CGPoint location) {
     if (!cell || !cellView) return NO;
     NSArray<ApolloSRTTarget *> *targets = SRTTargetsForCell(cell, cellView);
     if (targets.count == 0) return NO;
-    CGRect claim = SRTClaimRect(cell, cellView, targets);
     CGPoint p = (iview == cellView) ? location : [iview convertPoint:location toView:cellView];
-    return CGRectContainsPoint(claim, p);
+    return SRTPointClaimedForLoupe(cell, cellView, targets, p);
 }
 
 %hook _TtC6Apollo19PostCellActionTaker

@@ -13,8 +13,10 @@
 // currentTraitCollection guessing and no per-frame allocation.
 //
 // The runtime is deliberately small and deterministic: it knows nothing about
-// prompts, editor state, theme names, or variant generation — only the compiled
-// light/dark token table the Store + Compiler hand it.
+// prompts, editor state, or variant generation — only the compiled light/dark
+// token table the Store + Compiler hand it, plus a recovered table of the
+// stock Apollo themes' accents (served through ApolloThemeAccentColor for
+// tweak-drawn UI when no custom theme is active).
 
 __BEGIN_DECLS
 
@@ -23,6 +25,12 @@ BOOL ApolloThemeRuntimeIsActive(void);
 
 // Cached dynamic colour for a token, or nil if inactive / out of range.
 UIColor *ApolloThemeRuntimeColor(ApolloThemeToken token);
+
+// The EFFECTIVE accent for tweak-drawn UI: the custom theme's accent when one
+// is active, else the stock Apollo theme's (from a table recovered from the
+// binary's accent switch). nil only if neither can be determined — callers
+// supply their own last-resort (typically a view tint or systemBlue).
+UIColor *ApolloThemeAccentColor(void);
 
 // Re-derive a caller-provided system font in the active theme's system design.
 // Returns `base` unchanged when the theme runtime is inactive or the active
