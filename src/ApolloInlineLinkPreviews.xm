@@ -142,6 +142,7 @@ static void ApolloLPLogOncePerHost(NSString *host, NSString *event);
 static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host);
 static BOOL ApolloLPInvokeRowReloadIfPossible(ASDisplayNode *startNode, NSString *host);
 static ASDisplayNode *ApolloLPFindOwningCellNode(ASDisplayNode *node);
+static void ApolloLPNoteRowReloadMissForNode(ASDisplayNode *node, NSString *host);
 static BOOL ApolloLPIsRedditUserProfileURL(NSURL *url);
 static NSString *ApolloLPRedditUsernameFromProfileURL(NSURL *url);
 static BOOL ApolloLPIsRedditSubredditURL(NSURL *url);
@@ -1033,8 +1034,7 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
                     ApolloLPTriggerRelayoutForHost(hostNode, hostCopy);
                     ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(hostNode);
                     if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: hostNode, hostCopy)) {
-                        objc_setAssociatedObject(hostNode, &kApolloLPPendingRowReloadHostKey,
-                                                 hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+                        ApolloLPNoteRowReloadMissForNode(hostNode, hostCopy);
                     }
                 }
             }
@@ -1170,6 +1170,107 @@ static NSArray *ApolloLPRegisteredLinkPreviewNodesSnapshot(void) {
         snapshot = sApolloLPRegisteredLinkNodes.allObjects ?: @[];
     });
     return snapshot ?: @[];
+}
+
+// MARK: - V23: cross-node row reload for detached measurement trees
+//
+// Search results measure posts on cell-node trees that live off-window (and
+// are pre-marked visible while detached, so interface-state transitions
+// never fire again once the row actually scrolls on screen). The preview
+// fetch + hero->compact shrink happen on such a tree, so the V20 pending
+// mark lands on a node whose didEnterVisibleState never re-fires and both
+// row reloads miss ("no-scroll-cell") — the row keeps its hero placeholder
+// height around the small compact card. No node-side trigger is reliable
+// here, so remember the miss per URL (main-thread only) and poll once per
+// second while anything is pending: as soon as ANY registered same-URL
+// LinkButtonNode is attached to a window — i.e. the broken row is actually
+// on screen — fire the reload from that node, which can resolve its table
+// and index path. Entries are one-shot and the poll stops when the map
+// drains, so the steady-state cost is zero.
+//
+// Generous age cap: a user can sit on the results screen for minutes before
+// scrolling down to a marked row. Reloading an already-correct same-URL row
+// is harmless (it re-renders identically), so the cap is only a safety
+// valve against reloads firing in some unrelated screen much later.
+static const NSTimeInterval ApolloLPPendingCrossNodeReloadMaxAge = 900.0;
+
+static NSMutableDictionary<NSString *, NSDate *> *ApolloLPPendingCrossNodeRowReloads(void) {
+    static NSMutableDictionary<NSString *, NSDate *> *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = [NSMutableDictionary dictionary];
+    });
+    return map;
+}
+
+static BOOL ApolloLPFireRowReloadFromAttachedNodesForURL(NSString *urlString, NSString *host) {
+    if (urlString.length == 0) return NO;
+    BOOL fired = NO;
+    for (ASDisplayNode *node in ApolloLPRegisteredLinkPreviewNodesSnapshot()) {
+        NSURL *nodeURL = objc_getAssociatedObject(node, &kApolloLinkPreviewURLKey);
+        if (![nodeURL.absoluteString isEqualToString:urlString]) continue;
+        BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && [node isNodeLoaded];
+        UIView *view = loaded ? ApolloLPViewForNode(node) : nil;
+        if (!view.window) continue; // only an on-screen tree can resolve its row's index path
+        ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(node);
+        if (ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host)) {
+            fired = YES;
+        }
+    }
+    return fired;
+}
+
+static BOOL sApolloLPCrossNodeReloadPollScheduled = NO;
+
+static void ApolloLPRunCrossNodeRowReloadPoll(void);
+
+static void ApolloLPScheduleCrossNodeRowReloadPoll(void) {
+    if (sApolloLPCrossNodeReloadPollScheduled) return;
+    sApolloLPCrossNodeReloadPollScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        sApolloLPCrossNodeReloadPollScheduled = NO;
+        ApolloLPRunCrossNodeRowReloadPoll();
+    });
+}
+
+static void ApolloLPRunCrossNodeRowReloadPoll(void) {
+    NSMutableDictionary<NSString *, NSDate *> *pending = ApolloLPPendingCrossNodeRowReloads();
+    if (pending.count == 0) return;
+    for (NSString *urlString in pending.allKeys) {
+        NSDate *registered = pending[urlString];
+        if (-[registered timeIntervalSinceNow] > ApolloLPPendingCrossNodeReloadMaxAge) {
+            [pending removeObjectForKey:urlString];
+            continue;
+        }
+        NSString *host = ApolloLPHost([NSURL URLWithString:urlString]);
+        if (ApolloLPFireRowReloadFromAttachedNodesForURL(urlString, host)) {
+            [pending removeObjectForKey:urlString];
+            ApolloLog(@"[LinkPreviews] V23-cross-node-row-reload host=%@", host ?: @"?");
+        }
+    }
+    if (pending.count > 0) {
+        ApolloLPScheduleCrossNodeRowReloadPoll();
+    }
+}
+
+// Record a row-reload miss on `node`: keep the V20 per-node pending mark
+// (same-instance re-fire from didEnterVisibleState, the feed case) and queue
+// the V23 cross-instance reload keyed by the node's URL. Try to fire right
+// away — when the preview resolves while the row is already on screen, the
+// display tree is attached and the row heals immediately.
+static void ApolloLPNoteRowReloadMissForNode(ASDisplayNode *node, NSString *host) {
+    if (!node) return;
+    objc_setAssociatedObject(node, &kApolloLPPendingRowReloadHostKey, host ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    NSURL *url = objc_getAssociatedObject(node, &kApolloLinkPreviewURLKey);
+    NSString *urlString = url.absoluteString;
+    if (urlString.length == 0) return;
+    if (ApolloLPFireRowReloadFromAttachedNodesForURL(urlString, host)) {
+        ApolloLog(@"[LinkPreviews] V23-cross-node-row-reload host=%@", host ?: @"?");
+        return;
+    }
+    ApolloLPPendingCrossNodeRowReloads()[urlString] = [NSDate date];
+    ApolloLPScheduleCrossNodeRowReloadPoll();
 }
 
 static void ApolloLPMarkNodeForColorRefresh(ASDisplayNode *node) {
@@ -2659,6 +2760,24 @@ static BOOL ApolloLPInvokeTextureScrollRelayoutIfPossible(UIView *scrollView, NS
     return YES;
 }
 
+// Debug aid for row-reload misses: dump the superview + supernode ancestor
+// chains so a miss log pinpoints which container class the walk failed to
+// recognize (e.g. the search results VC's cell tree).
+static void ApolloLPLogRowReloadMissAncestry(ASDisplayNode *startNode, UIView *cellView, NSString *host) {
+    NSMutableArray<NSString *> *viewChain = [NSMutableArray array];
+    NSUInteger depth = 0;
+    for (UIView *current = cellView; current && depth < 40; current = current.superview, depth++) {
+        [viewChain addObject:NSStringFromClass([current class])];
+    }
+    NSMutableArray<NSString *> *nodeChain = [NSMutableArray array];
+    depth = 0;
+    for (ASDisplayNode *current = startNode; current && depth < 40; current = current.supernode, depth++) {
+        [nodeChain addObject:NSStringFromClass([current class])];
+    }
+    ApolloLPLogOncePerHost(host, [NSString stringWithFormat:@"V23-miss-view-chain %@", [viewChain componentsJoinedByString:@" > "]]);
+    ApolloLPLogOncePerHost(host, [NSString stringWithFormat:@"V23-miss-node-chain %@", [nodeChain componentsJoinedByString:@" > "]]);
+}
+
 static BOOL ApolloLPInvokeRowReloadIfPossible(ASDisplayNode *startNode, NSString *host) {
     UIView *cellView = ApolloLPViewForNode(startNode);
     if (!cellView) {
@@ -2718,6 +2837,7 @@ static BOOL ApolloLPInvokeRowReloadIfPossible(ASDisplayNode *startNode, NSString
     }
 
     ApolloLPLogOncePerHost(host, @"V12-row-reload-miss no-scroll-cell");
+    ApolloLPLogRowReloadMissAncestry(startNode, cellView, host);
     return NO;
 }
 
@@ -2800,7 +2920,7 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
     ApolloLPTriggerRelayoutInternal(node, NO, host);
     ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(node);
     if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host)) {
-        objc_setAssociatedObject(node, &kApolloLPPendingRowReloadHostKey, host ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+        ApolloLPNoteRowReloadMissForNode(node, host);
     }
 
     __weak ASDisplayNode *weakNode = node;
@@ -2811,8 +2931,12 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
         ASDisplayNode *strongCellNode = ApolloLPFindOwningCellNode(strongNode);
         if (ApolloLPInvokeRowReloadIfPossible(strongCellNode ?: strongNode, hostCopy)) {
             objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            NSURL *url = objc_getAssociatedObject(strongNode, &kApolloLinkPreviewURLKey);
+            if (url.absoluteString.length > 0) {
+                [ApolloLPPendingCrossNodeRowReloads() removeObjectForKey:url.absoluteString];
+            }
         } else {
-            objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+            ApolloLPNoteRowReloadMissForNode(strongNode, hostCopy);
         }
     });
 }
