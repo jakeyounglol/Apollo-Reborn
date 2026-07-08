@@ -162,6 +162,33 @@ static OSStatus SimKeychainServe(NSDictionary *q, NSData *data, CFTypeRef *resul
 }
 #endif
 
+// Fixes the signed-in account getting silently wiped seconds after sign-in
+// (apollo-reborn#567): Valet's read of its account-secrets keychain item
+// ("2RedditAccounts2") comes back errSecItemNotFound, but the next SecItemAdd
+// for the same item fails errSecDuplicateItem -- the signature of an
+// iCloud-synced item a plain read won't find but still collides with on add.
+// AccountManager doesn't retry with an update, it just wipes the account.
+// Fix: broaden reads to include synced items, and self-heal a stuck duplicate
+// by deleting the stale item and retrying the add.
+static NSDictionary *ApolloQueryByBroadeningSynchronizable(NSDictionary *query) {
+    if (query[(__bridge id)kSecAttrSynchronizable]) return query;
+    NSMutableDictionary *broadened = [query mutableCopy];
+    broadened[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+    return broadened;
+}
+
+static void ApolloDeleteStaleKeychainItem(NSDictionary *query) {
+    NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
+    deleteQuery[(__bridge id)kSecClass] = query[(__bridge id)kSecClass] ?: (__bridge id)kSecClassGenericPassword;
+    for (id key in @[(__bridge id)kSecAttrService, (__bridge id)kSecAttrAccount, (__bridge id)kSecAttrAccessGroup]) {
+        if (query[key]) deleteQuery[key] = query[key];
+    }
+    deleteQuery[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+    OSStatus status = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+    ApolloLog(@"[KeychainSelfHeal] deleted stale duplicate item service=%@ account=%@ status=%d",
+              query[(__bridge id)kSecAttrService], query[(__bridge id)kSecAttrAccount], (int)status);
+}
+
 static void *SecItemAdd_orig;
 static OSStatus SecItemAdd_replacement(CFDictionaryRef query, CFTypeRef *result) {
     NSDictionary *strippedQuery = stripGroupAccessAttr(query);
@@ -176,7 +203,12 @@ static OSStatus SecItemAdd_replacement(CFDictionaryRef query, CFTypeRef *result)
         return errSecSuccess;
     }
 #endif
-    return ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemAdd_orig)((__bridge CFDictionaryRef)strippedQuery, result);
+    OSStatus status = ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemAdd_orig)((__bridge CFDictionaryRef)strippedQuery, result);
+    if (status == errSecDuplicateItem && IsValetQuery(strippedQuery)) {
+        ApolloDeleteStaleKeychainItem(strippedQuery);
+        status = ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemAdd_orig)((__bridge CFDictionaryRef)strippedQuery, result);
+    }
+    return status;
 }
 
 static void *SecItemCopyMatching_orig;
@@ -208,6 +240,11 @@ static OSStatus SecItemCopyMatching_replacement(CFDictionaryRef query, CFTypeRef
     }
 #endif
 
+    if (IsValetQuery(strippedQuery)) {
+        // Broaden the read to include iCloud-synced items too -- see the fix
+        // comment above SecItemAdd_replacement.
+        strippedQuery = ApolloQueryByBroadeningSynchronizable(strippedQuery);
+    }
     return ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemCopyMatching_orig)((__bridge CFDictionaryRef)strippedQuery, result);
 }
 
