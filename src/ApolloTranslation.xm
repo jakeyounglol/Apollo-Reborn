@@ -1658,6 +1658,15 @@ static void ApolloApplyTranslationToCellNode(id commentCellNode, RDKComment *com
             if ([shown isKindOfClass:[NSAttributedString class]] && shown.length > 0 &&
                 !ApolloAttributedStringEndsWithMarker(shown) &&
                 ApolloTextQualifiesAsBodyCandidate(shown.string, comment.body)) {
+                // Overwrite the saved original with the just-validated CLEAN body
+                // (same reuse rationale as ApolloAppendTranslateAffordanceForCellNode):
+                // a reused node may carry a PREVIOUS comment's saved original (never
+                // nil-cleared, and ShowOriginal's containment check can wrongly accept
+                // it when it merely contains this body), and a missing key would let a
+                // later unpin save the DECORATED text as the "original" (stacked
+                // affordances on re-pin). `shown` is marker-free and matches THIS
+                // comment's body here, so it is always the correct clean original.
+                objc_setAssociatedObject(pinnedNode, kApolloOriginalAttributedTextKey, [shown copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 ApolloShowOriginalWithRetranslateAffordanceForCellNode(commentCellNode, comment, pinnedNode);
             }
         }
@@ -2224,11 +2233,11 @@ static void ApolloApplyTranslationToHeaderCellNode(id headerCellNode, RDKLink *l
 
     // TAP-TO-TRANSLATE: hold the header swap until the marker is tapped. Stash
     // the tap's inputs (content assocs, auto-pin, the link + body-node handles
-    // the toggle routes through) and show the TARGET-code marker. Skip when the
-    // translation is a no-op (same-language / "Don't Translate" language) — there
-    // is nothing to reveal, so no hold and no marker.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(body) &&
-        ApolloTranslatedTextDiffersFromSource(body, translatedText)) {
+    // the toggle routes through) and show the TARGET-code marker. A no-op
+    // translation (same-language / "Don't Translate" language) gets no hold and
+    // no marker — but STILL returns: tap mode must never auto-swap.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(body)) {
+        if (!ApolloTranslatedTextDiffersFromSource(body, translatedText)) return;
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [body copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
@@ -2313,9 +2322,10 @@ static void ApolloApplyTranslationToPostTextNode(id owner, id textNode, NSString
         }
     }
     // TAP-TO-TRANSLATE: hold the swap; stash + auto-pin so the marker tap works.
-    // A no-op translation (same-language / skipped language) gets no hold.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText) &&
-        ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) {
+    // A no-op translation (same-language / skipped language) gets no hold — but
+    // STILL returns: tap mode must never auto-swap.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText)) {
+        if (!ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) return;
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [sourceText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
@@ -4067,6 +4077,9 @@ static id ApolloCommentCellNodeForTextNode(id textNode) {
 // toggles the translation back on.
 static NSAttributedString *ApolloAttributedStringByAppendingRetranslateAffordance(NSAttributedString *originalAttr) {
     if (![originalAttr isKindOfClass:[NSAttributedString class]] || originalAttr.length == 0) return originalAttr;
+    // Never stack a second affordance onto a string that already ends with one
+    // (e.g. a saved "original" that was accidentally captured post-decoration).
+    if (ApolloAttributedStringEndsWithMarker(originalAttr)) return originalAttr;
 
     NSDictionary *baseAttributes = ApolloVisualBaseAttributesFromAttributedString(originalAttr);
     UIFont *bodyFont = baseAttributes[NSFontAttributeName];
@@ -6216,9 +6229,10 @@ static void ApolloApplyTranslationToTitleNode(id titleNode, id textNode, NSStrin
     // everything the tap needs (source/translated + auto-pin so every reapply
     // path and the unowned-preempt hook respect the held state), show the
     // marker with the TARGET code ("EN" = tap for English), and bail. A no-op
-    // translation (same-language / skipped language) gets no hold and no marker.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText) &&
-        ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) {
+    // translation (same-language / skipped language) gets no hold and no
+    // marker — but STILL returns: tap mode must never auto-swap.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText)) {
+        if (!ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) return;
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [sourceText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
