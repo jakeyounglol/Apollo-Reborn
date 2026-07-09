@@ -140,6 +140,18 @@ static void ApolloVFHandleModelUpdate(id note, void (^origCall)(void)) {
 - (void)didExitVisibleState  { %orig; ApolloVFTrackCell(self, NO);  }
 %end
 
+// Feed post cells participate in the foreground heal below (their text blanks
+// the same way when the app returns from the background).
+%hook _TtC6Apollo17LargePostCellNode
+- (void)didEnterVisibleState { %orig; ApolloVFTrackCell(self, YES); }
+- (void)didExitVisibleState  { %orig; ApolloVFTrackCell(self, NO);  }
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
+- (void)didEnterVisibleState { %orig; ApolloVFTrackCell(self, YES); }
+- (void)didExitVisibleState  { %orig; ApolloVFTrackCell(self, NO);  }
+%end
+
 %hook _TtC6Apollo24CommentSectionController
 - (void)modelObjectUpdatedNotificationReceived:(id)note {
     ApolloVFHandleModelUpdate(note, ^{ %orig; });
@@ -151,3 +163,44 @@ static void ApolloVFHandleModelUpdate(id note, void (^origCall)(void)) {
     ApolloVFHandleModelUpdate(note, ^{ %orig; });
 }
 %end
+
+// ── Foreground heal (issue #217's app-switch flicker) ──────────────────────
+// Backgrounding makes Texture drop cell backing stores (cells leave the
+// visible/display range and free their rendered contents to save memory);
+// returning to the app re-displays them ASYNCHRONOUSLY, so every visible
+// comment/post body renders BLANK until its redraw lands — measured in the
+// sim at over a second of nil-contents commits after didBecomeActive, which
+// matches the "text disappears for up to a second" reports. Same nil-contents
+// mechanism as the vote flicker, so the same lever fixes it: flush the
+// re-displays synchronously during the foreground transition, before the
+// live view replaces the system snapshot. Staged passes because cells
+// re-enter the visible range at slightly different times across the
+// transition (willEnterForeground → didBecomeActive → first frames).
+static void ApolloVFForegroundHeal(const char *stage) {
+    NSArray *cells = sApolloVFVisibleCells.allObjects;
+    if (cells.count == 0) return;
+    for (ASDisplayNode *cell in cells) {
+        @try {
+            if ([cell respondsToSelector:@selector(recursivelyEnsureDisplaySynchronously:)]) {
+                [cell recursivelyEnsureDisplaySynchronously:YES];
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    ApolloLog(@"[VoteFlicker] foreground heal: flushed display for %lu cell(s) (%s)",
+              (unsigned long)cells.count, stage);
+}
+
+%ctor {
+    %init;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    void (^heal)(NSNotification *) = ^(__unused NSNotification *n) {
+        ApolloVFForegroundHeal("now");
+        dispatch_async(dispatch_get_main_queue(), ^{ ApolloVFForegroundHeal("next-turn"); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{ ApolloVFForegroundHeal("late"); });
+    };
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil
+                     queue:[NSOperationQueue mainQueue] usingBlock:heal];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+                     queue:[NSOperationQueue mainQueue] usingBlock:heal];
+}
