@@ -2203,8 +2203,11 @@ static void ApolloApplyTranslationToHeaderCellNode(id headerCellNode, RDKLink *l
 
     // TAP-TO-TRANSLATE: hold the header swap until the marker is tapped. Stash
     // the tap's inputs (content assocs, auto-pin, the link + body-node handles
-    // the toggle routes through) and show the TARGET-code marker.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(body)) {
+    // the toggle routes through) and show the TARGET-code marker. Skip when the
+    // translation is a no-op (same-language / "Don't Translate" language) — there
+    // is nothing to reveal, so no hold and no marker.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(body) &&
+        ApolloTranslatedTextDiffersFromSource(body, translatedText)) {
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [body copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
@@ -2289,7 +2292,9 @@ static void ApolloApplyTranslationToPostTextNode(id owner, id textNode, NSString
         }
     }
     // TAP-TO-TRANSLATE: hold the swap; stash + auto-pin so the marker tap works.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText)) {
+    // A no-op translation (same-language / skipped language) gets no hold.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText) &&
+        ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) {
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [sourceText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
@@ -2697,6 +2702,25 @@ static NSString *ApolloDetectDominantLanguage(NSString *text) {
     return ApolloDominantLanguageWithConfidence(text, NULL);
 }
 
+// YES if `langCode` (a base ISO code like "it") is one the user added to the
+// "Don't Translate" skip list. Skip codes are persisted lowercase and base-only
+// (TranslationSettingsViewController -normalizedLanguageCodeFromIdentifier:), and
+// ApolloDetectDominantLanguage likewise returns a lowercase base code, so a plain
+// lowercase compare is correct. Shared by the translate gate AND the marker/
+// affordance gate so a skipped language never advertises a translation control.
+static BOOL ApolloLanguageCodeIsInSkipList(NSString *langCode) {
+    if (![langCode isKindOfClass:[NSString class]] || langCode.length == 0) return NO;
+    NSArray<NSString *> *skip = sTranslationSkipLanguages;
+    if (![skip isKindOfClass:[NSArray class]] || skip.count == 0) return NO;
+
+    NSString *lower = langCode.lowercaseString;
+    for (NSString *code in skip) {
+        if (![code isKindOfClass:[NSString class]]) continue;
+        if ([code.lowercaseString isEqualToString:lower]) return YES;
+    }
+    return NO;
+}
+
 // Returns YES if the user has asked us not to translate text in `detectedLang`.
 // We intentionally do NOT short-circuit when detected == target: many comments are
 // mixed-language (e.g. mostly English with embedded Japanese), and NLLanguageRecognizer
@@ -2710,11 +2734,7 @@ static BOOL ApolloShouldSkipTranslationForText(NSString *text, NSString *targetL
     NSString *detected = ApolloDetectDominantLanguage(text);
     if (detected.length == 0) return NO;
 
-    for (NSString *code in skip) {
-        if (![code isKindOfClass:[NSString class]]) continue;
-        if ([code.lowercaseString isEqualToString:detected]) return YES;
-    }
-    return NO;
+    return ApolloLanguageCodeIsInSkipList(detected);
 }
 
 // Strict source-language detector for the Apple backend. Apple needs an EXPLICIT
@@ -3103,6 +3123,7 @@ static void ApolloMaybeTranslateCommentCellNode(id commentCellNode, BOOL forceTr
         // the control. The request below still prefetches so the tap is
         // instant when it succeeded; on a miss the tap fetches on demand.
         if (sTapToTranslate && detected.length > 0 && ![detected isEqualToString:targetLanguage] &&
+            !ApolloLanguageCodeIsInSkipList(detected) &&
             fullName.length > 0 && !ApolloTapModeIsTranslatedKey(fullName)) {
             ApolloAppendTranslateAffordanceForCellNode(commentCellNode, comment);
         }
@@ -3392,6 +3413,7 @@ static void ApolloMaybeTranslatePostHeaderCellNode(id headerCellNode, RDKLink *f
         // foreign — don't wait for the prefetch (a failing provider must not
         // hide the control). The request below still prefetches.
         if (sTapToTranslate && detected.length > 0 && ![detected isEqualToString:targetLanguage] &&
+            !ApolloLanguageCodeIsInSkipList(detected) &&
             !ApolloTapModeIsTranslatedKey(trimmed)) {
             id heldNode = ApolloBestPostBodyTextNode(headerCellNode, link, trimmed);
             if (heldNode) {
@@ -3476,6 +3498,7 @@ static void ApolloMaybeTranslateVisiblePostBodyForController(UIViewController *v
         // post-body layouts the header-cell walk misses) — don't wait for the
         // prefetch below.
         if (sTapToTranslate && detected.length > 0 && ![detected isEqualToString:targetLanguage] &&
+            !ApolloLanguageCodeIsInSkipList(detected) &&
             !ApolloTapModeIsTranslatedKey(sourceText)) {
             @try {
                 NSAttributedString *cur = ((id (*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
@@ -3936,6 +3959,13 @@ static BOOL ApolloShouldShowTranslationMarkerForSource(NSString *sourceText, NSS
     if (sourceCode.length == 0) return NO;
     NSString *targetCode = ApolloResolvedTargetLanguageCode();
     if (targetCode.length > 0 && [sourceCode isEqualToString:targetCode]) return NO;
+    // Honour the user's "Don't Translate" list: text in a skipped language is
+    // never translated, so it must not carry a "Translated from …" marker or a
+    // "Translate" affordance — tapping one would just no-op (the reported bug:
+    // an Italian thread with Italian skipped still showed the label on every
+    // comment). This is the single gate for the normal-mode comment/title/
+    // header/feed markers, so returning NO here clears them all at once.
+    if (ApolloLanguageCodeIsInSkipList(sourceCode)) return NO;
     if (ApolloLocalizedSourceLanguageName(sourceCode).length == 0) return NO;
     if (outCode) *outCode = sourceCode;
     return YES;
@@ -6164,8 +6194,10 @@ static void ApolloApplyTranslationToTitleNode(id titleNode, id textNode, NSStrin
     // TAP-TO-TRANSLATE: hold the swap until the user taps the marker. Stash
     // everything the tap needs (source/translated + auto-pin so every reapply
     // path and the unowned-preempt hook respect the held state), show the
-    // marker with the TARGET code ("EN" = tap for English), and bail.
-    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText)) {
+    // marker with the TARGET code ("EN" = tap for English), and bail. A no-op
+    // translation (same-language / skipped language) gets no hold and no marker.
+    if (sTapToTranslate && !ApolloTapModeIsTranslatedKey(sourceText) &&
+        ApolloTranslatedTextDiffersFromSource(sourceText, translatedText)) {
         objc_setAssociatedObject(textNode, kApolloOwnedNodeOriginalBodyKey, [sourceText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloOwnedNodeTranslatedTextKey, [translatedText copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(textNode, kApolloTitlePinnedOriginalKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // @2 = tap-mode auto-pin
@@ -6406,8 +6438,10 @@ static void ApolloMaybeTranslatePostTitleNode(id titleNode) {
     if ([detected isEqualToString:targetLanguage]) return;
 
     // TAP-TO-TRANSLATE: marker + hold as soon as the title is detectably
-    // foreign (detection-driven — see the comment/header equivalents).
-    if (sTapToTranslate && detected.length > 0 && !ApolloTapModeIsTranslatedKey(titleText)) {
+    // foreign (detection-driven — see the comment/header equivalents). A title
+    // in a "Don't Translate" language gets no marker (it can't be translated).
+    if (sTapToTranslate && detected.length > 0 && !ApolloLanguageCodeIsInSkipList(detected) &&
+        !ApolloTapModeIsTranslatedKey(titleText)) {
         @try {
             NSAttributedString *cur = ((id (*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
             if ([cur isKindOfClass:[NSAttributedString class]] && cur.length > 0 &&
