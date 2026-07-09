@@ -199,6 +199,7 @@ static void ApolloToggleTranslationForCommentTextNode(id textNode);
 static void ApolloEnsureMarkerTappableOnNode(id textNode);
 static void ApolloEnsureCommentsTableBreathingRoom(void);
 static void ApolloAppendTranslateAffordanceForCellNode(id cellNode, RDKComment *comment);
+static void ApolloShowOriginalWithRetranslateAffordanceForCellNode(id cellNode, RDKComment *comment, id textNode);
 static BOOL ApolloAttributedStringEndsWithMarker(NSAttributedString *attr);
 static void ApolloApplyTranslationToTitleNode(id titleNode, id textNode, NSString *sourceText, NSString *translatedText);
 // A feed post title the user tapped to pin back to ORIGINAL; gates the title
@@ -1640,6 +1641,26 @@ static void ApolloApplyTranslationToCellNode(id commentCellNode, RDKComment *com
             return;
         }
     } else if (pinName.length > 0 && sUserPinnedOriginalFullNames && [sUserPinnedOriginalFullNames containsObject:pinName]) {
+        // Pinned to original — but a collapse/expand or cell reuse rebuilds the
+        // cell with the PLAIN body, stripping the "Show translation" line. That
+        // line is the tap target, so without re-asserting it the comment would
+        // be stranded in its original language with no way back (reported bug).
+        // Idempotent: skip when the displayed text already carries our marker,
+        // and only decorate the node actually showing THIS comment's original
+        // body. The affordance is only useful when a real translation exists
+        // (it does by construction here — we were called with one that differs,
+        // or the differs check below skips a no-op).
+        if (ApolloTranslatedTextDiffersFromSource(comment.body, translatedText)) {
+            id pinnedNode = ApolloBestCommentTextNode(commentCellNode, comment);
+            NSAttributedString *shown = nil;
+            @try { shown = ((id (*)(id, SEL))objc_msgSend)(pinnedNode, @selector(attributedText)); }
+            @catch (__unused NSException *e) {}
+            if ([shown isKindOfClass:[NSAttributedString class]] && shown.length > 0 &&
+                !ApolloAttributedStringEndsWithMarker(shown) &&
+                ApolloTextQualifiesAsBodyCandidate(shown.string, comment.body)) {
+                ApolloShowOriginalWithRetranslateAffordanceForCellNode(commentCellNode, comment, pinnedNode);
+            }
+        }
         return;
     }
 
@@ -7433,6 +7454,77 @@ static void ApolloDbgTapComment(CFNotificationCenterRef c, void *o, CFStringRef 
         ApolloLog(@"[Tw/dbg] no comment affordance visible");
     });
 }
+// Pin/unpin the topmost TRANSLATION-OWNED comment (works even when the marker
+// line is absent, e.g. detection-floor comments that still translated) — same
+// toggle a marker tap drives.
+static void ApolloDbgPinComment(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIWindow *w in ApolloAllWindows()) {
+            NSMutableArray *nodes = [NSMutableArray array];
+            NSHashTable *visited = [[NSHashTable alloc] initWithOptions:NSHashTableObjectPointerPersonality capacity:256];
+            ApolloCollectAttributedTextNodes(w, 18, visited, nodes);
+            id best = nil; CGFloat bestY = CGFLOAT_MAX;
+            for (id node in nodes) {
+                BOOL owned = [objc_getAssociatedObject(node, kApolloTranslationOwnedTextNodeKey) boolValue];
+                NSAttributedString *attr = nil;
+                @try { attr = ((id (*)(id, SEL))objc_msgSend)(node, @selector(attributedText)); } @catch (__unused NSException *e) { continue; }
+                if (!owned && !ApolloAttributedStringEndsWithMarker(attr)) continue;
+                UIView *v = nil;
+                @try { if ([node respondsToSelector:@selector(view)]) v = ((UIView *(*)(id, SEL))objc_msgSend)(node, @selector(view)); } @catch (__unused NSException *e) {}
+                if (!v.window) continue;
+                CGFloat y = [v convertRect:v.bounds toView:nil].origin.y;
+                if (y > 150.0 && y < bestY) { bestY = y; best = node; }
+            }
+            if (best) {
+                ApolloLog(@"[Tw/dbg] pin-toggling owned comment at y=%.0f", bestY);
+                ApolloToggleTranslationForCommentTextNode(best);
+                return;
+            }
+        }
+        ApolloLog(@"[Tw/dbg] no owned/marked comment visible");
+    });
+}
+// Collapse/expand the comment ROW containing the topmost owned-or-marked text
+// node, by routing through the table's own didSelectRow (exactly what a finger
+// tap on the cell does) — HID taps in the sim are unreliable for this.
+static void ApolloDbgToggleCollapse(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *tv = GetCommentsTableView(sVisibleCommentsViewController);
+        if (!tv) { ApolloLog(@"[Tw/dbg] no comments table"); return; }
+        // Find the topmost owned/marked node's position → its row.
+        NSMutableArray *nodes = [NSMutableArray array];
+        NSHashTable *visited = [[NSHashTable alloc] initWithOptions:NSHashTableObjectPointerPersonality capacity:256];
+        ApolloCollectAttributedTextNodes(tv, 18, visited, nodes);
+        NSIndexPath *ip = nil; CGFloat bestY = CGFLOAT_MAX;
+        for (id node in nodes) {
+            BOOL owned = [objc_getAssociatedObject(node, kApolloTranslationOwnedTextNodeKey) boolValue];
+            BOOL pinned = objc_getAssociatedObject(node, kApolloOriginalAttributedTextKey) != nil;
+            NSAttributedString *attr = nil;
+            @try { attr = ((id (*)(id, SEL))objc_msgSend)(node, @selector(attributedText)); } @catch (__unused NSException *e) { continue; }
+            if (!owned && !pinned && !ApolloAttributedStringEndsWithMarker(attr)) continue;
+            UIView *v = nil;
+            @try { if ([node respondsToSelector:@selector(view)]) v = ((UIView *(*)(id, SEL))objc_msgSend)(node, @selector(view)); } @catch (__unused NSException *e) {}
+            if (!v.window) continue;
+            CGRect inTable = [v convertRect:v.bounds toView:tv];
+            NSIndexPath *cand = [tv indexPathForRowAtPoint:CGPointMake(CGRectGetMidX(inTable), CGRectGetMidY(inTable))];
+            if (cand && inTable.origin.y < bestY) { bestY = inTable.origin.y; ip = cand; }
+        }
+        if (!ip) {
+            // Fallback: remembered row from the previous invocation (the collapsed
+            // cell no longer contains our text node).
+            ip = objc_getAssociatedObject(tv, "apollo_dbg_collapse_ip");
+        }
+        if (!ip) { ApolloLog(@"[Tw/dbg] no target row for collapse"); return; }
+        objc_setAssociatedObject(tv, "apollo_dbg_collapse_ip", ip, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        id target = tv.delegate;
+        if ([target respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+            ApolloLog(@"[Tw/dbg] didSelect (collapse-toggle) row=%ld sec=%ld", (long)ip.row, (long)ip.section);
+            ((void (*)(id, SEL, id, id))objc_msgSend)(target, @selector(tableView:didSelectRowAtIndexPath:), tv, ip);
+        } else {
+            ApolloLog(@"[Tw/dbg] table delegate %@ lacks didSelect", [target class]);
+        }
+    });
+}
 static void ApolloDbgDumpInsets(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableView *tv = GetCommentsTableView(sVisibleCommentsViewController);
@@ -7566,6 +7658,8 @@ static void ApolloDbgOpenFirstPost(CFNotificationCenterRef c, void *o, CFStringR
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgOpenFirstPost, CFSTR("apollofix.dbg.open"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgFlipTapMode, CFSTR("apollofix.dbg.tapmode"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgTapComment, CFSTR("apollofix.dbg.tapcomment"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgPinComment, CFSTR("apollofix.dbg.pincomment"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgToggleCollapse, CFSTR("apollofix.dbg.collapse"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, ApolloDbgDumpInsets, CFSTR("apollofix.dbg.insets"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 #endif
 
