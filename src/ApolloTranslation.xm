@@ -2812,6 +2812,258 @@ static void ApolloTranslateViaApple(NSString *text,
 #endif
 }
 
+// Max encoded size (in `q=` percent-encoded characters) of a single request sent to a
+// network translation provider. The public Google endpoint is a GET with the whole text
+// in the URL query param; a long post body overflows the server's URL length limit
+// (empirically HTTP 400 once the URL passes ~15KB, i.e. ~9000 chars of accented Latin or
+// ~1600 CJK chars) and the ENTIRE translation fails — which is why long posts silently
+// don't translate. 5000 keeps the full URL around ~5.1KB, comfortably inside the range
+// that responds 200, with margin for the LibreTranslate fallback's per-request caps too.
+static const NSUInteger kApolloTranslationChunkByteBudget = 5000;
+
+// Percent-encoded length of `s` as it appears in the Google `q=` query param. Percent
+// encoding is per-character, so this is additive — len(a+b) == len(a)+len(b) — which lets
+// the splitter accumulate chunk sizes incrementally instead of re-encoding growing strings.
+static NSUInteger ApolloEncodedTranslationLength(NSString *s) {
+    if (s.length == 0) return 0;
+    NSString *enc = [s stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    return enc ? enc.length : s.length;
+}
+
+// Split `text` into ordered chunks whose individual `q=` encoded sizes each stay at or
+// under `byteBudget`, preferring sentence/paragraph boundaries (falling back to word, then
+// character boundaries for pathological input). Fills `separatorsOut` with the exact
+// whitespace that sat between consecutive chunks (count == chunks.count - 1) so the caller
+// can rejoin translated pieces without losing paragraph structure. Chunk boundaries only
+// ever land on whitespace, so the single-token protection sentinels
+// (APOLLOTRANSLATION…TOKEN — no whitespace) are never split across a boundary and survive
+// the round-trip intact. Text already inside the budget returns as a single chunk, so the
+// common (short) path is byte-for-byte the same request as before.
+static NSArray<NSString *> *ApolloSplitTranslationText(NSString *text, NSUInteger byteBudget, NSArray<NSString *> **separatorsOut) {
+    if (separatorsOut) *separatorsOut = @[];
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return text ? @[text] : @[];
+    if (byteBudget < 64) byteBudget = 64;   // sanity floor
+    if (ApolloEncodedTranslationLength(text) <= byteBudget) return @[text];
+
+    NSMutableArray<NSString *> *chunks = [NSMutableArray array];
+    NSMutableArray<NSString *> *separators = [NSMutableArray array];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+
+    // Single funnel: append a chunk plus, for every chunk after the first, the whitespace
+    // that precedes it. Guarantees separators.count == chunks.count - 1. Callers pass the
+    // reused `current`/`cur` NSMutableStrings, so snapshot an immutable copy — otherwise
+    // every stored chunk would alias the same buffer and show its final value.
+    void (^emitChunk)(NSString *, NSString *) = ^(NSString *chunk, NSString *sepBefore) {
+        if (chunks.count > 0) [separators addObject:(sepBefore ? [sepBefore copy] : @"")];
+        [chunks addObject:(chunk ? [chunk copy] : @"")];
+    };
+
+    // Word-level packer for a single over-budget unit (a sentence longer than the budget);
+    // emits through emitChunk, using `leadSep` before its first emitted chunk. Preserves the
+    // unit's internal whitespace and hard-splits any single token that alone exceeds budget.
+    void (^packWords)(NSString *, NSString *) = ^(NSString *unit, NSString *leadSep) {
+        NSUInteger n = unit.length, i = 0;
+        NSMutableString *cur = [NSMutableString string];
+        NSUInteger curEnc = 0;
+        NSString *pend = @""; NSUInteger pendEnc = 0;
+        NSString *nextLead = leadSep ?: @"";
+        while (i < n) {
+            NSUInteger w0 = i;
+            while (i < n && ![ws characterIsMember:[unit characterAtIndex:i]]) i++;
+            NSString *word = [unit substringWithRange:NSMakeRange(w0, i - w0)];
+            NSUInteger s0 = i;
+            while (i < n && [ws characterIsMember:[unit characterAtIndex:i]]) i++;
+            NSString *trail = [unit substringWithRange:NSMakeRange(s0, i - s0)];
+            NSUInteger wordEnc = ApolloEncodedTranslationLength(word);
+
+            if (wordEnc > byteBudget) {
+                // A single token (no whitespace) larger than the budget — e.g. a giant URL
+                // or a wall of emoji. Hard-split it, but grow the pieces one *composed
+                // character sequence* at a time so a boundary never lands inside a surrogate
+                // pair / combining sequence (which would produce a lone surrogate that
+                // percent-encodes to nil and corrupts the request). Always emit at least one
+                // sequence per piece, even if that sequence alone exceeds the budget.
+                if (cur.length) { emitChunk(cur, nextLead); nextLead = pend; [cur setString:@""]; curEnc = 0; }
+                NSUInteger wl = word.length, j = 0;
+                // A protection sentinel (APOLLOTRANSLATIONLINK/NAME<n>TOKEN) can be embedded in
+                // a whitespace-free run (e.g. a URL inside spaceless CJK), so it can land in
+                // this monster token. Precompute their ranges so a byte-budget cut never
+                // bisects one — otherwise the restore pass can't match it and the raw sentinel
+                // leaks into the translation with the URL/name lost.
+                static NSRegularExpression *sSentinelRE;
+                static dispatch_once_t sSentinelOnce;
+                dispatch_once(&sSentinelOnce, ^{
+                    sSentinelRE = [NSRegularExpression regularExpressionWithPattern:@"APOLLOTRANSLATION(?:LINK|NAME)[0-9]+TOKEN" options:0 error:NULL];
+                });
+                NSArray<NSTextCheckingResult *> *sentinels = [sSentinelRE matchesInString:word options:0 range:NSMakeRange(0, wl)];
+                while (j < wl) {
+                    NSUInteger end = NSMaxRange([word rangeOfComposedCharacterSequenceAtIndex:j]);
+                    if (end > wl) end = wl;
+                    while (end < wl) {
+                        NSUInteger nextEnd = NSMaxRange([word rangeOfComposedCharacterSequenceAtIndex:end]);
+                        if (nextEnd > wl) nextEnd = wl;
+                        if (ApolloEncodedTranslationLength([word substringWithRange:NSMakeRange(j, nextEnd - j)]) > byteBudget) break;
+                        end = nextEnd;
+                    }
+                    // Snap the cut out of any sentinel it lands strictly inside: push the
+                    // sentinel wholly into the next piece, or (if it starts at this piece's
+                    // head and overruns the budget) keep it whole here, a little over budget.
+                    for (NSTextCheckingResult *m in sentinels) {
+                        NSRange r = m.range;
+                        if (end > r.location && end < NSMaxRange(r)) {
+                            end = (r.location > j) ? r.location : NSMaxRange(r);
+                            break;
+                        }
+                    }
+                    if (end > wl) end = wl;
+                    if (end <= j) end = MIN(j + 1, wl);   // never stall
+                    emitChunk([word substringWithRange:NSMakeRange(j, end - j)], nextLead);
+                    nextLead = @"";
+                    j = end;
+                }
+                // `cur` is empty after a hard-split, so the whitespace that followed the
+                // token is the separator BEFORE the next chunk (nextLead), not a pending
+                // internal joiner — otherwise it gets overwritten and the space is lost.
+                nextLead = trail; pend = @""; pendEnc = 0;
+                continue;
+            }
+
+            if (cur.length && (curEnc + pendEnc + wordEnc) > byteBudget) {
+                emitChunk(cur, nextLead); nextLead = pend;
+                [cur setString:word]; curEnc = wordEnc;
+                pend = trail; pendEnc = ApolloEncodedTranslationLength(trail);
+            } else {
+                if (cur.length) { [cur appendString:pend]; curEnc += pendEnc; }
+                [cur appendString:word]; curEnc += wordEnc;
+                pend = trail; pendEnc = ApolloEncodedTranslationLength(trail);
+            }
+        }
+        if (cur.length) emitChunk(cur, nextLead);
+    };
+
+    // Level 1: segment into sentence/paragraph units + the whitespace after each. A break
+    // is a whitespace run that either contains a newline (paragraph) or immediately follows
+    // sentence-ending punctuation; all other whitespace stays inside the unit.
+    NSMutableArray<NSString *> *units = [NSMutableArray array];
+    NSMutableArray<NSString *> *unitSeps = [NSMutableArray array];   // sep AFTER units[k]
+    {
+        NSCharacterSet *terms = [NSCharacterSet characterSetWithCharactersInString:@".!?…。！？؟।"];
+        NSCharacterSet *newlines = [NSCharacterSet newlineCharacterSet];
+        NSUInteger n = text.length, i = 0, unitStart = 0;
+        while (i < n) {
+            if ([ws characterIsMember:[text characterAtIndex:i]]) {
+                NSUInteger s0 = i; BOOL hasNL = NO;
+                while (i < n && [ws characterIsMember:[text characterAtIndex:i]]) {
+                    if ([newlines characterIsMember:[text characterAtIndex:i]]) hasNL = YES;
+                    i++;
+                }
+                unichar prev = s0 > 0 ? [text characterAtIndex:s0 - 1] : 0;
+                BOOL afterTerm = prev != 0 && [terms characterIsMember:prev];
+                if ((hasNL || afterTerm) && s0 > unitStart) {
+                    [units addObject:[text substringWithRange:NSMakeRange(unitStart, s0 - unitStart)]];
+                    [unitSeps addObject:[text substringWithRange:NSMakeRange(s0, i - s0)]];
+                    unitStart = i;
+                }
+            } else {
+                i++;
+            }
+        }
+        if (unitStart < n) { [units addObject:[text substringWithRange:NSMakeRange(unitStart, n - unitStart)]]; [unitSeps addObject:@""]; }
+    }
+
+    // Level 2: greedily pack whole units into chunks; a unit larger than the budget is
+    // word-split in place (its surrounding separators still tile exactly).
+    NSMutableString *current = [NSMutableString string];
+    NSUInteger currentEnc = 0;
+    NSString *sepBeforeCurrent = @"";   // whitespace that precedes `current` when it emits
+    NSString *pendingSep = @"";         // whitespace after current's last unit
+    NSUInteger pendingSepEnc = 0;
+
+    for (NSUInteger idx = 0; idx < units.count; idx++) {
+        NSString *u = units[idx];
+        NSString *s = unitSeps[idx];
+        NSUInteger uEnc = ApolloEncodedTranslationLength(u);
+
+        if (uEnc > byteBudget) {
+            NSString *leadSep;
+            if (current.length) { emitChunk(current, sepBeforeCurrent); leadSep = pendingSep; [current setString:@""]; currentEnc = 0; }
+            else { leadSep = sepBeforeCurrent; }
+            packWords(u, leadSep);
+            sepBeforeCurrent = s;   // next real chunk gets this as its preceding separator
+            pendingSep = @""; pendingSepEnc = 0;
+            continue;
+        }
+
+        if (current.length == 0) {
+            [current appendString:u]; currentEnc = uEnc;
+            pendingSep = s; pendingSepEnc = ApolloEncodedTranslationLength(s);
+        } else if ((currentEnc + pendingSepEnc + uEnc) > byteBudget) {
+            emitChunk(current, sepBeforeCurrent);
+            sepBeforeCurrent = pendingSep;
+            [current setString:u]; currentEnc = uEnc;
+            pendingSep = s; pendingSepEnc = ApolloEncodedTranslationLength(s);
+        } else {
+            [current appendString:pendingSep]; [current appendString:u];
+            currentEnc += pendingSepEnc + uEnc;
+            pendingSep = s; pendingSepEnc = ApolloEncodedTranslationLength(s);
+        }
+    }
+    if (current.length) emitChunk(current, sepBeforeCurrent);
+
+    if (separatorsOut) *separatorsOut = separators;
+    return chunks;
+}
+
+// Translate `chunks` in order through `translateOne` (one network round-trip per chunk),
+// then reassemble the results with `separators` between them. Sequential (not parallel) so
+// the output order is deterministic and we never fan out N simultaneous requests at the
+// same public endpoint. Any chunk failing fails the whole translation (nil result) so the
+// caller can fall back to the other provider, matching the single-request behaviour.
+static void ApolloTranslateChunksSequentially(NSArray<NSString *> *chunks,
+                                              NSArray<NSString *> *separators,
+                                              NSString *targetLanguage,
+                                              void (^translateOne)(NSString *chunk, NSString *target, void (^cb)(NSString *, NSError *)),
+                                              void (^completion)(NSString *joined, NSError *error)) {
+    NSMutableArray<NSString *> *results = [NSMutableArray arrayWithCapacity:chunks.count];
+    // Recursive async driver. `holder` keeps the step block alive across the network
+    // callbacks (a strong local would die when this function returns); re-invocation goes
+    // through a __weak ref so there's no compiler-visible retain cycle. Emptying `holder`
+    // at either terminal releases the block — no leak.
+    NSMutableArray *holder = [NSMutableArray array];
+    __weak __block void (^weakStep)(void) = nil;
+    void (^step)(void) = ^{
+        NSUInteger idx = results.count;
+        if (idx >= chunks.count) {
+            NSMutableString *joined = [NSMutableString string];
+            for (NSUInteger k = 0; k < results.count; k++) {
+                if (k > 0) {
+                    NSString *sep = (k - 1 < separators.count) ? separators[k - 1] : @" ";
+                    [joined appendString:(sep ?: @"")];
+                }
+                [joined appendString:results[k]];
+            }
+            [holder removeAllObjects];   // finished — release the driver block
+            completion([joined copy], nil);
+            return;
+        }
+        translateOne(chunks[idx], targetLanguage, ^(NSString *translated, NSError *error) {
+            if (![translated isKindOfClass:[NSString class]] || translated.length == 0) {
+                NSError *chunkError = error ?: [NSError errorWithDomain:@"ApolloTranslation" code:103
+                    userInfo:@{NSLocalizedDescriptionKey: @"Chunked translation failed"}];
+                [holder removeAllObjects];   // release on the failure path too
+                completion(nil, chunkError);
+                return;
+            }
+            [results addObject:translated];
+            void (^next)(void) = weakStep;
+            if (next) next();
+        });
+    };
+    [holder addObject:step];
+    weakStep = step;
+    step();
+}
+
 static void ApolloTranslateTextWithFallback(NSString *text,
                                             NSString *targetLanguage,
                                             void (^completion)(NSString *translated, NSError *error)) {
@@ -2826,13 +3078,30 @@ static void ApolloTranslateTextWithFallback(NSString *text,
         return;
     }
 
-    // Apple is on-device and deliberately has NO cross-provider fallback: if the
-    // user picked Apple, translation stays Apple (we'd rather prompt to download a
-    // language model than silently substitute Google output). On failure the error
-    // propagates and the caller leaves the original text. (A future opt-in fallback
-    // could be added here.)
+    // Split oversized text once, up front — every provider path reuses it. A full post
+    // selftext both overflows the Google GET endpoint's URL limit (HTTP 400 -> whole
+    // request fails) AND bogs down Apple's on-device serial session (a single giant
+    // translate can hang/fail — the same reason the feed preview is length-capped), so all
+    // three providers translate it in sentence-bounded chunks and reassemble in order.
+    // Short text yields a single chunk, so the everyday path is exactly one request as before.
+    NSArray<NSString *> *separators = nil;
+    NSArray<NSString *> *chunks = ApolloSplitTranslationText(text, kApolloTranslationChunkByteBudget, &separators);
+
+    // Apple is on-device and deliberately has NO cross-provider fallback: if the user picked
+    // Apple, translation stays Apple (we'd rather prompt to download a language model than
+    // silently substitute Google output). On failure the error propagates and the caller
+    // leaves the original text. Chunk it the same way; the shim already detects each chunk's
+    // source per snippet (which also handles a multilingual post better than one whole-text
+    // guess), and the large first chunk seeds the context fallback for any shorter tail chunk.
     if ([sTranslationProvider isEqualToString:@"apple"]) {
-        ApolloTranslateViaApple(text, targetLanguage, completion);
+        if (chunks.count <= 1) {
+            ApolloTranslateViaApple(text, targetLanguage, completion);
+        } else {
+            ApolloTranslateChunksSequentially(chunks, separators, targetLanguage,
+                ^(NSString *chunk, NSString *target, void (^cb)(NSString *, NSError *)) {
+                    ApolloTranslateViaApple(chunk, target, cb);
+                }, completion);
+        }
         return;
     }
 
@@ -2844,31 +3113,33 @@ static void ApolloTranslateTextWithFallback(NSString *text,
         primaryProvider = @"google";
     }
 
-    void (^callPrimary)(void (^)(NSString *, NSError *)) = ^(void (^cb)(NSString *, NSError *)) {
-        if ([primaryProvider isEqualToString:@"libre"]) {
-            ApolloTranslateViaLibre(text, targetLanguage, cb);
+    // Run one whole (possibly multi-chunk) translation through the named provider.
+    void (^runProvider)(NSString *, void (^)(NSString *, NSError *)) = ^(NSString *provider, void (^done)(NSString *, NSError *)) {
+        void (^one)(NSString *, NSString *, void (^)(NSString *, NSError *)) = ^(NSString *chunk, NSString *target, void (^cb)(NSString *, NSError *)) {
+            if ([provider isEqualToString:@"libre"]) {
+                ApolloTranslateViaLibre(chunk, target, cb);
+            } else {
+                ApolloTranslateViaGoogle(chunk, target, cb);
+            }
+        };
+        if (chunks.count <= 1) {
+            one(text, targetLanguage, done);
         } else {
-            ApolloTranslateViaGoogle(text, targetLanguage, cb);
+            ApolloTranslateChunksSequentially(chunks, separators, targetLanguage, one, done);
         }
     };
 
-    // If the primary provider fails, fall back to the other one.
-    void (^fallback)(void) = ^{
-        if ([primaryProvider isEqualToString:@"google"]) {
-            ApolloTranslateViaLibre(text, targetLanguage, completion);
-        } else {
-            ApolloTranslateViaGoogle(text, targetLanguage, completion);
-        }
-    };
-
-    callPrimary(^(NSString *translated, NSError *error) {
+    // If the primary provider fails (including a mid-chunk failure), fall back to the other.
+    runProvider(primaryProvider, ^(NSString *translated, NSError *error) {
         if ([translated isKindOfClass:[NSString class]] && translated.length > 0) {
             completion(translated, nil);
             return;
         }
-        fallback();
+        NSString *other = [primaryProvider isEqualToString:@"google"] ? @"libre" : @"google";
+        runProvider(other, completion);
     });
 }
+
 
 static void ApolloRequestTranslation(NSString *cacheKey,
                                      NSString *sourceText,
