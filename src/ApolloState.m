@@ -44,6 +44,7 @@ BOOL sEnableInlineImages = NO;
 BOOL sEnableChatMedia = NO;   // effective default YES via registerDefaults (UDKeyEnableChatMedia)
 BOOL sEnableAISummaries = NO;
 BOOL sLiveCommentsFollow = YES;   // effective default ON via registerDefaults (UDKeyLiveCommentsFollow)
+BOOL sPerPostCommentSort = NO;    // opt-in; default OFF via registerDefaults (UDKeyPerPostCommentSort)
 BOOL sEnableAIPostSummaries = YES;
 BOOL sEnableAICommentSummaries = YES;
 BOOL sEnableTapToSummarize = NO;

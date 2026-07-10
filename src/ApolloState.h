@@ -83,6 +83,10 @@ extern BOOL sIconRowMagnifier;
 // while you're at the top, and shows a "N new comments" jump pill when you've scrolled down
 // to read/reply. See ApolloLiveCommentsFollow.xm. Default ON via registerDefaults.
 extern BOOL sLiveCommentsFollow;
+// Per-post comment sort memory (issue #555): reopening a post restores the comment
+// sort last picked inside it; other posts keep Apollo's native sort chain. Opt-in;
+// default OFF via registerDefaults. See ApolloPerPostCommentSort.xm.
+extern BOOL sPerPostCommentSort;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;
