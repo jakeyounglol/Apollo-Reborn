@@ -71,6 +71,9 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
     $(SRC_DIR)/ApolloSettings.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
+    $(SRC_DIR)/ApolloHiddenContentData.m \
+    $(SRC_DIR)/ApolloHiddenContentViewController.m \
+    $(SRC_DIR)/ApolloHiddenContentMenu.xm \
     $(SRC_DIR)/ApolloSavedCategories.xm \
     $(SRC_DIR)/ApolloUserFlair.xm \
     $(SRC_DIR)/ApolloFlairColors.xm \
@@ -136,6 +139,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAccountCredentials.m \
     $(SRC_DIR)/ApolloAccountSwitcherViewController.xm \
     $(SRC_DIR)/ApolloSignInSplash.xm \
+    $(SRC_DIR)/ApolloHideSubscribePrompt.xm \
     $(SRC_DIR)/CustomAPIViewController.m \
     $(SRC_DIR)/ApolloAISettingsViewController.m \
     $(SRC_DIR)/ApolloDeletedCommentsSettingsViewController.m \

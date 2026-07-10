@@ -1356,7 +1356,7 @@ static UITableView *ApolloFindTableView(UIViewController *viewController) {
     return (UITableView *)ApolloFindSubviewOfClass(viewController.view, [UITableView class]);
 }
 
-static NSString *ApolloUsernameFromProfileViewController(UIViewController *viewController) {
+NSString *ApolloUsernameFromProfileViewController(UIViewController *viewController) {
     NSArray<NSString *> *preferredIvars = @[@"username", @"userName", @"_username", @"account", @"user", @"profile", @"viewModel"];
     for (NSString *ivarName in preferredIvars) {
         id value = ApolloObjectIvarValue(viewController, ivarName);
