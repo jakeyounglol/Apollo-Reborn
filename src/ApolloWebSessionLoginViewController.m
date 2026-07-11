@@ -42,6 +42,8 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
 // Consecutive harvest attempts that found an incomplete session (see the
 // completeness gate in _harvestAndFinishForUser:).
 @property (nonatomic) NSUInteger harvestAttempts;
+@property (nonatomic, copy) NSString *requiredUsername;
+@property (nonatomic, copy) void (^sessionCompletion)(BOOL success);
 @end
 
 // How many times the harvest may defer back to the 2s auth poll while waiting
@@ -80,6 +82,19 @@ static const NSTimeInterval kReharvestTimeout = 25.0;
 + (instancetype)loginControllerForAdditionalAccount {
     ApolloWebSessionLoginViewController *vc = [[self alloc] init];
     vc.clearsExistingSessionBeforeLoad = YES;
+    return vc;
+}
+
++ (instancetype)loginControllerForUsername:(NSString *)username completion:(void (^)(BOOL))completion {
+    ApolloWebSessionLoginViewController *vc = [[self alloc] init];
+    // Keep an already-authenticated shared WebKit session long enough to
+    // identify it. _harvestAndFinishForUser: accepts it only when its username
+    // matches requiredUsername; a mismatch's "Sign In Again" path clears the
+    // jar before presenting a fresh login. This makes the common OAuth case
+    // (the same user is already signed into reddit.com) genuinely one tap.
+    vc.clearsExistingSessionBeforeLoad = NO;
+    vc.requiredUsername = username.lowercaseString;
+    vc.sessionCompletion = completion;
     return vc;
 }
 
@@ -371,6 +386,26 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
 
 - (void)_harvestAndFinishForUser:(NSString *)username {
     if (self.finished) return;
+    if (self.requiredUsername.length > 0 &&
+        ![self.requiredUsername isEqualToString:username.lowercaseString]) {
+        self.decisionMade = YES;
+        self.awaitingLogin = NO;
+        NSString *message = [NSString stringWithFormat:
+            @"Apollo is using u/%@, but Reddit signed in as u/%@. Sign in with the matching account to vote.",
+            self.requiredUsername, username];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Different Reddit Account"
+                                                                        message:message
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        __weak typeof(self) weakSelf = self;
+        [alert addAction:[UIAlertAction actionWithTitle:@"Sign In Again" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf _reauthenticate];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *action) {
+            [weakSelf _cancelTapped];
+        }]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     self.finished = YES; // guard against the poll firing again mid-harvest
 
     WKHTTPCookieStore *cookieStore = self.webView.configuration.websiteDataStore.httpCookieStore;
@@ -471,6 +506,10 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
     self.finished = YES;
     [self.authPollTimer invalidate];
     self.authPollTimer = nil;
+    if (self.sessionCompletion) {
+        self.sessionCompletion(NO);
+        self.sessionCompletion = nil;
+    }
     [self _dismiss];
 }
 
@@ -483,6 +522,10 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
 // leaving them with a silently-blank account tab. Otherwise (account already
 // present / synthesis skipped) just dismiss with no prompt.
 - (void)_finishWithUser:(NSString *)username accountSynthesized:(BOOL)synthesized {
+    if (self.sessionCompletion) {
+        self.sessionCompletion(YES);
+        self.sessionCompletion = nil;
+    }
     if (!synthesized) { [self _dismiss]; return; }
 
     // Mark the pending state up front; clearing happens at next launch (%ctor).

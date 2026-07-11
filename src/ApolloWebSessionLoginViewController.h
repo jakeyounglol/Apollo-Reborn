@@ -28,6 +28,13 @@ NS_ASSUME_NONNULL_BEGIN
 // adding.
 + (instancetype)loginControllerForAdditionalAccount;
 
+// Poll voting needs a web session for an account that may otherwise use OAuth.
+// This variant requires the web login to match `username` (preventing the
+// shared WebKit cookie jar from authenticating the wrong Reddit account) and
+// reports whether a matching session was harvested.
++ (instancetype)loginControllerForUsername:(NSString *)username
+                                completion:(void (^)(BOOL success))completion;
+
 // Presents (from the topmost view controller) a one-shot "session expired"
 // alert for `username` offering to re-harvest its cookie, then launches the
 // login flow (clearing the dead session first, same as

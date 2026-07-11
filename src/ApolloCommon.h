@@ -115,4 +115,13 @@ void ApolloInjectPublicStickyAsSubredditIfNeeded(NSMutableArray *children, NSStr
 // ActionController is tagged on first build so re-builds re-inject and other
 // menus can't claim the item.
 void ApolloInjectDeletedCommentsMenuItemIfNeeded(NSMutableArray *children, NSString *menuTitle, id actionController);
+
+// ApolloPollCompose: quick post-type picker for the subreddit "..." menu.
+// Returns an inline UIMenu (ControlGroup-style icon row: Photo/Link/Text/Poll,
+// filtered by the current subreddit's submission rules) that replaces the
+// plain "Submit Post" row, or nil to keep the stock row. `selectRow` re-fires
+// the original Submit Post action; the tapped type is applied to the compose
+// sheet's segmented control when it appears. Called from
+// ApolloNativeActionMenuBuildMenu when it hits actionKind 51 (Submit Post).
+UIMenu *ApolloSubmitPostTypesMenu(id actionController, void (^selectRow)(void));
 __END_DECLS
