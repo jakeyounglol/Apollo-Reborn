@@ -318,6 +318,24 @@ static const LGRuntimeGroup *LGGroupAt(NSInteger gi) {
     return &sGroups[gi];
 }
 
+// Finds the LGIconRow for an arbitrary iconID by scanning every group's rows,
+// or NULL if it isn't one of ours (e.g. a stock Apollo alternate icon). Every
+// icon in icons.json declares exactly one "group" (enforced by the generator,
+// no default/fallback group), and every featured entry is itself one of those
+// icons, so scanning sGroups alone is a complete search — sFeaturedRows never
+// contains an icon absent from sGroups.
+static const LGIconRow *LGRowForIconID(NSString *iconID) {
+    if (!iconID.length) return NULL;
+    LGInitRuntimeGroups();
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        const LGRuntimeGroup *g = &sGroups[gi];
+        for (NSInteger ri = 0; ri < g->count; ri++) {
+            if ([g->rows[ri].iconID isEqualToString:iconID]) return &g->rows[ri];
+        }
+    }
+    return NULL;
+}
+
 // ── Main section helpers ───────────────────────────────────────────────────
 //
 // Every non-empty group renders as exactly one pack-card row in the packs
@@ -1181,16 +1199,19 @@ static void LGCorrectDefaultRowCheckmark(UITableViewCell *cell) {
     }
 }
 
-#pragma mark - Remembering the icon picker's table view
+#pragma mark - Remembering a hooked view controller's table view
 //
-// traitCollectionDidChange: needs the table view to reload the Featured
-// section on a live appearance change, but unlike the tableView:... methods
-// it isn't handed one as a parameter. _TtC6Apollo29SettingsAppIconViewController
-// is NOT a UITableViewController (confirmed the hard way — casting self and
-// sending -tableView crashed with doesNotRecognizeSelector:), so there's no
-// safe property to reach for either. Instead, stash the table view (via
-// associated object, unretained — the VC's own view hierarchy already owns
-// it) the first time any hooked tableView: method hands us one.
+// A couple of lifecycle hooks (traitCollectionDidChange:, viewWillAppear:)
+// need the table view to trigger a reload, but aren't handed one as a
+// parameter. Neither _TtC6Apollo29SettingsAppIconViewController nor
+// _TtC6Apollo22SettingsViewController is a UITableViewController (confirmed
+// the hard way for the former — casting self and sending -tableView crashed
+// with doesNotRecognizeSelector:), so there's no safe property to reach for
+// either. Instead, stash the table view (via associated object, unretained —
+// the VC's own view hierarchy already owns it) the first time any hooked
+// tableView: method hands us one. Keyed per (viewController, key) pair by
+// objc_setAssociatedObject itself, so this is safely shared across both VCs'
+// hook blocks below — each instance gets its own slot.
 static char kLGRememberedTableViewKey;
 
 static void LGRememberTableView(id viewController, UITableView *tableView) {
@@ -1355,6 +1376,84 @@ static UITableView *LGRememberedTableView(id viewController) {
         [tableView reloadSections:[NSIndexSet indexSetWithIndex:LGFeaturedSectionIndex()]
                   withRowAnimation:UITableViewRowAnimationNone];
     }
+}
+
+%end
+
+#pragma mark - Main Settings "App Icon" row
+//
+// Apollo's own main Settings list (one screen up from the picker) has its own
+// "App Icon" row showing a left-side thumbnail + right-side value label (e.g.
+// "Default"). Apollo builds both directly from
+// UIApplication.sharedApplication.alternateIconName — the same API
+// LGActiveIconID() already treats as unreliable on sideloaded distributions
+// (see the comment above LGActiveIconID). When it reports nil even though one
+// of our icons is active, this row silently reverts to showing Apollo's own
+// default icon and name. Fix it the same way as the picker's Default-row
+// checkmark: override the row after Apollo finishes building it, using our
+// own reliable LGActiveIconID().
+
+%hook _TtC6Apollo22SettingsViewController
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = %orig;
+    LGRememberTableView(self, tableView);
+    if (!LGAlternateIconsAvailable()) return cell;
+    // Section 1 holds the mainSettings list (App Icon is one of several rows
+    // there); pixelPal being conditionally present makes the row's absolute
+    // index unstable, so match by title rather than a hardcoded row number.
+    if (indexPath.section != 1) return cell;
+    if (![cell.textLabel.text isEqualToString:@"App Icon"]) return cell;
+
+    NSString *activeID = LGActiveIconID();
+    const LGIconRow *row = activeID.length ? LGRowForIconID(activeID) : NULL;
+    if (!row) return cell; // true Default, or a stock Apollo icon we don't own — leave Apollo's rendering alone
+
+    NSString *variant = LGIsDarkAppearance(cell) ? @"dark" : @"default";
+    UIImage *preview = LGPreviewImage(row->iconID, variant);
+    if (preview) {
+        // Apollo already thumbnail-prepared its own default icon into
+        // cell.imageView.image before we got here — reuse that exact size so
+        // our replacement lands at the same displayed size the row expects,
+        // without needing to know (or guess) Apollo's internal constant.
+        CGSize targetSize = cell.imageView.image.size;
+        if (targetSize.width > 0 && targetSize.height > 0) {
+            UIGraphicsImageRendererFormat *format = UIGraphicsImageRendererFormat.preferredFormat;
+            format.opaque = NO;
+            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
+            UIImage *thumb = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [preview drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+            }];
+            cell.imageView.image = thumb;
+            cell.imageView.clipsToBounds = YES;
+            cell.imageView.layer.cornerRadius = targetSize.width * kLGRenditionFanCornerRatio;
+        } else {
+            cell.imageView.image = preview;
+        }
+    }
+
+    // Clear attributedText first: Apollo may have populated the value via
+    // either text or attributedText depending on build, so this guarantees
+    // our plain text wins regardless of which one it used.
+    if (cell.detailTextLabel) {
+        cell.detailTextLabel.attributedText = nil;
+        cell.detailTextLabel.text = row->displayName;
+    }
+
+    return cell;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    // Popping back from the picker after changing the icon doesn't re-fetch
+    // already-built cells on its own — reload so this row picks up the change
+    // immediately rather than staying stale until the user scrolls it away
+    // and back. No-op on a screen's very first appearance if nothing has been
+    // remembered yet, which is fine: the initial cellForRowAtIndexPath: pass
+    // above already renders correctly.
+    if (!LGAlternateIconsAvailable()) return;
+    UITableView *tableView = LGRememberedTableView(self);
+    if (tableView) [tableView reloadData];
 }
 
 %end
