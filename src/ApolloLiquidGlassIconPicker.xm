@@ -162,20 +162,35 @@ static UIColor *LGThemedCardBackgroundColor(void) {
 static NSString *const kLGActiveIconDefaultsKey = @"ApolloLGActiveIconID";
 
 static void LGPersistActiveIconID(NSString *iconID) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     if (iconID.length) {
-        [NSUserDefaults.standardUserDefaults setObject:iconID forKey:kLGActiveIconDefaultsKey];
+        [defaults setObject:iconID forKey:kLGActiveIconDefaultsKey];
     } else {
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:kLGActiveIconDefaultsKey];
+        [defaults removeObjectForKey:kLGActiveIconDefaultsKey];
     }
+    // Belt-and-suspenders flush — confirmed via a forced-kill test that the
+    // write reaches cfprefsd well before this point in practice, but there's
+    // no downside to asking explicitly.
+    [defaults synchronize];
 }
 
 // The iconID of the currently-applied alternate icon, or nil if Apollo's
 // (non-glass) default is active. Trusts the system when it reports a real
 // value; otherwise falls back to the iconID we last applied ourselves — see
 // note above on why the system API can't always be trusted here.
+//
+// Deliberately gated on .length rather than a plain `?:` against nil: if
+// alternateIconName ever reports a non-nil-but-empty string instead of a
+// clean nil (observed intermittently, not just "always nil", on some
+// sideloaded distributions), a bare `?:` would treat that empty answer as
+// authoritative and skip the persisted fallback — which reads exactly like
+// the active icon's checkmark silently reverting to Default with no
+// consistent timing, since it depends on whichever moment the flaky system
+// value happens to get read.
 static NSString *LGActiveIconID(void) {
-    return UIApplication.sharedApplication.alternateIconName
-        ?: [NSUserDefaults.standardUserDefaults stringForKey:kLGActiveIconDefaultsKey];
+    NSString *system = UIApplication.sharedApplication.alternateIconName;
+    if (system.length) return system;
+    return [NSUserDefaults.standardUserDefaults stringForKey:kLGActiveIconDefaultsKey];
 }
 
 #pragma mark - Runtime icon model
@@ -1376,6 +1391,23 @@ static UITableView *LGRememberedTableView(id viewController) {
             [summary appendFormat:@"%ld %@", (long)sGroups[i].count, sGroups[i].groupID];
         }
         ApolloLog(@"[LGIconPicker] ctor: injecting %ld section(s) — %@", (long)LGInjectedSectionCount(), summary);
+
+        // Diagnostic for the "checkmark silently reverts to Default some
+        // time after being set" reports: log the raw system + persisted
+        // values (distinguishing nil from a non-nil-but-empty string, since
+        // LGActiveIconID now treats both the same but they'd have different
+        // root causes) on every foreground so a recurrence can be traced in
+        // `log show --predicate 'subsystem == "apollofix"'`.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                            object:nil
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+            NSString *system = UIApplication.sharedApplication.alternateIconName;
+            NSString *persisted = [NSUserDefaults.standardUserDefaults stringForKey:kLGActiveIconDefaultsKey];
+            NSString *systemDesc = system == nil ? @"(nil)" : (system.length ? system : @"(empty, non-nil)");
+            NSString *persistedDesc = persisted == nil ? @"(nil)" : (persisted.length ? persisted : @"(empty, non-nil)");
+            ApolloLog(@"[LGIconPicker] foreground check: alternateIconName=%@ persisted=%@", systemDesc, persistedDesc);
+        }];
     } else {
         ApolloLog(@"[LGIconPicker] ctor: LG asset catalog not detected, hooks will passthrough");
     }
