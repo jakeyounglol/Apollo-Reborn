@@ -26,7 +26,7 @@ static const LGIconRowEntry kLGGroupEntries_original[] = {
     { "harunatsu", "harunatsu", "harunatsu91202024" },
 };
 
-static const LGIconRowEntry kLGGroupEntries_variants[] = {
+static const LGIconRowEntry kLGGroupEntries_classics[] = {
     { "jryng-morty", "Wubalubadubdub", "jryng" },
     { "jryng-duck", "Wilson", "jryng" },
     { "jryng-antenna", "Irradiate", "jryng" },
@@ -68,7 +68,6 @@ static const LGIconRowEntry kLGGroupEntries_variants[] = {
     { "jryng-snazzy", "Margaret", "jryng" },
     { "jryng-andru", "Pro Wrestler", "jryng" },
     { "jryng-eap", "EAP", "jryng" },
-    { "jryng-red", "Red", "jryng" },
     { "lilacvibes-trans", "Trans", "lilacvibes" },
     { "lilacvibes-pride", "Pride", "lilacvibes" },
     { "lilacvibes-progress", "Progress Pride", "lilacvibes" },
@@ -80,6 +79,7 @@ static const LGIconRowEntry kLGGroupEntries_custom[] = {
     { "bajader-glitched", "Glitched", "bajader" },
     { "paulo1manso-modern", "Modern", "paulo1manso" },
     { "paulo1manso-modern-alt", "Modern Alt", "paulo1manso" },
+    { "jryng-red", "Red", "jryng" },
 };
 
 static const LGIconRowEntry kLGGroupEntries_helios[] = {
@@ -99,7 +99,7 @@ static const char *const kLGGroupCover_original[] = {
     "harunatsu",
 };
 
-static const char *const kLGGroupCover_variants[] = {
+static const char *const kLGGroupCover_classics[] = {
     "lilacvibes-pride",
     "bajader-sunset",
     "jryng-antenna",
@@ -112,15 +112,15 @@ static const char *const kLGGroupCover_custom[] = {
 };
 
 static const char *const kLGGroupCover_helios[] = {
-    "helios-ultra",
+    "helios-ultra-halo",
     "helios-cryo",
     "helios",
 };
 
 static const LGIconGroupDef kLGIconGroups[] = {
     { "original", "Original", "The original Apollo icon in Liquid Glass, crafted by the community.", "", kLGGroupEntries_original, 4, kLGGroupCover_original, 3 },
-    { "variants", "Variants", "Dozens of colorful variants and one-off designs from the original Apollo app, recreated in Liquid Glass.", "jryng, bajader & lilacvibes", kLGGroupEntries_variants, 45, kLGGroupCover_variants, 3 },
-    { "custom", "Custom", "Original, fully custom icon designs.", "bajader, paulo1manso & IllIIllIllIllII", kLGGroupEntries_custom, 5, kLGGroupCover_custom, 3 },
+    { "classics", "Classics", "Dozens of colorful variants and one-off designs from the original Apollo app, recreated in Liquid Glass.", "jryng, bajader & lilacvibes", kLGGroupEntries_classics, 44, kLGGroupCover_classics, 3 },
+    { "custom", "Custom", "Original, fully custom icon designs.", "bajader, paulo1manso & IllIIllIllIllII", kLGGroupEntries_custom, 6, kLGGroupCover_custom, 3 },
     { "helios", "Helios", "Icons inspired by the Hyper Suit 4000 icon from Apollo, and the Modern icons by paulo1manso.", "IllIIllIllIllII", kLGGroupEntries_helios, 8, kLGGroupCover_helios, 3 },
 };
 
