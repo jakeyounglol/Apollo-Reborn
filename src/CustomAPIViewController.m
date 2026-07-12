@@ -14,6 +14,7 @@
 #import "ApolloDeletedCommentsSettingsViewController.h"
 #import "ApolloLinkPreviewSettingsViewController.h"
 #import "InlineMediaSettingsViewController.h"
+#import "ApolloPollSettingsViewController.h"
 #import "ApolloOpenInAppViewController.h"
 #import "ApolloSubredditCustomBannerCache.h"
 #import "ApolloSubredditCustomIconCache.h"
@@ -36,6 +37,7 @@ typedef NS_ENUM(NSInteger, SectionIndex) {
     SectionGeneral,
     SectionApolloAI,
     SectionInlineMedia,   // single row -> InlineMediaSettingsViewController
+    SectionPolls,         // single row -> ApolloPollSettingsViewController
     SectionLinkPreviews,
     SectionMedia,
     SectionSubreddits,
@@ -576,6 +578,31 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
+- (UITableViewCell *)pollsCellForTableView:(UITableView *)tableView {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Polls"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Polls"];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+    cell.textLabel.text = @"Polls";
+    cell.detailTextLabel.text = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPollsEnabled] ? @"On" : @"Off";
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    return cell;
+}
+
+- (void)openPollSettings {
+    ApolloPollSettingsViewController *vc =
+        [[ApolloPollSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
 - (UITableViewCell *)deletedCommentsCellForTableView:(UITableView *)tableView {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Gen_DeletedComments"];
     if (!cell) {
@@ -703,6 +730,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionGeneral: return 14;
         case SectionApolloAI: return 1;
         case SectionInlineMedia: return 1;
+        case SectionPolls: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows. The inline-media rows (Previews toggle, Alignment,
         // Autoplay Inline GIFs) moved to the Inline Media sub-screen
@@ -724,6 +752,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionGeneral: return @"General";
         case SectionApolloAI: return @"Apollo AI";
         case SectionInlineMedia: return @"Inline Media";
+        case SectionPolls: return @"Polls";
         case SectionLinkPreviews: return @"Rich Link Previews";
         case SectionMedia: return @"Media";
         case SectionSubreddits: return @"Subreddits";
@@ -742,6 +771,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionGeneral: cell = [self generalCellForRow:indexPath.row tableView:tableView]; break;
         case SectionApolloAI: cell = [self apolloAICellForTableView:tableView]; break;
         case SectionInlineMedia: cell = [self inlineMediaCellForTableView:tableView]; break;
+        case SectionPolls: cell = [self pollsCellForTableView:tableView]; break;
         case SectionLinkPreviews: cell = [self linkPreviewsCellForTableView:tableView]; break;
         case SectionMedia: cell = [self mediaCellForRow:indexPath.row tableView:tableView]; break;
         case SectionSubreddits: cell = [self subredditCellForRow:indexPath.row tableView:tableView]; break;
@@ -1818,6 +1848,11 @@ typedef NS_ENUM(NSInteger, Tag) {
         return;
     }
 
+    if (indexPath.section == SectionPolls) {
+        [self openPollSettings];
+        return;
+    }
+
     if (indexPath.section == SectionLinkPreviews) {
         [self openLinkPreviewSettings];
         return;
@@ -2000,6 +2035,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     if (indexPath.section == SectionApolloAI) return YES;
     if (indexPath.section == SectionInlineMedia) return YES;
+    if (indexPath.section == SectionPolls) return YES;
     if (indexPath.section == SectionLinkPreviews) return YES;
     if (indexPath.section == SectionGeneral) {
         // Only the "Deleted Comments" (row 3) and "Open in App" (row 7)

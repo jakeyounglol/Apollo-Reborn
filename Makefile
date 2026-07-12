@@ -135,6 +135,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWebSessionStore.m \
     $(SRC_DIR)/ApolloPollVoting.xm \
     $(SRC_DIR)/ApolloPollCompose.xm \
+    $(SRC_DIR)/ApolloPollSettingsViewController.m \
     $(SRC_DIR)/ApolloSimDebugTap.xm \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
     $(SRC_DIR)/ApolloAccountCredentials.m \

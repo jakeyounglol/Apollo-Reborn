@@ -94,6 +94,49 @@ static void ApolloSimDebugPerformTap(CGPoint point) {
     });
 }
 
+// "swipe x1 y1 x2 y2" command: a real drag (began → moved steps → ended) so a
+// scroll view actually scrolls, unlike the single tap above. Reuses the same
+// synthesized-touch delivery path.
+static void ApolloSimDebugPerformSwipe(CGPoint start, CGPoint end) {
+    UIWindow *window = nil;
+    for (UIWindow *candidate in ApolloAllWindows()) {
+        if (candidate.isKeyWindow) { window = candidate; break; }
+    }
+    if (!window) window = ApolloAllWindows().firstObject;
+    UIView *hitView = [window hitTest:start withEvent:nil];
+    if (!window || !hitView) {
+        ApolloLog(@"[SimDebugTap] no window/hit view for swipe start (%.0f, %.0f)", start.x, start.y);
+        return;
+    }
+    UITouch *touch = [UITouch new];
+    if (![touch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)] ||
+        ![touch respondsToSelector:@selector(setPhase:)]) return;
+    [touch setWindow:window];
+    [touch setView:hitView];
+    [touch setTapCount:1];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) [touch _setIsFirstTouchForView:YES];
+    [touch _setLocationInWindow:start resetPrevious:YES];
+    [touch setPhase:UITouchPhaseBegan];
+    ApolloSimDebugSendTouch(touch);
+
+    const int steps = 12;
+    for (int i = 1; i <= steps; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.012 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            CGFloat t = (CGFloat)i / steps;
+            CGPoint p = CGPointMake(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t);
+            [touch _setLocationInWindow:p resetPrevious:NO];
+            [touch setPhase:UITouchPhaseMoved];
+            ApolloSimDebugSendTouch(touch);
+        });
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((steps * 0.012 + 0.02) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:end resetPrevious:NO];
+        [touch setPhase:UITouchPhaseEnded];
+        ApolloSimDebugSendTouch(touch);
+        ApolloLog(@"[SimDebugTap] swipe delivered (%.0f,%.0f)->(%.0f,%.0f)", start.x, start.y, end.x, end.y);
+    });
+}
+
 static UIResponder *ApolloSimDebugFirstResponder(UIView *view) {
     if (view.isFirstResponder) return view;
     for (UIView *subview in view.subviews) {
@@ -131,10 +174,18 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             ApolloSimDebugTypeText(payload);
             return;
         }
-        NSArray<NSString *> *parts = [contents componentsSeparatedByCharactersInSet:
+        BOOL isSwipe = [contents hasPrefix:@"swipe "];
+        NSString *coordString = isSwipe ? [contents substringFromIndex:6] : contents;
+        NSArray<NSString *> *parts = [coordString componentsSeparatedByCharactersInSet:
             NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSMutableArray<NSString *> *numbers = [NSMutableArray array];
         for (NSString *part in parts) if (part.length > 0) [numbers addObject:part];
+        if (isSwipe) {
+            if (numbers.count < 4) { ApolloLog(@"[SimDebugTap] malformed swipe: %@", contents); return; }
+            ApolloSimDebugPerformSwipe(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue),
+                                       CGPointMake(numbers[2].doubleValue, numbers[3].doubleValue));
+            return;
+        }
         if (numbers.count < 2) {
             ApolloLog(@"[SimDebugTap] malformed tap file: %@", contents ?: @"(missing)");
             return;

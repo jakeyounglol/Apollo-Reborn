@@ -116,6 +116,13 @@ void ApolloInjectPublicStickyAsSubredditIfNeeded(NSMutableArray *children, NSStr
 // menus can't claim the item.
 void ApolloInjectDeletedCommentsMenuItemIfNeeded(NSMutableArray *children, NSString *menuTitle, id actionController);
 
+// Whether the experimental native Polls feature (voting + creation) is enabled.
+// Off by default; toggled from Settings → Polls (UDKeyPollsEnabled). All poll
+// entry points — the poll-node tap handler, remembered-vote reconciliation, the
+// compose "Poll" post type, and the quick-menu Poll entry — gate on this, so
+// with it off the tweak leaves Apollo's stock behavior completely untouched.
+BOOL ApolloPollsFeatureEnabled(void);
+
 // ApolloPollCompose: quick post-type picker for the subreddit "..." menu.
 // Returns an inline UIMenu (ControlGroup-style icon row: Photo/Link/Text/Poll,
 // filtered by the current subreddit's submission rules) that replaces the

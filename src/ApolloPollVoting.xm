@@ -3,10 +3,19 @@
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloThemeRuntime.h"
+#import "ApolloState.h"
 #import "UIWindow+Apollo.h"
 #import <WebKit/WebKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+
+// Master gate for the whole Polls feature (voting + creation). Backed by the
+// cached sPollsFeatureEnabled global (loaded at launch, updated live by the
+// Polls settings toggle) rather than an NSUserDefaults read, since the poll
+// node's layoutSubviews hook calls this on a warm path.
+BOOL ApolloPollsFeatureEnabled(void) {
+    return sPollsFeatureEnabled;
+}
 
 // Minimal declarations avoid importing the generated class-dump header graph,
 // which redeclares Foundation protocols under newer SDKs.
@@ -523,7 +532,7 @@ static void ApolloPollBeginVote(RDKLink *link, RDKPollOption *option, NSString *
         }
         ApolloPollCastVote(link, option, session, username, pollNode);
     };
-    ApolloWebSessionEntry *session = ApolloWebSessionFor(username);
+    ApolloWebSessionEntry *session = ApolloWebSessionPollFor(username);
     if (session) { continueVote(session); return; }
 
     // First vote on an OAuth account: harvest a matching reddit.com cookie
@@ -531,7 +540,7 @@ static void ApolloPollBeginVote(RDKLink *link, RDKPollOption *option, NSString *
     ApolloWebSessionLoginViewController *login = [ApolloWebSessionLoginViewController
         loginControllerForUsername:username completion:^(BOOL success) {
             if (success) {
-                continueVote(ApolloWebSessionFor(username));
+                continueVote(ApolloWebSessionPollFor(username));
                 return;
             }
             // Cancelling the one-time cookie harvest must also cancel the
@@ -581,6 +590,7 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 %hook _TtC6Apollo8PollNode
 - (void)layoutSubviews {
     %orig;
+    if (!ApolloPollsFeatureEnabled()) return;
     ApolloPollNormalizeSelectedCounts(ApolloPollObjectIvar(self, "poll"));
     if (!ApolloThemeRuntimeIsActive()) return;
     UIColor *card = ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryBackground);
@@ -589,6 +599,7 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (!ApolloPollsFeatureEnabled()) { %orig; return; }
     UITouch *touch = [touches anyObject];
     UIView *pollView = ApolloPollNodeView(self);
     UIView *row = touch && pollView
@@ -603,6 +614,7 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 }
 
 - (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (!ApolloPollsFeatureEnabled()) { %orig; return; }
     UITouch *touch = [touches anyObject];
     UIView *view = ApolloPollNodeView(self);
     if (touch && view) {
@@ -627,11 +639,13 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 %hook RDKLink
 - (void)setPoll:(RDKPoll *)poll {
     %orig(poll);
+    if (!ApolloPollsFeatureEnabled()) return;
     ApolloPollReconcileRememberedVote(self, ApolloActiveAccountUsername());
 }
 
 - (void)setIdentifier:(NSString *)identifier {
     %orig(identifier);
+    if (!ApolloPollsFeatureEnabled()) return;
     // JSON/model decoding may assign poll before identifier. Reconcile again
     // once the stable post key becomes available; the helper is idempotent.
     if (self.poll) {
@@ -645,6 +659,7 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 // the section controller and owns the model refresh method used after voting.
 %hook _TtC6Apollo22CommentsHeaderCellNode
 - (void)didLoad {
+    if (!ApolloPollsFeatureEnabled()) { %orig; return; }
     // Reconcile before Apollo constructs/configures the mounted poll UI. A
     // navigation round trip creates a new RDKLink/RDKPoll, so fixing only the
     // old PollNode can never persist across that boundary.
@@ -661,6 +676,7 @@ static void ApolloPollPresentPicker(id pollNode, RDKLink *link, NSString *userna
 }
 
 - (void)pollNodeTappedWithSender:(id)sender {
+    if (!ApolloPollsFeatureEnabled()) { %orig; return; }
     RDKLink *link = MSHookIvar<RDKLink *>(self, "link");
     RDKPoll *poll = link.poll;
     ApolloPollReconcileRememberedVote(link, ApolloActiveAccountUsername());

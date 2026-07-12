@@ -150,7 +150,9 @@ UIMenu *ApolloSubmitPostTypesMenu(__unused id actionController, void (^selectRow
         { @"Photo", @"photo",          linkAllowed && allowImages },
         { @"Link",  @"link",           linkAllowed },
         { @"Text",  @"text.alignleft", textAllowed },
-        { @"Poll",  @"chart.bar",      ApolloActiveAccountUsername().length > 0 },
+        // Poll is only offered when the experimental Polls feature is enabled;
+        // the Photo/Link/Text speed-up stays regardless (it isn't poll-specific).
+        { @"Poll",  @"chart.bar",      ApolloPollsFeatureEnabled() && ApolloActiveAccountUsername().length > 0 },
     };
     UIAction *(^makeAction)(NSString *, NSString *) = ^(NSString *title, NSString *symbol) {
         return [UIAction actionWithTitle:title image:[UIImage systemImageNamed:symbol]
@@ -184,6 +186,7 @@ UIMenu *ApolloSubmitPostTypesMenu(__unused id actionController, void (^selectRow
 
 @interface ApolloPollComposeViewController : UITableViewController <UITextFieldDelegate>
 @property (nonatomic, weak) UIViewController *composeHost;
+@property (nonatomic, copy) NSString *originalComposeTitle;
 @property (nonatomic, strong) UIColor *composeBackgroundColor;
 @property (nonatomic, strong) UIColor *composeCellColor;
 @property (nonatomic, strong) UIColor *composePrimaryTextColor;
@@ -391,7 +394,7 @@ UIMenu *ApolloSubmitPostTypesMenu(__unused id actionController, void (^selectRow
     if (currentUsername.length == 0) { [self showError:@"Choose an account before posting."]; return; }
     self.username = currentUsername;
     self.submitting = YES;
-    ApolloWebSessionEntry *session = ApolloWebSessionFor(self.username);
+    ApolloWebSessionEntry *session = ApolloWebSessionPollFor(self.username);
     if (session.cookieHeader.length > 0) { [self submitWithSession:session]; return; }
 
     // OAuth account without a harvested reddit.com session yet: run the same
@@ -399,7 +402,7 @@ UIMenu *ApolloSubmitPostTypesMenu(__unused id actionController, void (^selectRow
     ApolloWebSessionLoginViewController *login = [ApolloWebSessionLoginViewController
         loginControllerForUsername:self.username completion:^(BOOL success) {
             if (!success) { self.submitting = NO; return; }
-            ApolloWebSessionEntry *harvested = ApolloWebSessionFor(self.username);
+            ApolloWebSessionEntry *harvested = ApolloWebSessionPollFor(self.username);
             if (harvested.cookieHeader.length > 0) {
                 [self submitWithSession:harvested];
             } else {
@@ -522,6 +525,7 @@ static void ApolloPollComposePresentComposer(UIViewController *composeVC) {
     if (existing) {
         existing.view.hidden = NO;
         composeVC.navigationItem.rightBarButtonItem = existing.pollPostButton;
+        composeVC.navigationItem.title = @"Poll";
         [existing revalidate];
         return;
     }
@@ -529,6 +533,8 @@ static void ApolloPollComposePresentComposer(UIViewController *composeVC) {
     composer.subredditName = subredditName;
     composer.username = username;
     composer.composeHost = composeVC;
+    composer.originalComposeTitle = composeVC.navigationItem.title ?: composeVC.title;
+    composeVC.navigationItem.title = @"Poll";
     UITableView *nativeTable = ApolloPollComposeIvar(composeVC, "tableView");
     UITableViewCell *nativeCell = [nativeTable.visibleCells firstObject];
     // Use the same semantic surface roles that the settings controllers use,
@@ -572,12 +578,14 @@ static void ApolloPollComposeHideComposer(UIViewController *composeVC) {
     if (composer.originalPostButton) {
         composeVC.navigationItem.rightBarButtonItem = composer.originalPostButton;
     }
+    composeVC.navigationItem.title = composer.originalComposeTitle;
 }
 
 // The segmented control is built after viewDidLoad/viewWillAppear (it's still
 // nil there), so install from viewDidAppear: — idempotent via the "Poll" title
 // check so re-appearances are no-ops.
 static void ApolloPollComposeInstallSegment(id composeVC) {
+    if (!ApolloPollsFeatureEnabled()) return;
     UISegmentedControl *control = ApolloPollComposeIvar(composeVC, "postTypeSegmentedControl");
     if (![control isKindOfClass:UISegmentedControl.class] || control.numberOfSegments == 0) {
         return;
