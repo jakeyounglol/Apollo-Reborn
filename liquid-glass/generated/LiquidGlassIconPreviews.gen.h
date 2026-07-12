@@ -73,15 +73,6 @@ static const LGIconRowEntry kLGGroupEntries_classics[] = {
     { "lilacvibes-progress", "Progress Pride", "lilacvibes" },
 };
 
-static const LGIconRowEntry kLGGroupEntries_custom[] = {
-    { "bajader-aperture-science", "Aperture Science", "bajader" },
-    { "bajader-apollos", "ApollOS", "bajader" },
-    { "bajader-glitched", "Glitched", "bajader" },
-    { "paulo1manso-modern", "Modern", "paulo1manso" },
-    { "paulo1manso-modern-alt", "Modern Alt", "paulo1manso" },
-    { "jryng-red", "Red", "jryng" },
-};
-
 static const LGIconRowEntry kLGGroupEntries_helios[] = {
     { "helios", "Helios", "IllIIllIllIllII" },
     { "helios-halo", "Helios Halo", "IllIIllIllIllII" },
@@ -91,6 +82,15 @@ static const LGIconRowEntry kLGGroupEntries_helios[] = {
     { "helios-parallax-halo", "Helios Parallax Halo", "IllIIllIllIllII" },
     { "helios-ultra", "Helios Ultra", "IllIIllIllIllII" },
     { "helios-ultra-halo", "Helios Ultra Halo", "IllIIllIllIllII" },
+};
+
+static const LGIconRowEntry kLGGroupEntries_concepts[] = {
+    { "bajader-aperture-science", "Aperture Science", "bajader" },
+    { "bajader-apollos", "ApollOS", "bajader" },
+    { "bajader-glitched", "Glitched", "bajader" },
+    { "paulo1manso-modern", "Modern", "paulo1manso" },
+    { "paulo1manso-modern-alt", "Modern Alt", "paulo1manso" },
+    { "jryng-red", "Red", "jryng" },
 };
 
 static const char *const kLGGroupCover_original[] = {
@@ -105,23 +105,23 @@ static const char *const kLGGroupCover_classics[] = {
     "jryng-antenna",
 };
 
-static const char *const kLGGroupCover_custom[] = {
-    "bajader-glitched",
-    "bajader-aperture-science",
-    "paulo1manso-modern",
-};
-
 static const char *const kLGGroupCover_helios[] = {
     "helios-ultra-halo",
     "helios-cryo",
     "helios",
 };
 
+static const char *const kLGGroupCover_concepts[] = {
+    "bajader-glitched",
+    "bajader-aperture-science",
+    "paulo1manso-modern",
+};
+
 static const LGIconGroupDef kLGIconGroups[] = {
     { "original", "Original", "The original Apollo icon in Liquid Glass, crafted by the community.", "", kLGGroupEntries_original, 4, kLGGroupCover_original, 3 },
-    { "classics", "Classics", "Dozens of colorful variants and one-off designs from the original Apollo app, recreated in Liquid Glass.", "jryng, bajader & lilacvibes", kLGGroupEntries_classics, 44, kLGGroupCover_classics, 3 },
-    { "custom", "Custom", "Original, fully custom icon designs.", "bajader, paulo1manso & IllIIllIllIllII", kLGGroupEntries_custom, 6, kLGGroupCover_custom, 3 },
+    { "classics", "Classics", "Dozens of colorful variants and one-off designs from the original Apollo app, recreated in Liquid Glass.", "jryng, bajader, lilacvibes", kLGGroupEntries_classics, 44, kLGGroupCover_classics, 3 },
     { "helios", "Helios", "Icons inspired by the Hyper Suit 4000 icon from Apollo, and the Modern icons by paulo1manso.", "IllIIllIllIllII", kLGGroupEntries_helios, 8, kLGGroupCover_helios, 3 },
+    { "concepts", "Concepts", "A mix of standalone icon concepts, including small thematic sets too short for their own pack.", "", kLGGroupEntries_concepts, 6, kLGGroupCover_concepts, 3 },
 };
 
 static const size_t kLGIconGroupCount = 4;

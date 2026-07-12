@@ -11,19 +11,18 @@
       "id": "classics", "title": "Classics",
       "coverIconIDs": ["lilacvibes-pride", "bajader-sunset", "jryng-antenna"],
       "description": "Dozens of colorful variants and one-off designs from the original Apollo app, recreated in Liquid Glass.",
-      "author": "jryng, bajader & lilacvibes"
-    },
-    {
-      "id": "custom", "title": "Custom",
-      "coverIconIDs": ["bajader-glitched", "bajader-aperture-science", "paulo1manso-modern"],
-      "description": "Original, fully custom icon designs.",
-      "author": "bajader, paulo1manso & IllIIllIllIllII"
+      "author": "jryng, bajader, lilacvibes"
     },
     {
       "id": "helios", "title": "Helios",
       "coverIconIDs": ["helios-ultra-halo", "helios-cryo", "helios"],
       "description": "Icons inspired by the Hyper Suit 4000 icon from Apollo, and the Modern icons by paulo1manso.",
       "author": "IllIIllIllIllII"
+    },
+    {
+      "id": "concepts", "title": "Concepts",
+      "coverIconIDs": ["bajader-glitched", "bajader-aperture-science", "paulo1manso-modern"],
+      "description": "A mix of standalone icon concepts, including small thematic sets too short for their own pack."
     }
   ],
   "icons": [
@@ -83,12 +82,12 @@
       { "id": "lilacvibes-progress",      "displayName": "Progress Pride",      "designer": "lilacvibes", "group": "classics" },
       
       
-      { "id": "bajader-aperture-science", "displayName": "Aperture Science",    "designer": "bajader", "group": "custom" },
-      { "id": "bajader-apollos",          "displayName": "ApollOS",             "designer": "bajader", "group": "custom" },
-      { "id": "bajader-glitched",         "displayName": "Glitched",            "designer": "bajader", "group": "custom" },
-      { "id": "paulo1manso-modern",       "displayName": "Modern",              "designer": "paulo1manso", "group": "custom" },
-      { "id": "paulo1manso-modern-alt",   "displayName": "Modern Alt",          "designer": "paulo1manso", "group": "custom" },
-      { "id": "jryng-red",                "displayName": "Red",                 "designer": "jryng", "group": "custom" },
+      { "id": "bajader-aperture-science", "displayName": "Aperture Science",    "designer": "bajader", "group": "concepts" },
+      { "id": "bajader-apollos",          "displayName": "ApollOS",             "designer": "bajader", "group": "concepts" },
+      { "id": "bajader-glitched",         "displayName": "Glitched",            "designer": "bajader", "group": "concepts" },
+      { "id": "paulo1manso-modern",       "displayName": "Modern",              "designer": "paulo1manso", "group": "concepts" },
+      { "id": "paulo1manso-modern-alt",   "displayName": "Modern Alt",          "designer": "paulo1manso", "group": "concepts" },
+      { "id": "jryng-red",                "displayName": "Red",                 "designer": "jryng", "group": "concepts" },
 
       { "id": "helios",                   "displayName": "Helios",              "designer": "IllIIllIllIllII", "group": "helios" },
       { "id": "helios-halo",              "displayName": "Helios Halo",         "designer": "IllIIllIllIllII", "group": "helios" },

@@ -13,8 +13,7 @@ liquid-glass/
 │   ├── clear-light.png        #                          clear light
 │   └── clear-dark.png         #                          clear dark
 ├── prebuilt/
-│   ├── Assets.car             # pre-built asset catalog injected by patch.sh (with all .icon packages and preview PNGs)
-│   └── asset-info.plist       # reference metadata for the catalog
+│   └── Assets.car             # pre-built asset catalog injected by patch.sh (with all .icon packages and preview PNGs)
 ├── scripts/
 │   ├── rebuild_assets.py      # rebuilds prebuilt/Assets.car from a fresh Apollo Assets.car
 │   ├── generate_icon_previews.py  # exports 104×104 PNG previews from .icon packages via ictool
@@ -31,7 +30,8 @@ modules.
 
 Groups (icon packs) are defined in `icons.json` under the top-level `"groups"`
 key. Each group renders as a tappable "icon pack" card in the injected section;
-tapping one pushes a 2-up grid of every icon in that group. Each entry has:
+tapping one pushes an adaptive grid (2 columns on a phone, more on wider
+screens/orientations) of every icon in that group. Each entry has:
 
 - `id` — stable identifier, also used to derive generated C symbol names.
 - `title` — shown on the pack card and as the pushed screen's nav title.
@@ -46,6 +46,12 @@ tapping one pushes a 2-up grid of every icon in that group. Each entry has:
 Every icon must declare a `"group"` field naming one of these group ids —
 there is no default/fallback group, so the generator fails if an
 icon's `"group"` is missing or doesn't match a defined group.
+
+**When to add a new group vs. reuse an existing one:** a new group earns its
+own pack card when there's a meaningful cluster of icons (roughly 4+) sharing
+a theme or designer that would get lost or feel out of place in an existing
+group's fan art and description. For one-off icons or small sets, add them to
+the existing `"concepts"` group instead of creating a new pack.
 
 ## Featuring specific icons
 
