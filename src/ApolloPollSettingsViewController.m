@@ -204,7 +204,17 @@ typedef NS_ENUM(NSInteger, ApolloPollSettingsSection) {
 #pragma mark - Toggle
 
 - (void)pollsSwitchToggled:(UISwitch *)toggle {
-    [[NSUserDefaults standardUserDefaults] setBool:toggle.on forKey:UDKeyPollsEnabled];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:toggle.on forKey:UDKeyPollsEnabled];
+    if (!toggle.on) {
+        // Apollo's untouched poll handler owns the disabled-feature path. It
+        // guards its original "Voting in Polls" explanation with this
+        // one-time preference before presenting Apollo's in-app browser.
+        // Native voting can leave that legacy preference set from an earlier
+        // tap, so reset it only when the user explicitly returns to Apollo's
+        // flow. Apollo itself sets it again after showing the explanation.
+        [defaults removeObjectForKey:@"HasViewedFirstPoll"];
+    }
     // Update the cached gate so poll hooks react immediately, no relaunch.
     sPollsFeatureEnabled = toggle.on;
     // Reveal/hide the sign-in section with a soft animation.
