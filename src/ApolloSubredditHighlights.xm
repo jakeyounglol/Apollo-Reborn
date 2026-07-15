@@ -74,6 +74,19 @@ static CGFloat const kApolloHLTopPadding = 6.0;
 // room. Mirrors the carousel's top padding for symmetry.
 static CGFloat const kApolloHLBottomPadding = 6.0;
 static NSInteger const kApolloHLFetchLimit = 15;
+// The full set comes from a rendered Reddit page, but there is no reason to leave
+// the rendered DOM sitting idle for a fixed three seconds before looking at it.
+// Probe as soon as navigation finishes (plus this short fallback timer for pages
+// whose navigation delegate callback races their client-side render), then poll
+// cheaply until the same overall timeout the old 3s + 8x2s loop allowed.
+static NSTimeInterval const kApolloHLWebInitialPollDelay = 0.20;
+static NSTimeInterval const kApolloHLWebPollInterval = 0.50;
+// A just-finished page can briefly expose only its first couple of cards before
+// the client render fills the carousel. More than two proves the upgrade is ready;
+// for a genuinely small set, keep the old three-second settling window so an early
+// partial DOM can never make us miss later cards.
+static NSTimeInterval const kApolloHLWebSmallSetSettleDelay = 3.0;
+static NSTimeInterval const kApolloHLWebTimeout = 18.0;
 // Freshness window: a cached carousel is reused as-is for this long. Returning to a
 // subreddit after the window elapses kicks a quiet background re-poll (stale-while-
 // revalidate) that rebuilds ONLY if the pinned set actually changed. Keeps navigation
@@ -474,6 +487,10 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 @property (nonatomic, copy) NSString *sub;
 @property (nonatomic, copy) void (^done)(NSArray<ApolloHLItem *> *items);
 @property (nonatomic) int polls;
+@property (nonatomic, strong) NSDate *startedAt;
+@property (nonatomic, strong) NSArray<ApolloHLItem *> *bestItems;
+@property (nonatomic) BOOL pollScheduled;
+@property (nonatomic) BOOL evaluationInFlight;
 @end
 @implementation ApolloHLWebFetch
 
@@ -508,6 +525,7 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 
 - (void)startForSub:(NSString *)sub completion:(void (^)(NSArray<ApolloHLItem *> *))done {
     self.sub = sub; self.done = done; self.polls = 0;
+    self.startedAt = [NSDate date]; self.bestItems = nil; self.pollScheduled = NO; self.evaluationInFlight = NO;
     UIWindow *win = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:[UIWindowScene class]]) continue;
@@ -523,14 +541,29 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
     [win insertSubview:self.web atIndex:0];
     [self.web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://www.reddit.com/r/%@/", sub]]]];
     ApolloLog(@"[Highlights][web] loading r/%@ for full highlights", sub);
-    [self pollAfter:3.0];
+    [self pollAfter:kApolloHLWebInitialPollDelay];
 }
 - (void)pollAfter:(double)delay {
+    // didFinishNavigation and the fallback timer can both ask for a probe. Keep
+    // exactly one scheduled probe and one evaluateJavaScript call at a time so
+    // faster polling never stacks work in WebKit.
+    if (!self.web || self.pollScheduled) return;
+    self.pollScheduled = YES;
     __weak typeof(self) ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws poll]; });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ws.pollScheduled = NO;
+        [ws poll];
+    });
 }
 - (void)poll {
-    if (!self.web) return;
+    if (!self.web || self.evaluationInFlight) return;
+    NSTimeInterval elapsed = self.startedAt ? -self.startedAt.timeIntervalSinceNow : 0.0;
+    if (elapsed >= kApolloHLWebTimeout) {
+        ApolloLog(@"[Highlights][web] r/%@ timed out after %.1fs (%d probes)", self.sub, elapsed, self.polls);
+        [self finish:self.bestItems ?: @[]];
+        return;
+    }
+    self.evaluationInFlight = YES;
     self.polls++;
     NSString *js = @"(function(){"
         "var all=document.querySelectorAll('*'),heading=null;"
@@ -544,10 +577,22 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
         "return JSON.stringify({n:out.length,items:out});})()";
     __weak typeof(self) ws = self;
     [self.web evaluateJavaScript:js completionHandler:^(id res, NSError *e) {
+        ApolloHLWebFetch *ss = ws;
+        if (!ss) return;
+        ss.evaluationInFlight = NO;
+        if (!ss.web) return;
         NSArray<ApolloHLItem *> *items = [ApolloHLWebFetch parseItems:res];
-        if (items.count > 0) { ApolloLog(@"[Highlights][web] r/%@ extracted %lu highlights (poll#%d)", ws.sub, (unsigned long)items.count, ws.polls); [ws finish:items]; }
-        else if (ws.polls >= 8) { ApolloLog(@"[Highlights][web] r/%@ timed out", ws.sub); [ws finish:@[]]; }
-        else [ws pollAfter:2.0];
+        if (items.count > ss.bestItems.count) ss.bestItems = items;
+        NSTimeInterval now = ss.startedAt ? -ss.startedAt.timeIntervalSinceNow : 0.0;
+        if (ss.bestItems.count > 2 || (ss.bestItems.count > 0 && now >= kApolloHLWebSmallSetSettleDelay)) {
+            ApolloLog(@"[Highlights][web] r/%@ extracted %lu highlights in %.2fs (probe#%d)", ss.sub, (unsigned long)ss.bestItems.count, now, ss.polls);
+            [ss finish:ss.bestItems];
+        } else if (now >= kApolloHLWebTimeout) {
+            ApolloLog(@"[Highlights][web] r/%@ timed out after %.1fs (%d probes, last error=%@)", ss.sub, now, ss.polls, e.localizedDescription ?: @"nil");
+            [ss finish:ss.bestItems ?: @[]];
+        } else {
+            [ss pollAfter:kApolloHLWebPollInterval];
+        }
     }];
 }
 + (NSArray<ApolloHLItem *> *)parseItems:(id)res {
@@ -575,10 +620,16 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 }
 - (void)finish:(NSArray<ApolloHLItem *> *)items {
     if (self.web) { self.web.navigationDelegate = nil; [self.web removeFromSuperview]; self.web = nil; }
+    self.pollScheduled = NO; self.evaluationInFlight = NO; self.startedAt = nil; self.bestItems = nil;
     void (^d)(NSArray *) = self.done; self.done = nil;
     if (d) d(items ?: @[]);
 }
-- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {}
+- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {
+    // On a warm WebKit process the full carousel is often present immediately.
+    // Probe now instead of waiting for the fallback timer; if Reddit still has
+    // client-side work to do, the regular poll loop continues unchanged.
+    if (wv == self.web) [self poll];
+}
 @end
 
 static NSString *ApolloHLItemsContentSig(NSArray<ApolloHLItem *> *items); // defined with ApolloHLSignature
@@ -626,7 +677,15 @@ static void ApolloHLFetchHighlights(NSString *subredditName, BOOL force, void (^
             // re-poll) must NOT overwrite it — the cache holds the possibly web-upgraded
             // set on display; the refresh caller rebuilds via ApplyItems only on a real
             // change, so a failed web re-run can't silently downgrade the carousel.
-            if (!force && (status == 200 || items.count > 0)) ApolloHLCache()[key] = items;
+            NSArray<ApolloHLItem *> *completionItems = items;
+            if (!force && (status == 200 || items.count > 0)) {
+                // The web page can now finish very quickly on a warm WebKit process.
+                // If it wins the race and has already installed the full set, do not
+                // let this slower REST response downgrade the cache/carousel to two.
+                NSArray<ApolloHLItem *> *displayed = ApolloHLCache()[key];
+                if (!displayed || displayed.count <= items.count) ApolloHLCache()[key] = items;
+                completionItems = ApolloHLCache()[key] ?: items;
+            }
             // Record the inline-sticky count (REST only) for the breaker rule + the
             // freshness timestamp/signature for the stale-while-revalidate re-poll.
             if (status == 200) {
@@ -634,7 +693,7 @@ static void ApolloHLFetchHighlights(NSString *subredditName, BOOL force, void (^
                 ApolloHLFetchTime()[key] = [NSDate date];
                 ApolloHLRestSig()[key] = ApolloHLItemsContentSig(items);
             }
-            if (completion) completion(items);
+            if (completion) completion(completionItems);
         });
     }] resume];
 }
@@ -976,13 +1035,29 @@ static void ApolloHLToggleCollapsed(NSString *sub); // fwd (defined after ApplyI
 }
 @end
 
+// Presentation signature includes metadata as well as post identity. The fast web
+// path intentionally paints titles/links before /api/info enrichment returns; once
+// thumbnails/flair/comment counts arrive, this signature makes the second ApplyItems
+// call rebuild those same cards with their richer presentation.
+static NSString *ApolloHLItemsPresentationSig(NSArray<ApolloHLItem *> *items) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (ApolloHLItem *it in items) {
+        [parts addObject:[NSString stringWithFormat:@"%@\x1F%@\x1F%@\x1F%@\x1F%lld\x1F%d",
+                          it.fullName ?: it.permalink ?: @"?",
+                          it.title ?: @"",
+                          it.thumbnailURL.absoluteString ?: @"",
+                          it.flairText ?: @"",
+                          it.numComments,
+                          it.isSpoiler]];
+    }
+    return [parts componentsJoinedByString:@"\x1E"];
+}
+
 // A stable signature for a set of items PLUS the collapse state, so we rebuild
-// when either the content or the collapsed/expanded state changes.
+// when either the content, its presentation metadata, or collapsed state changes.
 static NSString *ApolloHLSignature(NSString *sub, NSArray<ApolloHLItem *> *items) {
-    NSMutableArray *ids = [NSMutableArray array];
-    for (ApolloHLItem *it in items) [ids addObject:(it.fullName ?: it.permalink ?: @"?")];
     NSString *state = ApolloHLIsCollapsed(sub) ? @"C|" : @"E|";
-    return [state stringByAppendingString:[ids componentsJoinedByString:@"|"]];
+    return [state stringByAppendingString:ApolloHLItemsPresentationSig(items)];
 }
 
 // Content-only signature (no collapse-state prefix) used to detect when a subreddit's
@@ -1446,34 +1521,40 @@ static void ApolloHLToggleCollapsed(NSString *sub) {
 // reliable source that gives the first 2 their crisp thumbnails. Thumbnail/flair/
 // comment-count are filled from /api/info, then the API stickied cache, then the
 // web DOM as a last resort. Web order is preserved. `completion` runs on main.
-static void ApolloHLEnrichViaInfo(NSArray<ApolloHLItem *> *webItems, NSArray<ApolloHLItem *> *apiItems, void (^completion)(NSArray<ApolloHLItem *> *)) {
+static void ApolloHLMergeMetadata(NSArray<ApolloHLItem *> *webItems,
+                                  NSArray<ApolloHLItem *> *apiItems,
+                                  NSDictionary<NSString *, ApolloHLItem *> *infoMap) {
     NSMutableDictionary<NSString *, ApolloHLItem *> *apiByID = [NSMutableDictionary dictionary];
     for (ApolloHLItem *a in apiItems) {
         NSString *pid = ApolloHLPostIDFromPermalink(a.permalink);
         if (pid.length) apiByID[pid] = a;
     }
-    NSMutableArray<NSString *> *pidsInOrder = [NSMutableArray array];
+    for (ApolloHLItem *w in webItems) {
+        NSString *pid = ApolloHLPostIDFromPermalink(w.permalink);
+        ApolloHLItem *info = pid.length ? infoMap[[@"t3_" stringByAppendingString:pid]] : nil;
+        ApolloHLItem *api = pid.length ? apiByID[pid] : nil;
+        if (!w.fullName.length) w.fullName = info.fullName ?: api.fullName;
+        if (!w.thumbnailURL) w.thumbnailURL = info.thumbnailURL ?: api.thumbnailURL;
+        if (!w.flairText.length) w.flairText = info.flairText ?: api.flairText;
+        if (w.numComments == 0) w.numComments = info ? info.numComments : (api ? api.numComments : 0);
+        if (!w.isSpoiler) w.isSpoiler = info ? info.isSpoiler : (api ? api.isSpoiler : NO);
+    }
+}
+
+static void ApolloHLEnrichViaInfo(NSArray<ApolloHLItem *> *webItems, NSArray<ApolloHLItem *> *apiItems, void (^completion)(NSArray<ApolloHLItem *> *)) {
     NSMutableArray<NSString *> *fullnames = [NSMutableArray array];
     for (ApolloHLItem *w in webItems) {
-        NSString *pid = ApolloHLPostIDFromPermalink(w.permalink) ?: @"";
-        [pidsInOrder addObject:pid];
+        NSString *pid = ApolloHLPostIDFromPermalink(w.permalink);
         if (pid.length) [fullnames addObject:[@"t3_" stringByAppendingString:pid]];
     }
 
     void (^finish)(NSDictionary<NSString *, ApolloHLItem *> *) = ^(NSDictionary<NSString *, ApolloHLItem *> *infoMap) {
-        NSMutableArray<ApolloHLItem *> *out = [NSMutableArray array];
-        for (NSUInteger i = 0; i < webItems.count; i++) {
-            ApolloHLItem *w = webItems[i];
-            NSString *pid = pidsInOrder[i];
-            ApolloHLItem *info = pid.length ? infoMap[[@"t3_" stringByAppendingString:pid]] : nil;
-            ApolloHLItem *api = pid.length ? apiByID[pid] : nil;
-            if (!w.thumbnailURL) w.thumbnailURL = info.thumbnailURL ?: api.thumbnailURL;
-            if (!w.flairText.length) w.flairText = info.flairText ?: api.flairText;
-            if (w.numComments == 0) w.numComments = info ? info.numComments : (api ? api.numComments : 0);
-            if (!w.isSpoiler) w.isSpoiler = info ? info.isSpoiler : (api ? api.isSpoiler : NO);
-            [out addObject:w];
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
+        // `items` may already be the live main-queue cache because the fast path
+        // paints it before enrichment. Keep both mutation and callback on main.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ApolloHLMergeMetadata(webItems, apiItems, infoMap);
+            completion(webItems);
+        });
     };
 
     if (fullnames.count == 0) { finish(@{}); return; }
@@ -1508,15 +1589,30 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
         [ApolloHLWebDone() addObject:sub];
         NSArray<ApolloHLItem *> *apiItems = ApolloHLCache()[sub];
         if (items.count == 0) return; // web found nothing
-        // Enrich the web list with reliable /api/info thumbnails before applying.
+
+        // The DOM already has the authoritative order, titles, and links. Merge
+        // whatever metadata the fast REST result already knows, then show the full
+        // list immediately instead of blocking all extra cards on another network
+        // round trip. Missing off-screen thumbnails/details arrive just below.
+        ApolloHLMergeMetadata(items, apiItems, @{});
+        NSArray<ApolloHLItem *> *cur = ApolloHLCache()[sub];
+        BOOL grew = items.count > cur.count;
+        BOOL differs = ![ApolloHLItemsContentSig(items) isEqualToString:ApolloHLItemsContentSig(cur)];
+        if (grew || differs) {
+            ApolloLog(@"[Highlights] fast web upgrade r/%@: %lu → %lu (enriching asynchronously)", sub, (unsigned long)cur.count, (unsigned long)items.count);
+            ApolloHLApplyItems(sub, items);
+        }
+
+        NSString *preEnrichmentSig = ApolloHLItemsPresentationSig(items);
+        // Enrich the already-visible list with reliable /api/info thumbnails. A
+        // presentation-signature change rebuilds the cards, while an identical
+        // response is a no-op and cannot cause a visible flash.
         ApolloHLEnrichViaInfo(items, apiItems, ^(NSArray<ApolloHLItem *> *enriched) {
-            NSArray<ApolloHLItem *> *cur = ApolloHLCache()[sub];
-            // Apply when the web set adds to OR differs from what's shown — the latter
-            // matters on a refresh where a highlight was swapped (same count, new posts).
-            BOOL grew = enriched.count > cur.count;
-            BOOL differs = ![ApolloHLItemsContentSig(enriched) isEqualToString:ApolloHLItemsContentSig(cur)];
-            if (grew || differs) {
-                ApolloLog(@"[Highlights] web upgrade r/%@: %lu → %lu", sub, (unsigned long)cur.count, (unsigned long)enriched.count);
+            BOOL metadataChanged = ![ApolloHLItemsPresentationSig(enriched) isEqualToString:preEnrichmentSig];
+            NSArray<ApolloHLItem *> *shown = ApolloHLCache()[sub];
+            BOOL setChanged = ![ApolloHLItemsContentSig(enriched) isEqualToString:ApolloHLItemsContentSig(shown)];
+            if (metadataChanged || setChanged) {
+                ApolloLog(@"[Highlights] web enrichment r/%@ applied (metadataChanged=%d setChanged=%d)", sub, metadataChanged, setChanged);
                 ApolloHLApplyItems(sub, enriched);
             }
         });
