@@ -21,8 +21,8 @@
 // it is OFF the slot is free and we own it with zero conflict. Coexistence with
 // that feature (both ON) is handled separately; here we defer to it.
 //
-// Gated behind sCommunityHighlights (Settings → Subreddits → Community
-// Highlights).
+// Gated behind the Settings → Subreddits → Community Highlights mode: Off
+// disables it, Partial uses only the REST result, and Full adds the web upgrade.
 
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
@@ -258,6 +258,14 @@ static NSMutableDictionary<NSString *, NSArray<ApolloHLItem *> *> *ApolloHLCache
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
     return cache;
 }
+// The displayed cache can be upgraded to the full web set. Keep the latest pure
+// REST result separately so changing the setting from Full to Partial can remove
+// the extra cards immediately without another request or app restart.
+static NSMutableDictionary<NSString *, NSArray<ApolloHLItem *> *> *ApolloHLRestCache(void) {
+    static NSMutableDictionary *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    return cache;
+}
 static NSMutableSet<NSString *> *ApolloHLInFlight(void) {
     static NSMutableSet *set; static dispatch_once_t once;
     dispatch_once(&once, ^{ set = [NSMutableSet set]; });
@@ -481,7 +489,8 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 // new-Reddit subreddit page (logged out — highlights are public), waits for the
 // challenge to clear + the carousel to render, then scrapes title/permalink/
 // thumbnail from the DOM. Calls `done` on the main queue (empty array on
-// fail/timeout). Heavy — callers must cache + gate behind sCommunityHighlightsWeb.
+// fail/timeout). Used only by the Full setting; callers cache the result and gate
+// it behind sCommunityHighlightsWeb.
 @interface ApolloHLWebFetch : NSObject <WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *web;
 @property (nonatomic, copy) NSString *sub;
@@ -624,6 +633,16 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
     void (^d)(NSArray *) = self.done; self.done = nil;
     if (d) d(items ?: @[]);
 }
+- (void)cancel {
+    self.done = nil;
+    if (self.web) {
+        self.web.navigationDelegate = nil;
+        [self.web stopLoading];
+        [self.web removeFromSuperview];
+        self.web = nil;
+    }
+    self.pollScheduled = NO; self.evaluationInFlight = NO; self.startedAt = nil; self.bestItems = nil;
+}
 - (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {
     // On a warm WebKit process the full carousel is often present immediately.
     // Probe now instead of waiting for the fallback timer; if Reddit still has
@@ -683,12 +702,13 @@ static void ApolloHLFetchHighlights(NSString *subredditName, BOOL force, void (^
                 // If it wins the race and has already installed the full set, do not
                 // let this slower REST response downgrade the cache/carousel to two.
                 NSArray<ApolloHLItem *> *displayed = ApolloHLCache()[key];
-                if (!displayed || displayed.count <= items.count) ApolloHLCache()[key] = items;
+                if (!displayed || !sCommunityHighlightsWeb || displayed.count <= items.count) ApolloHLCache()[key] = items;
                 completionItems = ApolloHLCache()[key] ?: items;
             }
             // Record the inline-sticky count (REST only) for the breaker rule + the
             // freshness timestamp/signature for the stale-while-revalidate re-poll.
             if (status == 200) {
+                ApolloHLRestCache()[key] = items;
                 ApolloHLStickyCount()[key] = @(items.count);
                 ApolloHLFetchTime()[key] = [NSDate date];
                 ApolloHLRestSig()[key] = ApolloHLItemsContentSig(items);
@@ -1586,8 +1606,11 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
     ApolloHLWebFetchers()[sub] = fetch;
     [fetch startForSub:sub completion:^(NSArray<ApolloHLItem *> *items) {
         [ApolloHLWebFetchers() removeObjectForKey:sub];
+        // The user may have changed Full to Partial/Off while WebKit was still
+        // rendering. Never let that stale completion restore the full set.
+        if (!sCommunityHighlights || !sCommunityHighlightsWeb) return;
         [ApolloHLWebDone() addObject:sub];
-        NSArray<ApolloHLItem *> *apiItems = ApolloHLCache()[sub];
+        NSArray<ApolloHLItem *> *apiItems = ApolloHLRestCache()[sub] ?: ApolloHLCache()[sub];
         if (items.count == 0) return; // web found nothing
 
         // The DOM already has the authoritative order, titles, and links. Merge
@@ -1608,6 +1631,7 @@ static void ApolloHLMaybeWebUpgrade(NSString *subreddit) {
         // presentation-signature change rebuilds the cards, while an identical
         // response is a no-op and cannot cause a visible flash.
         ApolloHLEnrichViaInfo(items, apiItems, ^(NSArray<ApolloHLItem *> *enriched) {
+            if (!sCommunityHighlights || !sCommunityHighlightsWeb) return;
             BOOL metadataChanged = ![ApolloHLItemsPresentationSig(enriched) isEqualToString:preEnrichmentSig];
             NSArray<ApolloHLItem *> *shown = ApolloHLCache()[sub];
             BOOL setChanged = ![ApolloHLItemsContentSig(enriched) isEqualToString:ApolloHLItemsContentSig(shown)];
@@ -2200,9 +2224,56 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification *note) {
-        // Install/teardown + re-layout every feed controller so the carousel and
-        // the inline de-dup both update live (cells already laid out under the old
-        // state need a reload to collapse/restore).
+        NSMutableSet<NSString *> *visibleSubs = [NSMutableSet set];
+        ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
+            NSString *sub = ApolloHLSubredditName(postsVC);
+            if (sub.length) [visibleSubs addObject:sub];
+        });
+
+        if (!sCommunityHighlightsWeb) {
+            // Partial and Off must stop a Full-mode scrape already in progress.
+            // cancel deliberately drops its completion so it cannot repopulate
+            // the carousel after the mode changed.
+            NSArray<ApolloHLWebFetch *> *fetches = ApolloHLWebFetchers().allValues;
+            [ApolloHLWebFetchers() removeAllObjects];
+            for (ApolloHLWebFetch *fetch in fetches) [fetch cancel];
+            [ApolloHLWebDone() removeAllObjects];
+        } else {
+            // Full selected after Partial: allow each visible subreddit to run a
+            // fresh web upgrade even if it completed earlier in this app session.
+            for (NSString *sub in visibleSubs) [ApolloHLWebDone() removeObject:sub];
+        }
+
+        if (sCommunityHighlights && !sCommunityHighlightsWeb) {
+            // Downgrade a live Full carousel to the saved REST-only set at once.
+            // Every Full load begins with the same REST request Partial uses.
+            for (NSString *sub in visibleSubs) {
+                NSArray<ApolloHLItem *> *restItems = ApolloHLRestCache()[sub];
+                if (restItems) {
+                    ApolloHLCache()[sub] = restItems;
+                    if (restItems.count > 0) ApolloHLApplyItems(sub, restItems);
+                    else ApolloHLClearDeDup(sub);
+                    continue;
+                }
+
+                // An extremely early change can beat the first REST response.
+                // Force one if needed; the in-flight guard prevents duplicates.
+                ApolloHLFetchHighlights(sub, YES, ^(NSArray<ApolloHLItem *> *freshREST) {
+                    if (!freshREST || !sCommunityHighlights || sCommunityHighlightsWeb) return;
+                    ApolloHLCache()[sub] = freshREST;
+                    if (freshREST.count > 0) ApolloHLApplyItems(sub, freshREST);
+                    else ApolloHLClearDeDup(sub);
+                    ApolloHLForEachPostsVC(^(UIViewController *liveVC) {
+                        if (![ApolloHLSubredditName(liveVC) isEqualToString:sub]) return;
+                        ApolloHLInstall(liveVC);
+                        ApolloHLReloadFeed(liveVC);
+                    });
+                });
+            }
+        }
+
+        // Install/teardown + re-layout every feed controller so all three modes
+        // apply live (cells laid out under the old mode need remeasurement too).
         ApolloHLForEachPostsVC(^(UIViewController *postsVC) {
             ApolloHLInstall(postsVC);
             ApolloHLReloadFeed(postsVC);
