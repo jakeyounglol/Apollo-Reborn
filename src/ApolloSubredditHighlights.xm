@@ -500,6 +500,10 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 @property (nonatomic, strong) NSArray<ApolloHLItem *> *bestItems;
 @property (nonatomic) BOOL pollScheduled;
 @property (nonatomic) BOOL evaluationInFlight;
+// Reddit can hydrate a larger carousel progressively. Once a probe first sees
+// more than the REST-sized two cards, take one confirming probe before finishing
+// so bestItems can grow to the complete set without restoring the old 3s delay.
+@property (nonatomic) BOOL awaitingLargeSetConfirmation;
 @end
 @implementation ApolloHLWebFetch
 
@@ -535,6 +539,7 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 - (void)startForSub:(NSString *)sub completion:(void (^)(NSArray<ApolloHLItem *> *))done {
     self.sub = sub; self.done = done; self.polls = 0;
     self.startedAt = [NSDate date]; self.bestItems = nil; self.pollScheduled = NO; self.evaluationInFlight = NO;
+    self.awaitingLargeSetConfirmation = NO;
     UIWindow *win = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:[UIWindowScene class]]) continue;
@@ -593,7 +598,12 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
         NSArray<ApolloHLItem *> *items = [ApolloHLWebFetch parseItems:res];
         if (items.count > ss.bestItems.count) ss.bestItems = items;
         NSTimeInterval now = ss.startedAt ? -ss.startedAt.timeIntervalSinceNow : 0.0;
-        if (ss.bestItems.count > 2 || (ss.bestItems.count > 0 && now >= kApolloHLWebSmallSetSettleDelay)) {
+        if (ss.bestItems.count > 2 && !ss.awaitingLargeSetConfirmation && now < kApolloHLWebTimeout) {
+            ss.awaitingLargeSetConfirmation = YES;
+            ApolloLog(@"[Highlights][web] r/%@ found %lu highlights in %.2fs; confirming once for progressive hydration",
+                      ss.sub, (unsigned long)ss.bestItems.count, now);
+            [ss pollAfter:kApolloHLWebPollInterval];
+        } else if (ss.bestItems.count > 2 || (ss.bestItems.count > 0 && now >= kApolloHLWebSmallSetSettleDelay)) {
             ApolloLog(@"[Highlights][web] r/%@ extracted %lu highlights in %.2fs (probe#%d)", ss.sub, (unsigned long)ss.bestItems.count, now, ss.polls);
             [ss finish:ss.bestItems];
         } else if (now >= kApolloHLWebTimeout) {
@@ -629,7 +639,8 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 }
 - (void)finish:(NSArray<ApolloHLItem *> *)items {
     if (self.web) { self.web.navigationDelegate = nil; [self.web removeFromSuperview]; self.web = nil; }
-    self.pollScheduled = NO; self.evaluationInFlight = NO; self.startedAt = nil; self.bestItems = nil;
+    self.pollScheduled = NO; self.evaluationInFlight = NO; self.awaitingLargeSetConfirmation = NO;
+    self.startedAt = nil; self.bestItems = nil;
     void (^d)(NSArray *) = self.done; self.done = nil;
     if (d) d(items ?: @[]);
 }
@@ -641,7 +652,8 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
         [self.web removeFromSuperview];
         self.web = nil;
     }
-    self.pollScheduled = NO; self.evaluationInFlight = NO; self.startedAt = nil; self.bestItems = nil;
+    self.pollScheduled = NO; self.evaluationInFlight = NO; self.awaitingLargeSetConfirmation = NO;
+    self.startedAt = nil; self.bestItems = nil;
 }
 - (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)nav {
     // On a warm WebKit process the full carousel is often present immediately.
@@ -2245,12 +2257,20 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
         }
 
         if (sCommunityHighlights && !sCommunityHighlightsWeb) {
-            // Downgrade a live Full carousel to the saved REST-only set at once.
-            // Every Full load begins with the same REST request Partial uses.
+            // The display cache outlives its feed controller. Reset every cached
+            // subreddit, not just the currently visible ones, so revisiting a sub
+            // after Full → Partial cannot reinstall its session-old web set.
+            for (NSString *sub in ApolloHLCache().allKeys) {
+                NSArray<ApolloHLItem *> *restItems = ApolloHLRestCache()[sub];
+                if (restItems) ApolloHLCache()[sub] = restItems;
+                else [ApolloHLCache() removeObjectForKey:sub];
+            }
+
+            // Apply/fetch only for live feeds. Every Full load begins with the
+            // same REST request Partial uses, so most visible subs update at once.
             for (NSString *sub in visibleSubs) {
                 NSArray<ApolloHLItem *> *restItems = ApolloHLRestCache()[sub];
                 if (restItems) {
-                    ApolloHLCache()[sub] = restItems;
                     if (restItems.count > 0) ApolloHLApplyItems(sub, restItems);
                     else ApolloHLClearDeDup(sub);
                     continue;
@@ -2260,9 +2280,15 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
                 // Force one if needed; the in-flight guard prevents duplicates.
                 ApolloHLFetchHighlights(sub, YES, ^(NSArray<ApolloHLItem *> *freshREST) {
                     if (!freshREST || !sCommunityHighlights || sCommunityHighlightsWeb) return;
-                    ApolloHLCache()[sub] = freshREST;
-                    if (freshREST.count > 0) ApolloHLApplyItems(sub, freshREST);
-                    else ApolloHLClearDeDup(sub);
+                    // Preserve the fetcher's failure semantics: an empty result
+                    // stays uncached so a transient error can retry later instead
+                    // of becoming a session-long "nothing pinned" negative cache.
+                    if (freshREST.count > 0) {
+                        ApolloHLCache()[sub] = freshREST;
+                        ApolloHLApplyItems(sub, freshREST);
+                    } else {
+                        ApolloHLClearDeDup(sub);
+                    }
                     ApolloHLForEachPostsVC(^(UIViewController *liveVC) {
                         if (![ApolloHLSubredditName(liveVC) isEqualToString:sub]) return;
                         ApolloHLInstall(liveVC);
