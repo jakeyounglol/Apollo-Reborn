@@ -1360,29 +1360,11 @@ static void ApolloPollPresentAccessibilityPicker(id pollNode, RDKLink *link,
 // (e.g. [ASStackLayoutSpec ...]) fails at LINK time — no _OBJC_CLASS_$_
 // symbol exists in this build's inputs, even though the class exists once
 // actually loaded into Apollo (confirmed by trying it: `ld: symbol(s) not
-// found ... _OBJC_CLASS_$_ASStackLayoutSpec`). Resolve via objc_getClass at
-// runtime instead, exactly like ApolloPollEnsureRadioNode/VoteButtonNode
-// already do for ASTextNode below.
-static Class ApolloPollStackLayoutSpecClass(void) {
-    static Class cls;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ cls = objc_getClass("ASStackLayoutSpec"); });
-    return cls;
-}
-
-static Class ApolloPollInsetLayoutSpecClass(void) {
-    static Class cls;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ cls = objc_getClass("ASInsetLayoutSpec"); });
-    return cls;
-}
-
-static Class ApolloPollBackgroundLayoutSpecClass(void) {
-    static Class cls;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ cls = objc_getClass("ASBackgroundLayoutSpec"); });
-    return cls;
-}
+// found ... _OBJC_CLASS_$_ASStackLayoutSpec`). Every Texture class below is
+// therefore resolved via objc_getClass(...) at the point of use instead —
+// matching how this file already resolves _TtC6Apollo14PollOptionNode
+// elsewhere — rather than a dedicated per-class cache: objc_getClass is a
+// cheap runtime hash lookup, called only a handful of times per poll render.
 
 // A baseline-aligned SF Symbol as an attributed string, sized to `font` and
 // tinted `tint`. Mirrors ApolloAISummary.xm's ApolloAISymbolAttachment (kept
@@ -1446,35 +1428,51 @@ static void ApolloPollSetPendingSelection(id pollNode, NSString *optionID) {
                               OBJC_ASSOCIATION_COPY_NONATOMIC);
 }
 
-// Lazily creates and caches the leading radio glyph on a PollOptionNode.
-// Called from -[PollOptionNode layoutSpecThatFits:] (structural: only needs
-// to run once per node instance) to splice it into the row's layout; the
-// glyph's selected/unselected content is refreshed separately, out of band,
-// by ApolloPollRefreshOptionRadios below — never by re-running layout.
-static ASTextNode *ApolloPollEnsureRadioNode(ASDisplayNode *optionNode) {
-    ASTextNode *radio = objc_getAssociatedObject(optionNode, kApolloPollRadioNodeKey);
-    if (radio) return radio;
+// Lazily creates (if not already cached under `key` on `host`) a bare
+// ASTextNode, adds it as a subnode of `host`, and caches the reference for
+// next time. `didCreate` (if non-NULL) reports whether this call created a
+// FRESH node vs. returning the already-cached one, so callers can apply
+// one-time initial content without ever stomping state a later refresh
+// (ApolloPollRefreshOptionRadios/RefreshVoteButton) already applied.
+static ASTextNode *ApolloPollEnsureTextNode(ASDisplayNode *host, const void *key, BOOL *didCreate) {
+    ASTextNode *node = objc_getAssociatedObject(host, key);
+    if (node) {
+        if (didCreate) *didCreate = NO;
+        return node;
+    }
     Class textNodeClass = objc_getClass("ASTextNode");
     if (!textNodeClass) return nil;
-    radio = [textNodeClass new];
-    radio.attributedText = ApolloPollRadioAttributedText(NO, ApolloPollResolvedAccentColor(optionNode));
-    [optionNode addSubnode:radio];
-    objc_setAssociatedObject(optionNode, kApolloPollRadioNodeKey, radio, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    node = [textNodeClass new];
+    [host addSubnode:node];
+    objc_setAssociatedObject(host, key, node, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (didCreate) *didCreate = YES;
+    return node;
+}
+
+// The leading radio glyph on a PollOptionNode. Called from
+// -[PollOptionNode layoutSpecThatFits:] (structural: only needs to run once
+// per node instance) to splice it into the row's layout; the glyph's
+// selected/unselected content is refreshed separately, out of band, by
+// ApolloPollRefreshOptionRadios below — never by re-running layout, so the
+// default-unselected content set here on first creation is the only content
+// this function itself ever applies.
+static ASTextNode *ApolloPollEnsureRadioNode(ASDisplayNode *optionNode) {
+    BOOL didCreate = NO;
+    ASTextNode *radio = ApolloPollEnsureTextNode(optionNode, kApolloPollRadioNodeKey, &didCreate);
+    if (didCreate) {
+        radio.attributedText = ApolloPollRadioAttributedText(NO, ApolloPollResolvedAccentColor(optionNode));
+    }
     return radio;
 }
 
 // The Vote pill's text label. Deliberately carries no background/cornerRadius
 // of its own — see ApolloPollEnsureVoteButtonBackgroundNode below for why a
-// color set directly on this node wouldn't include the padding around it.
+// color set directly on this node wouldn't include the padding around it. No
+// default content is set here (unlike the radio above): the PollNode layout
+// hook always calls ApolloPollRefreshVoteButton right before this, on every
+// pass, so there's no "first creation" gap to fill.
 static ASTextNode *ApolloPollEnsureVoteButtonTextNode(ASDisplayNode *pollNode) {
-    ASTextNode *text = objc_getAssociatedObject(pollNode, kApolloPollVoteButtonTextNodeKey);
-    if (text) return text;
-    Class textNodeClass = objc_getClass("ASTextNode");
-    if (!textNodeClass) return nil;
-    text = [textNodeClass new];
-    [pollNode addSubnode:text];
-    objc_setAssociatedObject(pollNode, kApolloPollVoteButtonTextNodeKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return text;
+    return ApolloPollEnsureTextNode(pollNode, kApolloPollVoteButtonTextNodeKey, NULL);
 }
 
 // The Vote pill's visual chrome — a plain node stretched (via
@@ -1582,8 +1580,8 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
 
     ASTextNode *radio = ApolloPollEnsureRadioNode((ASDisplayNode *)self);
     if (!radio) return originalSpec;
-    Class stackClass = ApolloPollStackLayoutSpecClass();
-    Class insetClass = ApolloPollInsetLayoutSpecClass();
+    Class stackClass = objc_getClass("ASStackLayoutSpec");
+    Class insetClass = objc_getClass("ASInsetLayoutSpec");
     if (!stackClass || !insetClass) return originalSpec;
     ASStackLayoutSpec *row = [stackClass
         stackLayoutSpecWithDirection:ApolloPollStackDirectionHorizontal
@@ -1626,9 +1624,9 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     ASTextNode *text = ApolloPollEnsureVoteButtonTextNode((ASDisplayNode *)self);
     ASDisplayNode *background = ApolloPollEnsureVoteButtonBackgroundNode((ASDisplayNode *)self);
     if (!text || !background) return originalSpec;
-    Class stackClass = ApolloPollStackLayoutSpecClass();
-    Class insetClass = ApolloPollInsetLayoutSpecClass();
-    Class backgroundClass = ApolloPollBackgroundLayoutSpecClass();
+    Class stackClass = objc_getClass("ASStackLayoutSpec");
+    Class insetClass = objc_getClass("ASInsetLayoutSpec");
+    Class backgroundClass = objc_getClass("ASBackgroundLayoutSpec");
     if (!stackClass || !insetClass || !backgroundClass) return originalSpec;
     // The padded text (foreground) drives the pill's size; the background
     // node is stretched to match it, so the padding is part of the visible
