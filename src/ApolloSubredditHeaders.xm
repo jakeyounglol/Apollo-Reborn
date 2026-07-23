@@ -1334,7 +1334,7 @@ static BOOL ApolloSubredditShouldBlockOffset(UITableView *tableView, CGPoint new
 %hook UIScrollView
 
 - (void)setContentOffset:(CGPoint)contentOffset {
-    if ([self isKindOfClass:[UITableView class]] &&
+    if (sShowSubredditHeaders && [self isKindOfClass:[UITableView class]] &&
         ApolloSubredditShouldBlockOffset((UITableView *)self, contentOffset)) {
         return;
     }
@@ -1342,7 +1342,7 @@ static BOOL ApolloSubredditShouldBlockOffset(UITableView *tableView, CGPoint new
 }
 
 - (void)setContentOffset:(CGPoint)contentOffset animated:(BOOL)animated {
-    if ([self isKindOfClass:[UITableView class]] &&
+    if (sShowSubredditHeaders && [self isKindOfClass:[UITableView class]] &&
         ApolloSubredditShouldBlockOffset((UITableView *)self, contentOffset)) {
         return;
     }

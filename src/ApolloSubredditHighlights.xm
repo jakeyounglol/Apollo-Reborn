@@ -2109,7 +2109,8 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 %hook UIScrollView
 
 - (void)setContentOffset:(CGPoint)contentOffset {
-    if ([self isKindOfClass:[UITableView class]] &&
+    if (sCommunityHighlights && !sShowSubredditHeaders &&
+        [self isKindOfClass:[UITableView class]] &&
         ApolloHLShouldBlockOffset((UITableView *)self, contentOffset)) {
         return;
     }
@@ -2117,7 +2118,8 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 }
 
 - (void)setContentOffset:(CGPoint)contentOffset animated:(BOOL)animated {
-    if ([self isKindOfClass:[UITableView class]] &&
+    if (sCommunityHighlights && !sShowSubredditHeaders &&
+        [self isKindOfClass:[UITableView class]] &&
         ApolloHLShouldBlockOffset((UITableView *)self, contentOffset)) {
         return;
     }

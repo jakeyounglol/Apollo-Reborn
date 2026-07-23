@@ -59,6 +59,8 @@ static const void *kApolloDeletedCommentsOriginalBodyHTMLKey = &kApolloDeletedCo
 static const void *kApolloDeletedCommentsHostLayoutRefreshScheduledKey = &kApolloDeletedCommentsHostLayoutRefreshScheduledKey;
 static const void *kApolloDeletedCommentsHostRefreshRearmedKey = &kApolloDeletedCommentsHostRefreshRearmedKey;
 static const void *kApolloDeletedCommentsHostRefreshVerifyCountKey = &kApolloDeletedCommentsHostRefreshVerifyCountKey;
+static const void *kApolloDeletedCommentsHostRefreshDeferredForScrollKey = &kApolloDeletedCommentsHostRefreshDeferredForScrollKey;
+static const void *kApolloDeletedCommentsHostDeferredCellKey = &kApolloDeletedCommentsHostDeferredCellKey;
 static const void *kApolloDeletedCommentsRevealToggleInFlightKey = &kApolloDeletedCommentsRevealToggleInFlightKey;
 static const void *kApolloDeletedCommentsReasonChipRepairScheduledKey = &kApolloDeletedCommentsReasonChipRepairScheduledKey;
 static const void *kApolloDeletedCommentsRevealTapGestureKey = &kApolloDeletedCommentsRevealTapGestureKey;
@@ -3136,6 +3138,35 @@ NSTimeInterval ApolloDeletedCommentsCollapseSettleDelayRemaining(void) {
     return kApolloDeletedCommentsCollapseSettleWindow - elapsed;
 }
 
+// Preserve the first visible row's screen position across an empty table update.
+// A raw contentOffset snapshot is insufficient: remeasuring the tall post header
+// above the viewport changes the content-space origin of every comment row. The
+// visible row + delta is a stable scroll anchor even when those earlier heights
+// change during the commit.
+static NSDictionary *ApolloDeletedCommentsCaptureScrollAnchor(UITableView *tableView) {
+    NSArray<NSIndexPath *> *visible = [[tableView indexPathsForVisibleRows] sortedArrayUsingSelector:@selector(compare:)];
+    NSIndexPath *indexPath = visible.firstObject;
+    if (!indexPath) return nil;
+    CGRect rowRect = [tableView rectForRowAtIndexPath:indexPath];
+    CGFloat screenDelta = CGRectGetMinY(rowRect) - tableView.contentOffset.y;
+    return @{ @"indexPath": indexPath, @"screenDelta": @(screenDelta) };
+}
+
+static void ApolloDeletedCommentsRestoreScrollAnchor(UITableView *tableView, NSDictionary *anchor) {
+    NSIndexPath *indexPath = [anchor[@"indexPath"] isKindOfClass:[NSIndexPath class]] ? anchor[@"indexPath"] : nil;
+    NSNumber *screenDeltaValue = [anchor[@"screenDelta"] isKindOfClass:[NSNumber class]] ? anchor[@"screenDelta"] : nil;
+    if (!indexPath || !screenDeltaValue) return;
+    if (indexPath.section >= [tableView numberOfSections] || indexPath.row >= [tableView numberOfRowsInSection:indexPath.section]) return;
+
+    CGRect rowRect = [tableView rectForRowAtIndexPath:indexPath];
+    CGFloat requestedY = CGRectGetMinY(rowRect) - screenDeltaValue.doubleValue;
+    CGFloat minY = -tableView.adjustedContentInset.top;
+    CGFloat viewportHeight = CGRectGetHeight(tableView.bounds) - tableView.adjustedContentInset.top - tableView.adjustedContentInset.bottom;
+    CGFloat maxY = MAX(minY, tableView.contentSize.height - MAX(0.0, viewportHeight) - tableView.adjustedContentInset.top);
+    requestedY = MIN(MAX(requestedY, minY), maxY);
+    [tableView setContentOffset:CGPointMake(tableView.contentOffset.x, requestedY) animated:NO];
+}
+
 static void ApolloDeletedCommentsScheduleHostLayoutRefresh(id cellNode) {
     if (!cellNode || !ApolloDeletedCommentsFeatureActive() || !ApolloDeletedCommentsCellNodeShouldShowDeletedTreatment(cellNode)) return;
 
@@ -3201,6 +3232,38 @@ static void ApolloDeletedCommentsScheduleHostLayoutRefresh(id cellNode) {
             return;
         }
 
+        // Never launch a table-wide height query in the middle of a gesture or
+        // deceleration. Besides stealing frame time, the stale estimated post
+        // header height can make UITableView compensate contentOffset back toward
+        // the top (#703). Keep one coalesced refresh per host and retry after the
+        // scroll settles; newly displayed deleted cells merge into the same host
+        // flag instead of multiplying begin/endUpdates calls.
+        if ([strongHostView isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *scrollView = (UIScrollView *)strongHostView;
+            if (scrollView.tracking || scrollView.dragging || scrollView.decelerating) {
+                objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostLayoutRefreshScheduledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // Retain one representative cell through the gesture. Without
+                // this, Texture can recycle the weak node before deceleration
+                // ends and the final required height commit is silently lost.
+                id deferredCell = weakCellNode;
+                if (deferredCell) {
+                    objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostDeferredCellKey, deferredCell, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                if (![objc_getAssociatedObject(strongHostView, kApolloDeletedCommentsHostRefreshDeferredForScrollKey) boolValue]) {
+                    objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostRefreshDeferredForScrollKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    ApolloLog(@"[DeletedComments] deferred host height refresh until scrolling settles");
+                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    id deferredNode = objc_getAssociatedObject(strongHostView, kApolloDeletedCommentsHostDeferredCellKey);
+                    objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostDeferredCellKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostLayoutRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    if (deferredNode && strongHostView.window) ApolloDeletedCommentsScheduleHostLayoutRefresh(deferredNode);
+                });
+                return;
+            }
+        }
+        objc_setAssociatedObject(strongHostView, kApolloDeletedCommentsHostRefreshDeferredForScrollKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
         for (UIView *view = strongCellView; view && view != strongHostView.superview; view = view.superview) {
             [view setNeedsLayout];
             [view setNeedsDisplay];
@@ -3214,6 +3277,8 @@ static void ApolloDeletedCommentsScheduleHostLayoutRefresh(id cellNode) {
         // both the implicit UITableView row animation and the Core Animation actions so the
         // row snaps to its correct height. Native collapse/expand animates via its own path
         // and is untouched.
+        UITableView *anchorTable = [strongHostView isKindOfClass:[UITableView class]] ? (UITableView *)strongHostView : nil;
+        NSDictionary *scrollAnchor = anchorTable ? ApolloDeletedCommentsCaptureScrollAnchor(anchorTable) : nil;
         void (^commit)(void) = ^{
             @try {
                 if ([strongHostView isKindOfClass:[UICollectionView class]]) {
@@ -3226,6 +3291,7 @@ static void ApolloDeletedCommentsScheduleHostLayoutRefresh(id cellNode) {
                     [strongHostView setNeedsLayout];
                     [strongHostView layoutIfNeeded];
                 }
+                if (anchorTable && scrollAnchor) ApolloDeletedCommentsRestoreScrollAnchor(anchorTable, scrollAnchor);
             } @catch (__unused NSException *e) {
                 [strongHostView setNeedsLayout];
             }

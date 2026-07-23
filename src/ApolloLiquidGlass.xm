@@ -734,6 +734,53 @@ static void HideApolloStatusBarBackgroundView(UINavigationController *navControl
 @interface _UINavigationBarTitleControl : UIControl
 @end
 
+@interface ApolloTitleRecenterCache : NSObject
+@property(nonatomic) CGRect barBounds;
+@property(nonatomic) CGRect titleFrame;
+@property(nonatomic) NSUInteger itemSignature;
+@property(nonatomic) NSUInteger barSubviewCount;
+@property(nonatomic) CGAffineTransform desiredTransform;
+@property(nonatomic) BOOL valid;
+@end
+
+@implementation ApolloTitleRecenterCache
+@end
+
+static char kApolloTitleRecenterCacheKey;
+
+static NSUInteger ApolloNavigationItemsSignature(UINavigationBar *bar) {
+    UINavigationItem *item = bar.topItem;
+    NSUInteger signature = (NSUInteger)(__bridge void *)item;
+    NSArray<UIBarButtonItem *> *groups[] = { item.leftBarButtonItems, item.rightBarButtonItems };
+    for (NSUInteger groupIndex = 0; groupIndex < 2; groupIndex++) {
+        NSArray<UIBarButtonItem *> *items = groups[groupIndex];
+        signature = signature * 33u + items.count;
+        for (UIBarButtonItem *barItem in items) {
+            signature = signature * 33u + (NSUInteger)(__bridge void *)barItem;
+            signature = signature * 33u + barItem.title.hash;
+            signature = signature * 33u + (NSUInteger)(__bridge void *)barItem.image;
+            signature = signature * 33u + (NSUInteger)(__bridge void *)barItem.customView;
+            signature = signature * 33u + (NSUInteger)llround(barItem.width * 2.0);
+            if (barItem.customView) {
+                signature = signature * 33u + (NSUInteger)llround(CGRectGetWidth(barItem.customView.bounds) * 2.0);
+                signature = signature * 33u + (NSUInteger)llround(CGRectGetHeight(barItem.customView.bounds) * 2.0);
+                signature = signature * 33u + (barItem.customView.hidden ? 1u : 0u);
+            }
+        }
+    }
+    signature = signature * 33u + item.title.hash;
+    signature = signature * 33u + (NSUInteger)(__bridge void *)item.titleView;
+    return signature;
+}
+
+static void ApolloApplyTitleTransform(UIView *titleControl, CGAffineTransform desired) {
+    if (CGAffineTransformEqualToTransform(titleControl.transform, desired)) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    titleControl.transform = desired;
+    [CATransaction commit];
+}
+
 static void ApolloRecenterTitleControl(UIView *titleControl) {
     if (!titleControl.window || !titleControl.superview) return;
 
@@ -751,6 +798,19 @@ static void ApolloRecenterTitleControl(UIView *titleControl) {
     CGRect frameInBar = [titleControl.superview convertRect:titleControl.frame toView:bar];
     frameInBar.origin.x -= existingTx;
 
+    // UINavigationBar can ask the title control to lay out repeatedly while its
+    // scroll-edge appearance updates. The expensive descendant scans below only
+    // depend on bar/title geometry and navigation-item content, so reuse the
+    // previous transform when that signature is unchanged.
+    NSUInteger itemSignature = ApolloNavigationItemsSignature(bar);
+    ApolloTitleRecenterCache *cache = objc_getAssociatedObject(titleControl, &kApolloTitleRecenterCacheKey);
+    if (cache.valid && CGRectEqualToRect(cache.barBounds, bar.bounds) &&
+        CGRectEqualToRect(cache.titleFrame, frameInBar) &&
+        cache.itemSignature == itemSignature && cache.barSubviewCount == bar.subviews.count) {
+        ApolloApplyTitleTransform(titleControl, cache.desiredTransform);
+        return;
+    }
+
     CGFloat width = CGRectGetWidth(frameInBar);
     if (width <= 0) return;
 
@@ -762,9 +822,8 @@ static void ApolloRecenterTitleControl(UIView *titleControl) {
     NSMutableSet<NSValue *> *titleSubtree = [NSMutableSet set];
     {
         NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:titleControl];
-        while (q.count > 0) {
-            UIView *v = q.firstObject;
-            [q removeObjectAtIndex:0];
+        for (NSUInteger index = 0; index < q.count; index++) {
+            UIView *v = q[index];
             [titleSubtree addObject:[NSValue valueWithNonretainedObject:v]];
             for (UIView *c in v.subviews) [q addObject:c];
         }
@@ -776,9 +835,8 @@ static void ApolloRecenterTitleControl(UIView *titleControl) {
     CGFloat leftLimit = 0;
     CGFloat rightLimit = CGRectGetWidth(bar.bounds);
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:bar];
-    while (queue.count > 0) {
-        UIView *v = queue.firstObject;
-        [queue removeObjectAtIndex:0];
+    for (NSUInteger index = 0; index < queue.count; index++) {
+        UIView *v = queue[index];
         for (UIView *child in v.subviews) {
             if ([titleSubtree containsObject:[NSValue valueWithNonretainedObject:child]]) continue;
             if (child.hidden || child.alpha == 0) continue;
@@ -812,14 +870,20 @@ static void ApolloRecenterTitleControl(UIView *titleControl) {
         : MIN(MAX(barCenter, minCenter), maxCenter);
 
     CGFloat newTx = targetCenter - unadjustedCenter;
-    if (fabs(newTx - existingTx) < 0.5) return;
-
-    CGAffineTransform desired = (fabs(newTx) < 0.5) ? CGAffineTransformIdentity
-                                                    : CGAffineTransformMakeTranslation(newTx, 0);
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    titleControl.transform = desired;
-    [CATransaction commit];
+    CGAffineTransform desired = (fabs(newTx - existingTx) < 0.5)
+        ? titleControl.transform
+        : ((fabs(newTx) < 0.5) ? CGAffineTransformIdentity : CGAffineTransformMakeTranslation(newTx, 0));
+    if (!cache) {
+        cache = [ApolloTitleRecenterCache new];
+        objc_setAssociatedObject(titleControl, &kApolloTitleRecenterCacheKey, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    cache.barBounds = bar.bounds;
+    cache.titleFrame = frameInBar;
+    cache.itemSignature = itemSignature;
+    cache.barSubviewCount = bar.subviews.count;
+    cache.desiredTransform = desired;
+    cache.valid = YES;
+    ApolloApplyTitleTransform(titleControl, desired);
 }
 
 %hook _UINavigationBarTitleControl
