@@ -85,8 +85,8 @@ BOOL ApolloWebJSONShouldStubFlairList(NSURLResponse *response);
 // Recovers the real flair-template list after a cookie-routed flair fetch
 // failed (see ApolloWebJSONShouldStubFlairList): refetches the same path+query
 // from oauth.reddit.com using the session's token_v2 cookie as an OAuth
-// bearer, minting a fresh token via a cookie-authed HTML page load when the
-// stored one has aged out (Reddit only rotates token_v2 on HTML responses).
+// bearer, minting a fresh bearer from the accounts token service
+// (accounts.reddit.com/api/access_token) when the stored one has aged out.
 // Returns the template array Apollo natively parses, or nil when no usable
 // bearer/response could be produced (caller falls back to the empty stub).
 // Synchronous, bounded by short timeouts — background queues only; in
