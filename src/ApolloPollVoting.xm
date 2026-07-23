@@ -4,6 +4,7 @@
 #import "ApolloWebSessionStore.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloState.h"
+#import "ApolloTextureDecls.h"
 #import "UIWindow+Apollo.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -52,17 +53,14 @@ BOOL ApolloPollsFeatureEnabled(void) {
 - (void)setNeedsLayout;
 @end
 
-// MARK: - Minimal Texture (AsyncDisplayKit) forward declarations for the
-// radio-list + Vote button layout injection below. Real Texture headers
-// aren't on the include path, so — mirroring ApolloAISummary.xm/
-// ApolloInlineImages.xm — this declares only the selectors/enums used; the
-// runtime resolves them against Apollo's bundled Texture implementation.
+// MARK: - Radio list + Vote button layout injection (see ApolloTextureDecls.h
+// for the shared Texture forward declarations this and ApolloAISummary.xm
+// both use).
 //
-// Enum values confirmed in Hopper: -[PollNode layoutSpecThatFits:] builds
-// its stack with stackLayoutSpecWithDirection:0x0, i.e. Vertical=0/
-// Horizontal=1. Don't reuse ApolloAISummary.xm's local direction enum here —
-// its values are swapped relative to real Texture, which only works there
-// because it clones an existing stack rather than building one from scratch.
+// Local direction/justifyContent/alignItems enum, deliberately not shared
+// with ApolloAISummary.xm's copy (see ApolloTextureDecls.h) — values
+// confirmed in Hopper: -[PollNode layoutSpecThatFits:] builds its stack with
+// stackLayoutSpecWithDirection:0x0, i.e. Vertical=0/Horizontal=1.
 typedef NS_ENUM(unsigned char, ApolloPollStackDirection) {
     ApolloPollStackDirectionVertical = 0,
     ApolloPollStackDirectionHorizontal = 1,
@@ -78,54 +76,6 @@ typedef NS_ENUM(unsigned char, ApolloPollStackAlignItems) {
     ApolloPollStackAlignItemsCenter = 2,
     ApolloPollStackAlignItemsStretch = 3,
 };
-
-@class ASLayoutSpec, ASStackLayoutSpec, ASInsetLayoutSpec, ASBackgroundLayoutSpec, ASTextNode, ASDisplayNode;
-
-@interface ASDisplayNode : NSObject
-- (void)addSubnode:(ASDisplayNode *)subnode;
-- (ASDisplayNode *)supernode;
-- (void)setNeedsLayout;
-- (void)setNeedsDisplay;
-- (void)invalidateCalculatedLayout;
-- (BOOL)isNodeLoaded;
-- (UIView *)view;
-@property (nonatomic, copy) UIColor *backgroundColor;
-@property (nonatomic) CGFloat cornerRadius;
-@property (nonatomic) BOOL clipsToBounds;
-@end
-
-@interface ASTextNode : ASDisplayNode
-@property (nonatomic, copy) NSAttributedString *attributedText;
-@end
-
-@interface ASLayoutSpec : NSObject
-@property (nullable, nonatomic) NSArray *children;
-@end
-
-@interface ASStackLayoutSpec : ASLayoutSpec
-+ (instancetype)stackLayoutSpecWithDirection:(ApolloPollStackDirection)direction
-                                     spacing:(CGFloat)spacing
-                              justifyContent:(ApolloPollStackJustifyContent)justifyContent
-                                  alignItems:(ApolloPollStackAlignItems)alignItems
-                                    children:(NSArray *)children;
-@end
-
-@interface ASInsetLayoutSpec : ASLayoutSpec
-+ (instancetype)insetLayoutSpecWithInsets:(UIEdgeInsets)insets child:(id)child;
-@end
-
-// Stretches `background` behind `child`'s laid-out size. Needed for the Vote
-// pill: ASInsetLayoutSpec only reserves space in the parent layout, it never
-// grows the child's own frame, so a color set directly on padded text renders
-// tight instead of padded. This is Texture's real pattern for a padded pill
-// (mirrors ApolloAISummary.xm's box background).
-@interface ASBackgroundLayoutSpec : ASLayoutSpec
-+ (instancetype)backgroundLayoutSpecWithChild:(id)child background:(ASDisplayNode *)background;
-@end
-
-// ASSizeRange stand-in (named CDStruct_90e057aa in class-dumped headers) so
-// Logos can hook the by-value struct argument of -layoutSpecThatFits:.
-struct ApolloPollSizeRange { CGSize min; CGSize max; };
 
 // Associated-object keys for the radio-list + Vote button state below.
 static const void *kApolloPollPendingOptionKey = &kApolloPollPendingOptionKey;   // NSString*, on PollNode: not-yet-committed selected option id
@@ -1347,22 +1297,6 @@ static void ApolloPollPresentAccessibilityPicker(id pollNode, RDKLink *link,
 // of use instead, matching how this file already resolves
 // _TtC6Apollo14PollOptionNode elsewhere.
 
-// Baseline-aligned SF Symbol as an attributed string, sized to `font` and
-// tinted `tint` (own copy of ApolloAISummary.xm's ApolloAISymbolAttachment,
-// per this file's preference for self-contained helpers). Returns nil if the
-// symbol can't load, so callers fall back to a plain-text glyph.
-static NSAttributedString *ApolloPollSymbolAttachment(NSString *symbolName, UIFont *font, UIColor *tint) {
-    UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithFont:font];
-    UIImage *image = [UIImage systemImageNamed:symbolName withConfiguration:config];
-    if (!image) return nil;
-    image = [image imageWithTintColor:tint renderingMode:UIImageRenderingModeAlwaysOriginal];
-    NSTextAttachment *attachment = [NSTextAttachment new];
-    attachment.image = image;
-    CGFloat y = (font.capHeight - image.size.height) / 2.0;
-    attachment.bounds = CGRectMake(0, y, image.size.width, image.size.height);
-    return [NSAttributedString attributedStringWithAttachment:attachment];
-}
-
 // -layoutSpecThatFits: can run off the main thread. ApolloThemeAccentColor()
 // is a dynamic provider color, so resolve it against an in-hierarchy view's
 // traitCollection to avoid picking the wrong light/dark variant on a
@@ -1379,7 +1313,7 @@ static UIColor *ApolloPollResolvedAccentColor(ASDisplayNode *node) {
 static NSAttributedString *ApolloPollRadioAttributedText(BOOL selected, UIColor *tint) {
     UIFont *font = [UIFont systemFontOfSize:20.0 weight:UIFontWeightRegular];
     NSString *symbol = selected ? @"largecircle.fill.circle" : @"circle";
-    return ApolloPollSymbolAttachment(symbol, font, tint) ?:
+    return ApolloSymbolAttachment(symbol, font, tint) ?:
         [[NSAttributedString alloc] initWithString:(selected ? @"●" : @"○")
             attributes:@{ NSForegroundColorAttributeName: tint, NSFontAttributeName: font }];
 }
@@ -1532,7 +1466,7 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
 // which still renders PollOptionNode rows even though taps route to %orig.
 // Skip the radio there so a no-longer-votable poll doesn't look selectable.
 %hook _TtC6Apollo14PollOptionNode
-- (id)layoutSpecThatFits:(struct ApolloPollSizeRange)constrainedSize {
+- (id)layoutSpecThatFits:(struct ApolloTextureSizeRange)constrainedSize {
     id originalSpec = %orig;
     if (!ApolloPollsFeatureEnabled()) return originalSpec;
 
@@ -1574,7 +1508,7 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
 // Appends the always-present, disabled-until-selected Vote button below the
 // option/results content — see "Radio list + Vote button" above for the
 // mechanism.
-- (id)layoutSpecThatFits:(struct ApolloPollSizeRange)constrainedSize {
+- (id)layoutSpecThatFits:(struct ApolloTextureSizeRange)constrainedSize {
     id originalSpec = %orig;
     if (!ApolloPollsFeatureEnabled()) return originalSpec;
     RDKPoll *poll = ApolloPollObjectIvar(self, "poll");
