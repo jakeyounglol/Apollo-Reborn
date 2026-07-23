@@ -53,22 +53,16 @@ BOOL ApolloPollsFeatureEnabled(void) {
 @end
 
 // MARK: - Minimal Texture (AsyncDisplayKit) forward declarations for the
-// radio-list + Vote button layout injection (see the PollOptionNode and
-// PollNode -layoutSpecThatFits: hooks further down). Real Texture headers
-// aren't on this build's include path, so — mirroring the existing technique
-// in ApolloAISummary.xm/ApolloInlineImages.xm — this just declares the
-// selectors/enums actually used; the runtime resolves them against Apollo's
-// own bundled Texture implementation.
+// radio-list + Vote button layout injection below. Real Texture headers
+// aren't on the include path, so — mirroring ApolloAISummary.xm/
+// ApolloInlineImages.xm — this declares only the selectors/enums used; the
+// runtime resolves them against Apollo's bundled Texture implementation.
 //
-// Enum values below are confirmed against the compiled binary in Hopper:
-// -[PollNode layoutSpecThatFits:] builds its existing option/results stack
-// with stackLayoutSpecWithDirection:0x0, i.e. Vertical=0/Horizontal=1 — the
-// same ordering ApolloInlineImages.xm's (already-working) declarations use.
-// Do NOT copy ApolloAISummary.xm's local ApolloAIStackDirection enum for a
-// stack built from scratch here: its Horizontal/Vertical values are swapped
-// relative to real Texture, and that file only gets away with it because it
-// merely clones an existing stack's already-correct direction property
-// rather than constructing a fresh spec from the enum's raw values.
+// Enum values confirmed in Hopper: -[PollNode layoutSpecThatFits:] builds
+// its stack with stackLayoutSpecWithDirection:0x0, i.e. Vertical=0/
+// Horizontal=1. Don't reuse ApolloAISummary.xm's local direction enum here —
+// its values are swapped relative to real Texture, which only works there
+// because it clones an existing stack rather than building one from scratch.
 typedef NS_ENUM(unsigned char, ApolloPollStackDirection) {
     ApolloPollStackDirectionVertical = 0,
     ApolloPollStackDirectionHorizontal = 1,
@@ -120,13 +114,11 @@ typedef NS_ENUM(unsigned char, ApolloPollStackAlignItems) {
 + (instancetype)insetLayoutSpecWithInsets:(UIEdgeInsets)insets child:(id)child;
 @end
 
-// Stretches `background` to match `child`'s laid-out size, behind it. Needed
-// for the Vote pill: ASInsetLayoutSpec's insets only reserve empty space in
-// the PARENT layout around a child — they never grow the child's own frame,
-// so a color/cornerRadius set directly on an inset-wrapped ASTextNode renders
-// tight to the text, not padded. Wrapping the padded text in this spec, with
-// a separate plain ASDisplayNode as `background`, is Texture's actual pattern
-// for a padded pill/card (mirrors ApolloAISummary.xm's box background).
+// Stretches `background` behind `child`'s laid-out size. Needed for the Vote
+// pill: ASInsetLayoutSpec only reserves space in the parent layout, it never
+// grows the child's own frame, so a color set directly on padded text renders
+// tight instead of padded. This is Texture's real pattern for a padded pill
+// (mirrors ApolloAISummary.xm's box background).
 @interface ASBackgroundLayoutSpec : ASLayoutSpec
 + (instancetype)backgroundLayoutSpecWithChild:(id)child background:(ASDisplayNode *)background;
 @end
@@ -281,10 +273,9 @@ static UIView *ApolloPollNodeView(id node);
 static void ApolloPollRenderCurrentVote(id pollNode);
 static void ApolloPollScheduleAuthoritativeRefreshes(NSString *postID, NSString *username,
                                                       NSUInteger sequence);
-// Radio-list + Vote button state (defined further down, near their %hook
-// call sites); forward-declared here because ApolloPollBeginVote and
-// ApolloPollRollbackOptimisticVote — both defined earlier in the file — need
-// to clear/refresh the two-step selection UI.
+// Radio-list + Vote button state, defined further down near their %hook
+// sites; forward-declared because ApolloPollBeginVote/RollbackOptimisticVote
+// above need to clear/refresh the two-step selection UI.
 static void ApolloPollSetPendingSelection(id pollNode, NSString *optionID);
 static void ApolloPollRefreshOptionRadios(id pollNode);
 static void ApolloPollRefreshVoteButton(id pollNode);
@@ -1332,45 +1323,34 @@ static void ApolloPollPresentAccessibilityPicker(id pollNode, RDKLink *link,
 
 // MARK: - Radio list + Vote button (deliberate two-step voting)
 //
-// Reddit poll votes are irreversible, so a single tap that immediately casts
-// a vote is replaced, for ordinary touch input, with a two-step interaction:
-// tapping an option only SELECTS it (its radio fills), and a separate "Vote"
-// button — always present below the options, disabled until a selection
-// exists — commits it. The button IS the confirmation step, so no additional
-// "Are you sure?" alert is needed. (The VoiceOver/Switch Control path above,
-// ApolloPollPresentAccessibilityPicker, is left as a direct one-step vote:
-// picking an item from that sheet is already an explicit, deliberate action.)
+// Reddit poll votes are irreversible, so an ordinary tap only SELECTS an
+// option (its radio fills); a separate "Vote" button below the options,
+// disabled until something is selected, commits it — the button itself is
+// the confirmation step, so no extra alert is needed. The VoiceOver/Switch
+// Control path (ApolloPollPresentAccessibilityPicker above) stays one-step:
+// picking from that sheet is already a deliberate, explicit action.
 //
-// Mechanism: mirrors ApolloAISummary.xm's layout-injection pattern. Each
-// hooked -layoutSpecThatFits: below calls %orig, lazily creates+caches its
-// own subnode(s) via addSubnode:, and splices them into the returned spec
-// tree so they occupy real measured space — never an overlay. Because the
-// Vote button is present (albeit disabled) from the very first layout pass,
-// this never needs AISummary's post-display beginUpdates/realize-display
-// remeasure machinery: Texture measures the taller row correctly up front.
-// Live selection changes after a tap are applied by mutating the
-// already-mounted cached nodes directly (ApolloPollRefreshOptionRadios/
-// RefreshVoteButton below) rather than by re-triggering layoutSpecThatFits:
-// a glyph/button-style swap never changes measured size, and Texture does
-// not guarantee that invalidating a parent's calculated layout re-invokes
-// every child's own -layoutSpecThatFits:.
+// Mechanism mirrors ApolloAISummary.xm: each hooked -layoutSpecThatFits:
+// calls %orig, lazily creates+caches its own subnode(s), and splices them
+// into the returned spec tree as real stack children (not an overlay) so
+// Texture measures the taller row correctly from the first layout pass —
+// no post-display remeasure needed. Selection changes afterward mutate the
+// cached nodes directly (ApolloPollRefreshOptionRadios/RefreshVoteButton)
+// rather than re-triggering layout, since a glyph/style swap doesn't change
+// measured size and Texture doesn't guarantee a relayout reaches every child.
 
-// ApolloReborn.dylib is injected into Apollo's process rather than linked
-// against it at build time, so referencing a Texture class directly by name
-// (e.g. [ASStackLayoutSpec ...]) fails at LINK time — no _OBJC_CLASS_$_
-// symbol exists in this build's inputs, even though the class exists once
-// actually loaded into Apollo (confirmed by trying it: `ld: symbol(s) not
-// found ... _OBJC_CLASS_$_ASStackLayoutSpec`). Every Texture class below is
-// therefore resolved via objc_getClass(...) at the point of use instead —
-// matching how this file already resolves _TtC6Apollo14PollOptionNode
-// elsewhere — rather than a dedicated per-class cache: objc_getClass is a
-// cheap runtime hash lookup, called only a handful of times per poll render.
+// ApolloReborn.dylib is injected rather than linked against Apollo, so
+// referencing a Texture class by name (e.g. [ASStackLayoutSpec ...]) fails
+// at LINK time even though the class exists once Apollo actually loads
+// (confirmed: `ld: symbol(s) not found ... _OBJC_CLASS_$_ASStackLayoutSpec`).
+// Every Texture class below is resolved via objc_getClass(...) at the point
+// of use instead, matching how this file already resolves
+// _TtC6Apollo14PollOptionNode elsewhere.
 
-// A baseline-aligned SF Symbol as an attributed string, sized to `font` and
-// tinted `tint`. Mirrors ApolloAISummary.xm's ApolloAISymbolAttachment (kept
-// as its own copy here, per this file's existing preference for
-// self-contained helpers over cross-file sharing). Returns nil if the symbol
-// image can't be loaded so callers can fall back to a plain-text glyph.
+// Baseline-aligned SF Symbol as an attributed string, sized to `font` and
+// tinted `tint` (own copy of ApolloAISummary.xm's ApolloAISymbolAttachment,
+// per this file's preference for self-contained helpers). Returns nil if the
+// symbol can't load, so callers fall back to a plain-text glyph.
 static NSAttributedString *ApolloPollSymbolAttachment(NSString *symbolName, UIFont *font, UIColor *tint) {
     UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithFont:font];
     UIImage *image = [UIImage systemImageNamed:symbolName withConfiguration:config];
@@ -1383,13 +1363,12 @@ static NSAttributedString *ApolloPollSymbolAttachment(NSString *symbolName, UIFo
     return [NSAttributedString attributedStringWithAttachment:attachment];
 }
 
-// -layoutSpecThatFits: can run off the main thread (Texture's whole point).
-// ApolloThemeAccentColor() is a dynamic provider color; resolving it against
-// an in-hierarchy view's traitCollection avoids picking the wrong light/dark
-// variant when ambient trait context is unspecified on a background thread
-// (same pattern as ApolloManualSignInViewController.m/
+// -layoutSpecThatFits: can run off the main thread. ApolloThemeAccentColor()
+// is a dynamic provider color, so resolve it against an in-hierarchy view's
+// traitCollection to avoid picking the wrong light/dark variant on a
+// background thread (same pattern as ApolloManualSignInViewController.m/
 // ApolloLiveCommentsFollow.xm). Only resolves once the node's view already
-// exists — never force-loads a Texture node's view from a background thread.
+// exists — never force-loads it from a background thread.
 static UIColor *ApolloPollResolvedAccentColor(ASDisplayNode *node) {
     UIColor *accent = ApolloThemeAccentColor() ?: UIColor.systemBlueColor;
     BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && node.isNodeLoaded;
@@ -1428,12 +1407,10 @@ static void ApolloPollSetPendingSelection(id pollNode, NSString *optionID) {
                               OBJC_ASSOCIATION_COPY_NONATOMIC);
 }
 
-// Lazily creates (if not already cached under `key` on `host`) a bare
-// ASTextNode, adds it as a subnode of `host`, and caches the reference for
-// next time. `didCreate` (if non-NULL) reports whether this call created a
-// FRESH node vs. returning the already-cached one, so callers can apply
-// one-time initial content without ever stomping state a later refresh
-// (ApolloPollRefreshOptionRadios/RefreshVoteButton) already applied.
+// Lazily creates+caches a bare ASTextNode under `key` on `host` (added via
+// addSubnode:). `didCreate` (if non-NULL) reports whether this call made a
+// fresh node vs. returned the cached one, so callers can set one-time
+// initial content without overwriting a later refresh's state.
 static ASTextNode *ApolloPollEnsureTextNode(ASDisplayNode *host, const void *key, BOOL *didCreate) {
     ASTextNode *node = objc_getAssociatedObject(host, key);
     if (node) {
@@ -1449,13 +1426,10 @@ static ASTextNode *ApolloPollEnsureTextNode(ASDisplayNode *host, const void *key
     return node;
 }
 
-// The leading radio glyph on a PollOptionNode. Called from
-// -[PollOptionNode layoutSpecThatFits:] (structural: only needs to run once
-// per node instance) to splice it into the row's layout; the glyph's
+// The leading radio glyph on a PollOptionNode. Called once per node instance
+// from -[PollOptionNode layoutSpecThatFits:] to splice it into the row;
 // selected/unselected content is refreshed separately, out of band, by
-// ApolloPollRefreshOptionRadios below — never by re-running layout, so the
-// default-unselected content set here on first creation is the only content
-// this function itself ever applies.
+// ApolloPollRefreshOptionRadios — this only ever sets the initial state.
 static ASTextNode *ApolloPollEnsureRadioNode(ASDisplayNode *optionNode) {
     BOOL didCreate = NO;
     ASTextNode *radio = ApolloPollEnsureTextNode(optionNode, kApolloPollRadioNodeKey, &didCreate);
@@ -1465,21 +1439,18 @@ static ASTextNode *ApolloPollEnsureRadioNode(ASDisplayNode *optionNode) {
     return radio;
 }
 
-// The Vote pill's text label. Deliberately carries no background/cornerRadius
-// of its own — see ApolloPollEnsureVoteButtonBackgroundNode below for why a
-// color set directly on this node wouldn't include the padding around it. No
-// default content is set here (unlike the radio above): the PollNode layout
-// hook always calls ApolloPollRefreshVoteButton right before this, on every
-// pass, so there's no "first creation" gap to fill.
+// The Vote pill's text label — no background/cornerRadius of its own (see
+// ApolloPollEnsureVoteButtonBackgroundNode for why). No default content set
+// here either: the PollNode layout hook always calls
+// ApolloPollRefreshVoteButton right before this, on every pass.
 static ASTextNode *ApolloPollEnsureVoteButtonTextNode(ASDisplayNode *pollNode) {
     return ApolloPollEnsureTextNode(pollNode, kApolloPollVoteButtonTextNodeKey, NULL);
 }
 
 // The Vote pill's visual chrome — a plain node stretched (via
-// ASBackgroundLayoutSpec in the PollNode layout hook below) to cover the
-// text node PLUS its surrounding ASInsetLayoutSpec padding. This is also the
-// tap-hit target (ApolloPollTouchHitVoteButton), so the padded area is
-// tappable too, matching how it looks.
+// ASBackgroundLayoutSpec below) to cover the text node plus its padding.
+// Also the tap-hit target (ApolloPollTouchHitVoteButton), so the padded
+// area is tappable, matching how it looks.
 static ASDisplayNode *ApolloPollEnsureVoteButtonBackgroundNode(ASDisplayNode *pollNode) {
     ASDisplayNode *background = objc_getAssociatedObject(pollNode, kApolloPollVoteButtonNodeKey);
     if (background) return background;
@@ -1493,10 +1464,9 @@ static ASDisplayNode *ApolloPollEnsureVoteButtonBackgroundNode(ASDisplayNode *po
     return background;
 }
 
-// Walks a mounted poll's option ROW VIEWS (not the Swift optionNodes array
-// ivar, which is a bridged Array<PollOptionNode> and not safely readable as a
-// plain NSArray from ObjC — see ApolloPollOptionAtPoint above, which already
-// walks the view tree for the same reason). Mirrors its exact recursion shape.
+// Walks a mounted poll's option row VIEWS, not the Swift optionNodes array
+// ivar (a bridged Array<PollOptionNode>, unsafe to read as plain NSArray from
+// ObjC — see ApolloPollOptionAtPoint above). Mirrors its recursion shape.
 static void ApolloPollForEachOptionNode(UIView *containerView, NSUInteger depth,
                                         void (^body)(id optionNode)) {
     Class optionClass = objc_getClass("_TtC6Apollo14PollOptionNode");
@@ -1510,11 +1480,9 @@ static void ApolloPollForEachOptionNode(UIView *containerView, NSUInteger depth,
     }
 }
 
-// Re-derives every option row's radio glyph from the current pending
-// selection. Pure content mutation on already-mounted, fixed-size nodes — no
-// relayout, no beginUpdates: swapping between the "circle"/
-// "largecircle.fill.circle" SF Symbols never changes measured size at a fixed
-// point size.
+// Re-derives every option row's radio glyph from the pending selection.
+// Pure content mutation on already-mounted nodes — no relayout needed, since
+// swapping "circle"/"largecircle.fill.circle" never changes measured size.
 static void ApolloPollRefreshOptionRadios(id pollNode) {
     UIView *pollView = ApolloPollNodeView(pollNode);
     if (!pollView) return;
@@ -1530,12 +1498,10 @@ static void ApolloPollRefreshOptionRadios(id pollNode) {
     });
 }
 
-// Restyles the Vote pill (enabled/accent vs. disabled/dim) from the current
-// pending selection. Same "mutate the mounted nodes directly" approach as the
-// radios, and for the same reason (no size change → no relayout needed): the
-// text/background split doesn't change either node's own measured size,
-// since the background is stretched by the ASBackgroundLayoutSpec in the
-// PollNode layout hook rather than resized here.
+// Restyles the Vote pill (enabled/accent vs. disabled/dim) from the pending
+// selection. Same direct-mutation approach as the radios and for the same
+// reason: the background is stretched by ASBackgroundLayoutSpec in the
+// PollNode layout hook, not resized here, so no relayout is needed.
 static void ApolloPollRefreshVoteButton(id pollNode) {
     ASTextNode *text = ApolloPollEnsureVoteButtonTextNode(pollNode);
     ASDisplayNode *background = ApolloPollEnsureVoteButtonBackgroundNode(pollNode);
@@ -1548,13 +1514,11 @@ static void ApolloPollRefreshVoteButton(id pollNode) {
     [text setNeedsDisplay];
 }
 
-// Hit-test the cached Vote pill's BACKGROUND node frame — that's the node
-// stretched to the full padded pill size (see
-// ApolloPollEnsureVoteButtonBackgroundNode), so the padding is tappable too,
-// not just the tight text. It's a DIRECT subnode of pollNode (added via
-// addSubnode: there), so its view's frame is already expressed in pollNode's
-// own view's coordinate space — the same space ApolloPollOptionAtPoint above
-// already hit-tests option rows in — no coordinate conversion needed.
+// Hit-test the cached Vote pill's background node frame — stretched to the
+// full padded pill (see ApolloPollEnsureVoteButtonBackgroundNode), so the
+// padding is tappable too. It's a direct subnode of pollNode, so its frame
+// is already in pollNode's view's coordinate space, same as
+// ApolloPollOptionAtPoint's option-row hit-testing — no conversion needed.
 static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     ASDisplayNode *background = objc_getAssociatedObject(pollNode, kApolloPollVoteButtonNodeKey);
     BOOL loaded = [background respondsToSelector:@selector(isNodeLoaded)] && background.isNodeLoaded;
@@ -1563,12 +1527,10 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     return CGRectContainsPoint(backgroundView.frame, pointInPollView);
 }
 
-// Injects the leading radio glyph into each unvoted option row. PollResultNode
-// (a separate class) renders voted polls, so PollOptionNode only ever exists
-// for an open, interactive poll — EXCEPT an ended-but-never-voted poll, which
-// Apollo still renders with PollOptionNode rows even though
-// pollNodeTappedWithSender: below routes taps to %orig for it. Skip the radio
-// there so a no-longer-votable poll never shows a selectable-looking control.
+// Injects the leading radio glyph into each unvoted option row. PollOptionNode
+// only exists for an interactive poll — except an ended-but-never-voted poll,
+// which still renders PollOptionNode rows even though taps route to %orig.
+// Skip the radio there so a no-longer-votable poll doesn't look selectable.
 %hook _TtC6Apollo14PollOptionNode
 - (id)layoutSpecThatFits:(struct ApolloPollSizeRange)constrainedSize {
     id originalSpec = %orig;
@@ -1609,11 +1571,9 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     if (card && pollView) pollView.backgroundColor = card;
 }
 
-// Appends the always-present (disabled-until-selected) Vote button below the
-// existing option/results content — see the "Radio list + Vote button"
-// section above for the full mechanism. Splicing it in as a genuine stack
-// child, rather than an overlay, is what makes Texture measure the taller
-// row correctly.
+// Appends the always-present, disabled-until-selected Vote button below the
+// option/results content — see "Radio list + Vote button" above for the
+// mechanism.
 - (id)layoutSpecThatFits:(struct ApolloPollSizeRange)constrainedSize {
     id originalSpec = %orig;
     if (!ApolloPollsFeatureEnabled()) return originalSpec;
@@ -1628,10 +1588,9 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     Class insetClass = objc_getClass("ASInsetLayoutSpec");
     Class backgroundClass = objc_getClass("ASBackgroundLayoutSpec");
     if (!stackClass || !insetClass || !backgroundClass) return originalSpec;
-    // The padded text (foreground) drives the pill's size; the background
-    // node is stretched to match it, so the padding is part of the visible
-    // (and tappable — see ApolloPollTouchHitVoteButton) pill, not empty
-    // space outside it.
+    // The padded text drives the pill's size; the background is stretched to
+    // match, so the padding is part of the visible, tappable pill (see
+    // ApolloPollTouchHitVoteButton), not empty space around it.
     id textInset = [insetClass
         insetLayoutSpecWithInsets:UIEdgeInsetsMake(6, 16, 6, 16) child:text];
     id pill = [backgroundClass backgroundLayoutSpecWithChild:textInset background:background];
@@ -1813,10 +1772,8 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
     UIView *pollView = ApolloPollNodeView(pollNode);
     BOOL hasTouchPoint = ApolloPollConsumeLastTouchPoint(pollNode, &touchPoint) && pollView != nil;
 
-    // Deliberate two-step voting: Reddit poll votes are irreversible, so an
-    // ordinary tap on an option row only SELECTS it (fills its radio); only a
-    // tap on the always-present Vote button commits it. The button IS the
-    // confirmation step — no separate "Are you sure?" alert.
+    // Two-step voting (see "Radio list + Vote button" above): a tap on the
+    // Vote button commits the pending selection.
     if (hasTouchPoint && ApolloPollTouchHitVoteButton(pollNode, touchPoint)) {
         NSString *pendingID = ApolloPollPendingSelection(pollNode);
         RDKPollOption *pendingOption = nil;
@@ -1848,11 +1805,10 @@ static BOOL ApolloPollTouchHitVoteButton(id pollNode, CGPoint pointInPollView) {
         return;
     }
 
-    // The whole legacy PollNode is one control, so Apollo routes taps on
-    // "N Votes · Closes in …" (and any other non-option/non-button area)
-    // through this same action. Only touchless assistive-tech activation
-    // needs an option list; picking an item there is itself a deliberate,
-    // explicit action, so it still votes directly rather than only selecting.
+    // PollNode is one control, so Apollo routes taps on "N Votes · Closes in …"
+    // (and any other non-option/non-button area) through this same action. Only
+    // touchless assistive tech needs the option list below — picking from it is
+    // already a deliberate action, so it still votes directly.
     ApolloPollDiagnosticLog(@" poll action ignored metadata/accessibility path post=%@ link=%@ pollNode=%@",
               link.identifier, ApolloPollPointer(link), ApolloPollPointer(pollNode));
     if (UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning()) {
