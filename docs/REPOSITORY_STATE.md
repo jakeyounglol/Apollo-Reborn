@@ -5,7 +5,7 @@ Updated: 2026-09-15
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
-- Repository: `Thetromboneman1/Apollo-Reborn`
+- Repository: `jakeyounglol/Apollo-Reborn`
 - Default branch: `main`
 - Implementation fingerprint: `5fff15a58eab4932`
 - Maintained documents: 37
