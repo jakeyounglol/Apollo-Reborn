@@ -1,0 +1,36 @@
+name: Workflow lifecycle email
+
+on:
+  workflow_run:
+    workflows:
+      - Boneman Upstream Sync
+      - Build and release IPA variants
+      - Publish distribution sources
+    types:
+      - in_progress
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: workflow-lifecycle-email-${{ github.event.workflow_run.id }}-${{ github.event.action }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Send lifecycle email
+    if: github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send workflow lifecycle email
+        uses: Thetromboneman1/github-actions-lifecycle-email@c639809639bbb890f9337b047a7a31dbf911bf8d
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          phase: ${{ github.event.action == 'in_progress' && 'started' || (github.event.workflow_run.conclusion == 'success' && 'success' || github.event.workflow_run.conclusion == 'cancelled' && 'cancelled' || github.event.workflow_run.conclusion == 'skipped' && 'skipped' || 'failure') }}
+          status: ${{ github.event.action == 'in_progress' && 'started' || github.event.workflow_run.conclusion }}
+          workload-summary: Observed lifecycle transition for the source workflow run.
+          correlation-id: ${{ github.repository }}:${{ github.event.workflow_run.id }}:${{ github.event.workflow_run.run_attempt }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}

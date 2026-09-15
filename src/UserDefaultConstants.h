@@ -295,6 +295,18 @@ static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
 // real iPad build lands. Opt-in; default OFF via registerDefaults. See ApolloIPadTabBarBottom.xm.
 static NSString *const UDKeyIPadTabBarBottom = @"IPadTabBarBottom";
 static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadTabBarBottomChangedNotification";
+// iPad only. When ON, replaces each tab's single navigation stack with a
+// multi-column UISplitViewController: sidebar (the tab's own root list) →
+// content → detail. Opt-in; default OFF via registerDefaults. Installation
+// happens at scene connect, so a change needs a relaunch to apply — the
+// settings row confirms and restarts rather than pretending it is live.
+// Supersedes UDKeyIPadTabBarBottom while active (the floating pill is hidden).
+// See src/ipad/ and docs/ipad-pane-layout-plan.md.
+static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
+// Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
+// dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
+// default OFF via registerDefaults. See ApolloLiquidGlass.xm.
+static NSString *const UDKeyTabBarSwipeNavigation = @"TabBarSwipeNavigation";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill
@@ -659,7 +671,7 @@ static NSString *const UDKeyForwardSwipeForgetAfterScrolling = @"ForwardSwipeFor
 // In the fullscreen viewer for post-backed images, galleries, GIFs, and video,
 // an upward vertical flick or comments-button tap opens a media-owned comments
 // pane. The normal downward flick still dismisses when the pane is closed.
-// Default YES. See ApolloSwipeUpComments.xm. No change notification: the flag
+// Default NO (opt-in). See ApolloSwipeUpComments.xm. No change notification: the flag
 // is read live at gesture/tap time, so a toggle applies immediately without
 // any cached state to invalidate (unlike the carousel above).
 static NSString *const UDKeySwipeUpForComments = @"SwipeUpForComments";
@@ -716,6 +728,22 @@ static NSString *const ApolloLinkPreviewModeDidChangeNotification = @"ApolloLink
 // Posted by the Inline Media settings screen when size/alignment changes so
 // visible comments re-measure their inline media immediately.
 static NSString *const ApolloInlineMediaLayoutDidChangeNotification = @"ApolloInlineMediaLayoutDidChangeNotification";
+
+// Per-menu ••• layouts (Apollo Reborn → Interface → Action Menus): a dictionary
+// keyed by ApolloActionMenuContext id → { "order": [itemID…], "hidden": [itemID…] }.
+// An absent context means Apollo's own order with nothing hidden, and that
+// sheet is never touched. Model and item vocabulary: ApolloActionMenuLayout.h.
+static NSString *const UDKeyActionMenuLayouts = @"ActionMenuLayouts";
+// Whether the Action Menus screen keeps its live preview pinned while the rows
+// scroll beneath it (default YES); tap the card to toggle, like the other
+// pinned-preview screens.
+static NSString *const UDKeyActionMenuPreviewPinned = @"ActionMenuPreviewPinned";
+// Which catalogue items each ••• menu offered the last time it was opened
+// (context id → [itemID…]); written by the menu owner, read by the settings
+// preview so it mirrors this user's menus rather than the whole catalogue.
+static NSString *const UDKeyActionMenuLastPresented = @"ActionMenuLastPresented";
+// Posted (object = the context id) whenever a menu's order or hidden set changes.
+static NSString *const ApolloActionMenuLayoutsChangedNotification = @"ApolloActionMenuLayoutsChangedNotification";
 
 // The last TWEAK_VERSION (without the leading "v") the What's New sheet was
 // shown for (or silently advanced past, when a version has no catalog entry).

@@ -1,3 +1,4 @@
+#import "ipad/ApolloPaneChrome.h"
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
@@ -296,8 +297,9 @@ static void OpenAccountManager(void) {
     UIViewController *profileVC = nil;
     if (tabBarController) {
         for (UIViewController *vc in tabBarController.viewControllers) {
-            if ([vc isKindOfClass:[UINavigationController class]]) {
-                UINavigationController *navController = (UINavigationController *)vc;
+            // Every column: with the iPad pane layout the profile screen can sit
+            // in either the primary or the detail stack.
+            for (UINavigationController *navController in ApolloAllNavigationControllersForTabChild(vc)) {
                 // Search through the entire navigation stack, not just topViewController
                 for (UIViewController *stackVC in navController.viewControllers) {
                     if ([stackVC isMemberOfClass:profileVCClass]) {
@@ -306,7 +308,9 @@ static void OpenAccountManager(void) {
                     }
                 }
                 if (profileVC) break;
-            } else if ([vc isMemberOfClass:profileVCClass]) {
+            }
+            if (profileVC) break;
+            if ([vc isMemberOfClass:profileVCClass]) {
                 profileVC = vc;
                 break;
             }
@@ -346,15 +350,46 @@ static void ApolloHandleAccountTabLongPress(UIView *view, UILongPressGestureReco
     }
 }
 
-// Cancel Liquid Lens gesture recognizer to prevent it interfering with our long-press gesture
-static void ApolloCancelLiquidLensGesture(UITabBar *tabBar) {
+static UIGestureRecognizer *ApolloFindLiquidLensGesture(UITabBar *tabBar) {
     for (UIGestureRecognizer *gesture in tabBar.gestureRecognizers) {
         if ([gesture isKindOfClass:NSClassFromString(@"_UIContinuousSelectionGestureRecognizer")]) {
-            gesture.enabled = NO;
-            gesture.enabled = YES;
-            return;
+            return gesture;
         }
     }
+    return nil;
+}
+
+// Cancel Liquid Lens gesture recognizer to prevent it interfering with our long-press gesture
+static void ApolloCancelLiquidLensGesture(UITabBar *tabBar) {
+    UIGestureRecognizer *liquidLens = ApolloFindLiquidLensGesture(tabBar);
+    if (!liquidLens) return;
+    liquidLens.enabled = NO;
+    liquidLens.enabled = YES;
+}
+
+// Opt-in (sTabBarSwipeNavigation): Apollo's tab-bar swipe-to-navigate and
+// Liquid Glass's native "Liquid Lens" drag-to-switch-tab both arm on the same
+// touch-down + horizontal drag, and Liquid Lens wins by default, silencing
+// Apollo's gesture. Requiring Liquid Lens to fail against Apollo's pan first
+// flips that priority. No public API undoes a `requireGestureRecognizerToFail:`
+// and wiring only happens once per launch, so the setting needs a relaunch.
+static char kApolloTabBarSwipePriorityWiredKey;
+
+static void ApolloPrioritizeSwipeNavigationOverLiquidLens(UITabBarController *tabBarController) {
+    if (!IsLiquidGlass() || !sTabBarSwipeNavigation || !tabBarController) return;
+
+    UITabBar *tabBar = tabBarController.tabBar;
+    if (!tabBar || objc_getAssociatedObject(tabBar, &kApolloTabBarSwipePriorityWiredKey)) return;
+
+    UIGestureRecognizer *liquidLens = ApolloFindLiquidLensGesture(tabBar);
+    if (!liquidLens) return; // not laid out yet; retry on the next viewWillAppear:
+
+    id panGesture = ApolloObjectIvar(tabBarController, "tabBarPanGestureRecognizer");
+    if (![panGesture isKindOfClass:[UIPanGestureRecognizer class]]) return;
+
+    [liquidLens requireGestureRecognizerToFail:panGesture];
+    objc_setAssociatedObject(tabBar, &kApolloTabBarSwipePriorityWiredKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloLog(@"[LiquidGlassTabBar] Wired Liquid Lens to require Apollo's swipe-nav pan to fail first (opt-in)");
 }
 
 @interface _UITabButton : UIView
@@ -455,11 +490,13 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 - (void)viewDidLoad {
     %orig;
     ApolloApplyAdaptiveTabBarAppearance(self.tabBar, @"tabBarController viewDidLoad");
+    ApolloPrioritizeSwipeNavigationOverLiquidLens(self);
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig(animated);
     ApolloApplyAdaptiveTabBarAppearance(self.tabBar, @"tabBarController viewWillAppear:");
+    ApolloPrioritizeSwipeNavigationOverLiquidLens(self);
 }
 
 %end
@@ -1267,7 +1304,8 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
         CGFloat targetAlpha = profileTitleLabel ? profileTitleLabel.alpha : 1.0;
         self.glassView.alpha = targetAlpha;
         [hostView insertSubview:self.glassView atIndex:0];
-        BOOL fadeInstall = self.fadeNextInstall && !ownsTitle;
+        BOOL fadeInstall = self.fadeNextInstall && !ownsTitle &&
+            !UIAccessibilityIsReduceMotionEnabled();
         self.fadeNextInstall = NO;
         if (fadeInstall) {
             UIVisualEffectView *installed = self.glassView;
@@ -1411,6 +1449,12 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(self.titleControl);
+    if (!jumpBar && ApolloPaneUsesUnifiedChrome(self.titleControl)) {
+        [self.glassView removeFromSuperview];
+        self.glassView = nil;
+        self.observationValid = NO;
+        return;
+    }
     UIView *hostView = jumpBar ?: self.titleControl;
 
     if (ApolloNavigationTitleContainsNativeSearchSurface(self.titleControl)) {
@@ -1503,12 +1547,16 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
 
 - (void)scheduleTargetRefreshIfNeeded {
     UIView *titleControl = self.titleControl;
-    if (!titleControl) return;
+    if (!titleControl || self.refreshScheduled) return;
     if (ApolloNavigationTitlePresentationSuppressesControl(titleControl)) {
         if (self.fittedWidthConstraint || self.glassView) [self scheduleTargetRefresh];
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(titleControl);
+    if (!jumpBar && ApolloPaneUsesUnifiedChrome(titleControl)) {
+        if (self.glassView) [self scheduleTargetRefresh];
+        return;
+    }
     BOOL unchanged = self.observationValid &&
         (!self.glassView || (self.glassHostView && self.glassView.superview == self.glassHostView)) &&
         self.preservesNativeSearchLayout == ApolloNavigationTitleContainsNativeSearchSurface(titleControl) &&

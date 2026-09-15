@@ -1,4 +1,5 @@
 #import "ApolloNotificationBackend.h"
+#import "ApolloNotificationBackendPath.h"
 #import "ApolloBarkNotifications.h"
 #if defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
 // The request/configuration code is Foundation-only. Host tests provide the
@@ -100,20 +101,6 @@ static BOOL ApolloPathIsAccountUpsertBulk(NSString *path) {
         && [parts[2] isEqualToString:@"device"]
         && parts[3].length > 0
         && [parts[4] isEqualToString:@"accounts"];
-}
-
-// Match `/v1/live_activities` (Live Activity registration — the backend polls
-// the thread and pushes ActivityKit updates).
-static BOOL ApolloPathIsLiveActivityRegistration(NSString *path) {
-    return [path isEqualToString:@"/v1/live_activities"];
-}
-
-// Endpoints behind REGISTRATION_SECRET on the new backend.
-static BOOL ApolloPathRequiresRegistrationToken(NSString *path) {
-    return ApolloPathIsDeviceRegistration(path)
-        || ApolloPathIsAccountUpsertSingular(path)
-        || ApolloPathIsAccountUpsertBulk(path)
-        || ApolloPathIsLiveActivityRegistration(path);
 }
 
 // MARK: - JSON body augmentation
@@ -238,6 +225,50 @@ static NSData *ApolloAugmentDeviceRegistrationBody(NSData *originalBody) {
 
 // MARK: - Request rewrite
 
+#if !defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
+// ApolloActiveAccountClient deliberately permits only main-thread access: it
+// reads Apollo's live Swift account array without retaining that array's
+// storage. NSURLSession resumes on an internal queue, so cross to main before
+// reading currentUser.identifier and copy only the immutable identifier back.
+static NSString *ApolloActiveNotificationAccountIdentifier(void) {
+    __block NSString *accountIdentifier = nil;
+    void (^resolve)(void) = ^{
+        id client = ApolloActiveAccountClient();
+        if (!client) return;
+
+        id candidate = nil;
+        @try {
+            id currentUser = [client valueForKey:@"currentUser"];
+            candidate = [currentUser valueForKey:@"identifier"];
+        } @catch (__unused NSException *exception) {
+            candidate = nil;
+        }
+        if ([candidate isKindOfClass:[NSString class]]) {
+            accountIdentifier = [candidate copy];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        resolve();
+    } else {
+        // Do not synchronously dispatch back to main from NSURLSession's
+        // `_onqueue_resume`: a future Foundation implementation could have
+        // main waiting for that queue. Bound the hop so this request fails
+        // closed instead of creating a reverse-queue deadlock.
+        dispatch_semaphore_t resolved = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            resolve();
+            dispatch_semaphore_signal(resolved);
+        });
+        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(resolved, deadline) != 0) {
+            return nil;
+        }
+    }
+    return accountIdentifier;
+}
+#endif
+
 NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) {
     if (!request) return nil;
     NSURL *requestURL = request.URL;
@@ -250,7 +281,10 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
     NSDictionary *configuration = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
     NSURL *base = ApolloParseBackendBaseURL(configuration[UDKeyNotificationBackendURL]);
     if (!base) return nil;
-    NSString *registrationToken = ApolloParseRegistrationToken(configuration[UDKeyNotificationBackendRegistrationToken]);
+    // This is a request-local snapshot, despite the historical variable name
+    // retained for the source regression test. It is never shared or cached
+    // across defaults changes.
+    NSString *sCachedRegistrationToken = ApolloParseRegistrationToken(configuration[UDKeyNotificationBackendRegistrationToken]);
 
     NSURLComponents *components = [NSURLComponents componentsWithURL:requestURL resolvingAgainstBaseURL:NO];
     if (!components) return nil;
@@ -264,21 +298,63 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
     components.user = baseComponents.user;
     components.password = baseComponents.password;
 
+    NSString *method = request.HTTPMethod.uppercaseString ?: @"GET";
+
+    // Some native Apollo notification/watcher calls are built while its
+    // temporary account object is empty, producing `/account//`. Repair only
+    // that literal empty component from the active RDKUser identifier. The
+    // pure helper leaves valid and unrelated paths untouched. If it signals
+    // that repair is required, but no valid identifier can be resolved, fail
+    // closed: returning nil lets the existing legacy-host blocklist suppress
+    // the malformed request instead of forwarding it to the self-host.
+#if defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
+    // The host-side configuration stress test compiles this file alone. Path
+    // repair and Apollo's live account lookup have their own focused tests and
+    // are linked normally in tweak builds.
+    BOOL repairedEmptyAccountComponent = NO;
+#else
+    NSString *percentEncodedPath = components.percentEncodedPath ?: @"";
+    NSString *repairedPath = ApolloNotificationBackendPathByRepairingEmptyAccountComponent(
+        percentEncodedPath,
+        method,
+        nil
+    );
+    BOOL repairedEmptyAccountComponent = repairedPath == nil;
+    if (repairedEmptyAccountComponent) {
+        repairedPath = ApolloNotificationBackendPathByRepairingEmptyAccountComponent(
+            percentEncodedPath,
+            method,
+            ApolloActiveNotificationAccountIdentifier()
+        );
+        if (!repairedPath) {
+            ApolloLog(@"[NotifBackend] Blocked malformed account-scoped request: active account identifier unavailable");
+            return nil;
+        }
+        components.percentEncodedPath = repairedPath;
+    }
+#endif
+
     NSURL *rewrittenURL = components.URL;
     if (!rewrittenURL) return nil;
+
+    if (repairedEmptyAccountComponent) {
+        ApolloLog(@"[NotifBackend] Repaired empty account component from the active account");
+    }
 
     NSMutableURLRequest *mutable = [request mutableCopy];
     mutable.URL = rewrittenURL;
 
-    NSString *method = mutable.HTTPMethod.uppercaseString ?: @"GET";
-    NSString *path = requestURL.path ?: @"";
-
-    // Header gate: only POSTs hit the gated handlers, but be defensive.
-    if ([method isEqualToString:@"POST"] && ApolloPathRequiresRegistrationToken(path)) {
-        if (registrationToken.length > 0) {
-            [mutable setValue:registrationToken forHTTPHeaderField:@"X-Registration-Token"];
-        }
+    // A configured backend token authenticates the rewritten backend request,
+    // not a small historical set of registration paths. Attach it before any
+    // method/path-specific compatibility work so DELETE, PATCH, GET, receipt,
+    // and diagnostic requests all keep working when the backend requires it.
+    // Requests that are not rewritten return above unchanged; an unset token
+    // intentionally adds no header.
+    if (sCachedRegistrationToken.length > 0) {
+        [mutable setValue:sCachedRegistrationToken forHTTPHeaderField:@"X-Registration-Token"];
     }
+
+    NSString *path = requestURL.path ?: @"";
 
     // Credential injection for the two account-upsert endpoints. The forked
     // backend's accountRegistrationRequest requires four Reddit OAuth fields
@@ -350,7 +426,7 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
         }
     }
 
-    ApolloLog(@"[NotifBackend] Rewriting %@ %@ -> %@", method, requestURL.absoluteString, rewrittenURL.absoluteString);
+    ApolloLog(@"[NotifBackend] Rewriting configured-backend request (method=%@)", method);
     return [mutable copy];
 }
 

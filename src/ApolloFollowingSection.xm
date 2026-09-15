@@ -680,7 +680,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     sApolloFollowingListVC = (UIViewController *)self;
-    NSInteger native = %orig;
+    NSInteger native = %orig(tableView);
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active) return native;
     return map.hasSyntheticSection ? native + 1 : native;
@@ -688,7 +688,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, section);
     NSInteger nativeSection = ApolloFollowingNativeSectionForVisible(map, section);
     if (nativeSection == kApolloFollowingSyntheticSection) return (NSInteger)map.entries.count;
     if (nativeSection == NSNotFound) return 0;
@@ -708,18 +708,18 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
     if (!nativePath) {
         ApolloLog(@"[FollowingSection] cellForRow: no native path for %ld/%ld", (long)indexPath.section, (long)indexPath.row);
-        return %orig; // fail soft: let Apollo interpret the visible path
+        return %orig(tableView, indexPath); // fail soft: let Apollo interpret the visible path
     }
     return %orig(tableView, nativePath);
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, section);
     NSInteger nativeSection = ApolloFollowingNativeSectionForVisible(map, section);
     if (nativeSection == kApolloFollowingSyntheticSection) {
         if (map.entries.count == 0) return 0.0;
@@ -736,7 +736,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, section);
     NSInteger nativeSection = ApolloFollowingNativeSectionForVisible(map, section);
     if (nativeSection == kApolloFollowingSyntheticSection) {
         if (map.entries.count == 0) return nil;
@@ -763,7 +763,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 }
 
 - (NSArray *)sectionIndexTitlesForTableView:(UITableView *)tableView {
-    NSArray *native = %orig;
+    NSArray *native = %orig(tableView);
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active || native.count < 4) return native;
     // native[0..3] are the four special glyphs, native[4..] the letters.
@@ -783,7 +783,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (NSInteger)tableView:(UITableView *)tableView sectionForSectionIndexTitle:(NSString *)title atIndex:(NSInteger)index {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, title, index);
     // While the remap is engaged this answer is computed directly in visible
     // space rather than via %orig. The native implementation has a
     // preventSectionIndexTitlesFromWorking veto that answers NSNotFound and
@@ -805,7 +805,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
@@ -813,7 +813,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
               (long)indexPath.section, (long)indexPath.row,
               (long)(nativePath ? nativePath.section : -1), (long)(nativePath ? nativePath.row : -1));
     if (!nativePath) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     %orig(tableView, nativePath);
@@ -821,53 +821,53 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 
 - (id)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath, point);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath, point);
     return %orig(tableView, nativePath, point);
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath);
     return %orig(tableView, nativePath);
 }
 
 - (NSInteger)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath);
     return %orig(tableView, nativePath);
 }
 
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath);
     return %orig(tableView, nativePath);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath);
     return %orig(tableView, nativePath);
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(NSInteger)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active) {
-        %orig;
+        %orig(tableView, editingStyle, indexPath);
         return;
     }
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
     if (!nativePath) {
-        %orig;
+        %orig(tableView, editingStyle, indexPath);
         return;
     }
     // Apollo's commit paths end in reloadData (never row animations), so the
@@ -878,12 +878,12 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 - (void)tableView:(UITableView *)tableView willBeginEditingRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
     if (!nativePath) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     %orig(tableView, nativePath);
@@ -892,12 +892,12 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 - (void)tableView:(UITableView *)tableView didEndEditingRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active || !indexPath) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
     if (!nativePath) {
-        %orig;
+        %orig(tableView, indexPath);
         return;
     }
     %orig(tableView, nativePath);
@@ -911,11 +911,11 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     // Favorites need not be the first visible section in a customized list.
     NSInteger section = map.active ? ApolloFollowingNativeSectionForVisible(map, indexPath.section) : indexPath.section;
     if (sSortFavoritesAlphabetically && section == kApolloNativeSectionFavorites) return NO;
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, indexPath);
     NSInteger nativeSection = ApolloFollowingNativeSectionForVisible(map, indexPath.section);
     if (nativeSection == kApolloFollowingSyntheticSection) return map.entries.count > 1;
     NSIndexPath *nativePath = ApolloFollowingNativePathForVisible(map, indexPath);
-    if (!nativePath) return %orig;
+    if (!nativePath) return %orig(tableView, indexPath);
     return %orig(tableView, nativePath);
 }
 
@@ -923,7 +923,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     NSInteger section = map.active ? ApolloFollowingNativeSectionForVisible(map, sourceIndexPath.section) : sourceIndexPath.section;
     if (sSortFavoritesAlphabetically && section == kApolloNativeSectionFavorites) return sourceIndexPath;
-    if (!map.active) return %orig;
+    if (!map.active) return %orig(tableView, sourceIndexPath, proposedDestinationIndexPath);
     NSInteger sourceNativeSection = ApolloFollowingNativeSectionForVisible(map, sourceIndexPath.section);
     if (sourceNativeSection == kApolloFollowingSyntheticSection) {
         // Clamp within the synthetic section.
@@ -933,7 +933,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     }
     NSIndexPath *nativeSource = ApolloFollowingNativePathForVisible(map, sourceIndexPath);
     NSIndexPath *nativeProposed = ApolloFollowingNativePathForVisible(map, proposedDestinationIndexPath);
-    if (!nativeSource || !nativeProposed) return %orig;
+    if (!nativeSource || !nativeProposed) return %orig(tableView, sourceIndexPath, proposedDestinationIndexPath);
     NSIndexPath *nativeResult = %orig(tableView, nativeSource, nativeProposed);
     NSIndexPath *visibleResult = ApolloFollowingVisiblePathForNative(map, nativeResult);
     return visibleResult ?: proposedDestinationIndexPath;
@@ -949,7 +949,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
         return;
     }
     if (!map.active) {
-        %orig;
+        %orig(tableView, fromIndexPath, toIndexPath);
         return;
     }
     NSInteger fromNativeSection = ApolloFollowingNativeSectionForVisible(map, fromIndexPath.section);
@@ -975,7 +975,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     NSIndexPath *nativeFrom = ApolloFollowingNativePathForVisible(map, fromIndexPath);
     NSIndexPath *nativeTo = ApolloFollowingNativePathForVisible(map, toIndexPath);
     if (!nativeFrom || !nativeTo) {
-        %orig;
+        %orig(tableView, fromIndexPath, toIndexPath);
         return;
     }
     %orig(tableView, nativeFrom, nativeTo);
@@ -987,7 +987,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     UITableView *tableView = ApolloFollowingTableViewOf((UIViewController *)self);
     ApolloFollowingMap *map = tableView ? ApolloFollowingActiveMapForTable(tableView) : nil;
     if (!map) {
-        %orig;
+        %orig(sender);
         return;
     }
     sApolloFollowingWindowDepth++;
@@ -995,7 +995,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     sApolloFollowingWindowTappedName = nil;
     NSArray *favorites = [[NSUserDefaults standardUserDefaults] stringArrayForKey:@"FavoriteSubreddits"];
     sApolloFollowingWindowFavorites = [favorites isKindOfClass:[NSArray class]] ? favorites : @[];
-    %orig;
+    %orig(sender);
     if (sApolloFollowingWindowDepth > 0) sApolloFollowingWindowDepth--;
     if (sApolloFollowingWindowDepth == 0) {
         sApolloFollowingWindowTable = nil;
@@ -1011,13 +1011,13 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     // This also applies to the normal layout, where no Following map exists.
     ApolloPerformMultiredditExpansion(tableView, ^{
         if (!map) {
-            %orig;
+            %orig(sender);
             return;
         }
         sApolloFollowingWindowDepth++;
         sApolloFollowingWindowTable = tableView;
         @try {
-            %orig;
+            %orig(sender);
         } @finally {
             if (sApolloFollowingWindowDepth > 0) sApolloFollowingWindowDepth--;
             if (sApolloFollowingWindowDepth == 0) {
@@ -1059,7 +1059,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 }
 
 - (NSIndexPath *)indexPathForRowAtPoint:(CGPoint)point {
-    NSIndexPath *visible = %orig;
+    NSIndexPath *visible = %orig(point);
     void *caller = __builtin_return_address(0);
     BOOL windowActive = sApolloFollowingWindowDepth > 0 && (UITableView *)self == sApolloFollowingWindowTable;
     if (!windowActive && !ApolloFollowingCallerIsApolloBinary(caller)) return visible;
@@ -1085,11 +1085,11 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 // space — UIKit and this tweak's other modules pass visible paths.
 - (UITableViewCell *)cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     void *caller = __builtin_return_address(0);
-    if (!ApolloFollowingCallerIsApolloBinary(caller)) return %orig;
+    if (!ApolloFollowingCallerIsApolloBinary(caller)) return %orig(indexPath);
     ApolloFollowingMap *map = ApolloFollowingActiveMapForTable((UITableView *)self);
-    if (!map || !indexPath) return %orig;
+    if (!map || !indexPath) return %orig(indexPath);
     NSIndexPath *visible = ApolloFollowingVisiblePathForNative(map, indexPath);
-    if (!visible) return %orig;
+    if (!visible) return %orig(indexPath);
     if (visible.section != indexPath.section || visible.row != indexPath.row) {
         ApolloLog(@"[FollowingSection] cell lookup native %ld/%ld -> visible %ld/%ld (caller %p)",
                   (long)indexPath.section, (long)indexPath.row, (long)visible.section, (long)visible.row, caller);
@@ -1130,7 +1130,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     BOOL windowActive = sApolloFollowingWindowDepth > 0 && (UITableView *)self == sApolloFollowingWindowTable;
     ApolloFollowingMap *map = ApolloFollowingPresentedMapForTable((UITableView *)self);
     if (!map) {
-        %orig;
+        %orig(indexPaths, animation);
         return;
     }
     NSMutableArray<NSIndexPath *> *translated = [NSMutableArray arrayWithCapacity:indexPaths.count];
@@ -1171,7 +1171,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 - (void)insertRowsAtIndexPaths:(NSArray<NSIndexPath *> *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
     if (ApolloDeferMultiredditTableUpdate((UITableView *)self)) return;
     if (!ApolloFollowingTableIsList((UITableView *)self)) {
-        %orig;
+        %orig(indexPaths, animation);
         return;
     }
     // Inserts speak the POST-update layout: rebuild from the current model
@@ -1181,7 +1181,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     ApolloFollowingInvalidateMap((UIViewController *)((UITableView *)self).dataSource);
     ApolloFollowingMap *map = ApolloFollowingActiveMapForTable((UITableView *)self);
     if (!map) {
-        %orig;
+        %orig(indexPaths, animation);
         return;
     }
     NSMutableArray<NSIndexPath *> *translated = [NSMutableArray arrayWithCapacity:indexPaths.count];
@@ -1209,12 +1209,12 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
     // windows remain the fallback for Apollo's synchronous star/expand reloads.
     BOOL windowActive = sApolloFollowingWindowDepth > 0 && (UITableView *)self == sApolloFollowingWindowTable;
     if (!windowActive && !ApolloFollowingCallerIsApolloBinary(__builtin_return_address(0))) {
-        %orig;
+        %orig(indexPaths, animation);
         return;
     }
     ApolloFollowingMap *map = ApolloFollowingPresentedMapForTable((UITableView *)self);
     if (!map) {
-        %orig;
+        %orig(indexPaths, animation);
         return;
     }
     NSMutableArray<NSIndexPath *> *translated = [NSMutableArray arrayWithCapacity:indexPaths.count];

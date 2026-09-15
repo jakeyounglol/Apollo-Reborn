@@ -378,3 +378,26 @@ Thank you to these wonderful people:
 </table>
 
 <!-- CONTRIBUTORS-LIST:END -->
+
+## Fork Maintenance
+
+This fork tracks `Apollo-Reborn/Apollo-Reborn`. Upstream changes must use a
+review branch because downstream builds and signing behavior need validation.
+See [repository maintenance](docs/repository-maintenance.md) before syncing.
+
+<!-- documentation-health:start -->
+
+## Current repository state
+
+![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
+
+- **Default branch:** `main`
+- **Implementation fingerprint:** `5fff15a58eab4932`
+- **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
+- **Documentation contract:** editable diagram sources, committed PNG renderings,
+  resolved local image links, and generated state are checked on every commit.
+- **Refresh command:** `python3 scripts/documentation_health.py --write`
+
+See [repository state](docs/REPOSITORY_STATE.md) and the
+[architecture asset guide](docs/architecture/README.md).
+<!-- documentation-health:end -->

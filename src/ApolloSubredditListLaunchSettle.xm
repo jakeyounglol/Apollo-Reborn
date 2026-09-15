@@ -499,11 +499,11 @@ static void ApolloSLDNoteHeaderSuppressed(UIView *header) {
 
 - (void)setContentOffset:(CGPoint)offset {
     if (!sWindowOpen || self != sTrackedTable) {
-        %orig;
+        %orig(offset);
         return;
     }
     CGPoint before = self.contentOffset;
-    %orig;
+    %orig(offset);
     if (fabs(before.y - offset.y) < 0.5) return;
     ApolloSLDLog(@"+%.0fms setContentOffset y %.1f -> %.1f anim(%@) via %@",
                  ApolloSLDElapsedMs(), before.y, offset.y, ApolloSLDAnimationContext(), ApolloSLDCallers());
@@ -513,11 +513,11 @@ static void ApolloSLDNoteHeaderSuppressed(UIView *header) {
 
 - (void)setContentInset:(UIEdgeInsets)inset {
     if (!sWindowOpen || self != sTrackedTable) {
-        %orig;
+        %orig(inset);
         return;
     }
     UIEdgeInsets before = self.contentInset;
-    %orig;
+    %orig(inset);
     if (UIEdgeInsetsEqualToEdgeInsets(before, inset)) return;
     ApolloSLDLog(@"+%.0fms setContentInset %@ -> %@ anim(%@) via %@",
                  ApolloSLDElapsedMs(), ApolloSLDInsets(before), ApolloSLDInsets(inset),
@@ -530,11 +530,11 @@ static void ApolloSLDNoteHeaderSuppressed(UIView *header) {
 // -setContentOffset:, so the offset move can bypass the setter above.
 - (void)setBounds:(CGRect)bounds {
     if (!sWindowOpen || self != sTrackedTable) {
-        %orig;
+        %orig(bounds);
         return;
     }
     CGRect before = self.bounds;
-    %orig;
+    %orig(bounds);
     if (fabs(before.origin.y - bounds.origin.y) < 0.5) return;
     ApolloSLDLog(@"+%.0fms setBounds originY %.1f -> %.1f anim(%@) via %@",
                  ApolloSLDElapsedMs(), before.origin.y, bounds.origin.y,

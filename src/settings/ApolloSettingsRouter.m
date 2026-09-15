@@ -7,6 +7,7 @@
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
 #import "settings/ApolloAISettingsViewController.h"
+#import "settings/ApolloActionMenuSettingsViewController.h"
 #import "settings/ApolloAutomaticBackupViewController.h"
 #import "settings/ApolloDeletedCommentsSettingsViewController.h"
 #import "settings/ApolloLinkPreviewSettingsViewController.h"
@@ -75,6 +76,7 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
         });
         add(@"profile-layout", @"Profile Layout", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloProfileLayoutViewController class]));
         add(@"interface", @"Interface", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloInterfaceSettingsViewController class]));
+        add(@"action-menus", @"Action Menus", @"Apollo Reborn → Features → Interface", ApolloSettingsInsetGrouped([ApolloActionMenuSettingsViewController class]));
         add(@"notification-backend", @"Notification Backend", @"Apollo Reborn → Advanced", ApolloSettingsInsetGrouped([ApolloNotificationBackendViewController class]));
         add(@"automatic-backups", @"Automatic Backups", @"Apollo Reborn → Data", ApolloSettingsInsetGrouped([ApolloAutomaticBackupViewController class]));
         add(@"saved-categories", @"Saved Categories", @"General → Other", ApolloSettingsInsetGrouped([SavedCategoriesViewController class]));
@@ -138,12 +140,12 @@ UIViewController *ApolloSettingsRouteInstantiate(NSString *routeId) {
     return builder ? builder() : nil;
 }
 
-BOOL ApolloSettingsRouteOpenNow(NSString *routeId) {
+BOOL ApolloSettingsRouteOpenNowInScene(NSString *routeId, UIWindowScene *scene) {
     ApolloSettingsRouterEnsureRegistry();
     ApolloSettingsRouteBuilder builder = [routeId isKindOfClass:[NSString class]] ? sRouteBuilders[routeId.lowercaseString] : nil;
     if (!builder) return NO;
 
-    UIViewController *tabBarController = ApolloMainTabBarController();
+    UIViewController *tabBarController = ApolloMainTabBarControllerForScene(scene);
     if (!tabBarController) return NO;
 
     if ([tabBarController respondsToSelector:@selector(goToSettingsTab)]) {
@@ -156,9 +158,8 @@ BOOL ApolloSettingsRouteOpenNow(NSString *routeId) {
 
     if (![tabBarController isKindOfClass:UITabBarController.class]) return NO;
     UIViewController *selected = [(UITabBarController *)tabBarController selectedViewController];
-    UINavigationController *nav = [selected isKindOfClass:UINavigationController.class]
-        ? (UINavigationController *)selected
-        : selected.navigationController;
+    // Unwraps the iPad pane layout's split view controller; identity otherwise.
+    UINavigationController *nav = ApolloNavigationControllerForTabChild(selected);
     if (!nav) return NO;
 
     // A modal over the settings tab (e.g. account switcher) would swallow the
@@ -170,6 +171,10 @@ BOOL ApolloSettingsRouteOpenNow(NSString *routeId) {
     [nav pushViewController:builder() animated:YES];
     ApolloLog(@"[SettingsRouter] Opened route '%@'", routeId);
     return YES;
+}
+
+BOOL ApolloSettingsRouteOpenNow(NSString *routeId) {
+    return ApolloSettingsRouteOpenNowInScene(routeId, nil);
 }
 
 static void ApolloSettingsRouteOpenWithRetry(NSString *routeId, NSUInteger attempt) {

@@ -21,8 +21,11 @@ NSString *ApolloNotificationBackendRegistrationToken(void);
 
 // If `request`'s host is one of the three legacy Apollo push backends AND a
 // backend URL is configured, returns a copy of the request with scheme/host/
-// port replaced by the configured backend. Path, query, method, headers, and
-// body are preserved unchanged. Returns nil if no rewrite is needed.
+// port replaced by the configured backend. A literal empty `/account//`
+// component is repaired from the active Reddit account identifier; if that
+// identifier is unavailable or invalid, the request fails closed. Query,
+// method, headers, and body are otherwise preserved unchanged. Returns nil if
+// no rewrite is needed.
 NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request);
 
 // Fires GET <backendURL>/v1/health with a 5s timeout via the shared session.

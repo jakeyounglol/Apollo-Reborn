@@ -35,6 +35,7 @@
 #import "ApolloWebSessionStore.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloAccountCredentials.h"
+#import "ApolloRecommendedSettingsMigration.h"
 #import "ApolloPerAccountFavorites.h"
 #import "ApolloFavoritesSorting.h"
 #import "crash/ApolloCrashManager.h"
@@ -3729,9 +3730,9 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyShowRecentlyReadThumbnails: @YES,
                                     UDKeyFeedTextPostThumbnails: @YES,
                                     UDKeyFeedGalleryCarousel: @YES,
-                                    UDKeyFeedGalleryEdgeSwipeNav: @NO,
+                                    UDKeyFeedGalleryEdgeSwipeNav: @YES,
                                     UDKeyForwardSwipeForgetAfterScrolling: @NO,
-                                    UDKeySwipeUpForComments: @YES,
+                                    UDKeySwipeUpForComments: @NO,
                                     UDKeySportsClipsInlineVideo: @YES,
                                     UDKeyDevvitInteractivePosts: @NO,
                                     UDKeyDevvitFeedWidgets: @YES,
@@ -3758,6 +3759,7 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyLinkPreviewBodyMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewCommentsMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewPreviewPinned: @YES,
+                                    UDKeyActionMenuPreviewPinned: @YES,
                                     UDKeyLinkPreviewCardColor: @(ApolloLinkPreviewCardColorNeutral),
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
                                     UDKeyCommentLinkHost: @(CommentLinkHostOff),
@@ -3793,6 +3795,8 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyTabBarCollapseSide: @0,
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyIPadTabBarBottom: @NO,
+                                    UDKeyIPadPaneLayout: @NO,
+                                    UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
                                     UDKeyInfoRowTapComments: @YES,
@@ -3854,6 +3858,7 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyRedditClientSecret: @""};
     NSUserDefaults *standardDefaults = [NSUserDefaults standardUserDefaults];
     [standardDefaults registerDefaults:defaultValues];
+    ApolloApplyRecommendedSettingsMigration(standardDefaults);
     sAutomaticBackupsEnabled = [standardDefaults boolForKey:UDKeyAutomaticBackupsEnabled];
     sAutomaticBackupIntervalDays = [standardDefaults integerForKey:UDKeyAutomaticBackupIntervalDays];
     if (![@[@1, @3, @7] containsObject:@(sAutomaticBackupIntervalDays)]) {
@@ -4076,6 +4081,10 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
     sTabBarHideStyle = (ApolloTabBarHideStyle)storedTabBarHideStyle;
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
+    // Read once here: ApolloPaneInstall.xm builds the split controllers during
+    // scene connect, which happens after %ctor and never again for the process.
+    sIPadPaneLayout = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout];
+    sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];
     sInfoRowTapComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapComments];
@@ -4492,7 +4501,16 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
             UITabBarController *tabBarController = (UITabBarController *)mainWindow.rootViewController;
             // Navigate to Settings tab
             tabBarController.selectedViewController = [tabBarController.viewControllers lastObject];
-            UINavigationController *settingsNavController = (UINavigationController *) tabBarController.selectedViewController;
+            // The selected child is the navigation controller in the stock
+            // layout, but a UISplitViewController under the iPad pane layout —
+            // unwrap rather than casting, or this push hits the split
+            // controller and throws.
+            UINavigationController *settingsNavController =
+                ApolloNavigationControllerForTabChild(tabBarController.selectedViewController);
+            if (!settingsNavController) {
+                ApolloLog(@"[Tweak] no navigation controller for the settings tab; skipping Custom API redirect");
+                return;
+            }
 
             // Push Custom API directly
             CustomAPIViewController *vc = [[CustomAPIViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];

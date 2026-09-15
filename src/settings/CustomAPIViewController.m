@@ -29,7 +29,7 @@
 #import "ApolloLinkPreviewShapeMemory.h"
 #import "settings/ApolloDeletedCommentsSettingsViewController.h"
 #import "settings/ApolloLinkPreviewSettingsViewController.h"
-#import "settings/ApolloProfileLayoutViewController.h"
+#import "settings/ApolloLayoutViewController.h"
 #import "ApolloSubredditCustomBannerCache.h"
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloSubredditInfoCache.h"
@@ -56,12 +56,14 @@
 #import "crash/ApolloCrashReportsViewController.h"
 #import "settings/ApolloOpenInAppViewController.h"
 #import "settings/SavedCategoriesViewController.h"
-#import "settings/ApolloSubredditLayoutViewController.h"
 #import "settings/ApolloSubredditSectionsViewController.h"
+#import "ApolloActionMenuLayout.h"
+#import "settings/ApolloActionMenuSettingsViewController.h"
 #import "ApolloFollowingSection.h"
 #import "settings/TranslationSettingsViewController.h"
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
+#import "ipad/ApolloPaneLayout.h"
 
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
@@ -117,8 +119,10 @@ static UIButton *ApolloSettingsMenuButton(NSString *menuTitle,
             ? UIMenuElementStateOn : UIMenuElementStateOff;
         [actions addObject:action];
     }];
+    UIMenuOptions menuOptions = 0;
+    if (@available(iOS 15.0, *)) menuOptions = UIMenuOptionsSingleSelection;
     button.menu = [UIMenu menuWithTitle:menuTitle image:nil identifier:nil
-                                options:UIMenuOptionsSingleSelection children:actions];
+                                options:menuOptions children:actions];
     button.showsMenuAsPrimaryAction = YES;
     button.accessibilityLabel = currentTitle;
     [button sizeToFit];
@@ -144,6 +148,17 @@ static NSInteger sPendingLinkPreviewModeRefreshMode = ApolloLinkPreviewModeFull;
 
 static NSString *const kApolloRebornSubredditName = @"ApolloReborn";
 static char kAboutSubredditIconTaskKey;
+
+static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
+    BOOL desired = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyIPadPaneLayout];
+    BOOL active = ApolloPaneLayoutActive();
+    if (desired != active) {
+        return desired
+            ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
+            : @"Will turn off after Apollo quits and reopens. The current multi-column layout remains active until then.";
+    }
+    return @"Experimental on iPadOS 18+ and iOS 27. Opens detail beside the list when space allows, and returns to one column in narrow windows. Apollo restarts to apply changes.";
+}
 
 @interface ApolloFeedShortcutsPreviewState : NSObject
 @property (nonatomic, copy) NSArray<NSNumber *> *visibleIndexes;
@@ -908,9 +923,9 @@ typedef NS_ENUM(NSInteger, Tag) {
     [self reloadRowWithID:@"interface.hideBarsOnScroll"];
     [self reloadRowWithID:@"interface.hideTopBarToo"];
     [self reloadRowWithID:@"interface.tabBarScrollBehavior"];
-    // Refresh the Profile Layout summary after returning from that screen
-    // (Density/Avatar/band switches may have just changed).
-    [self reloadRowWithID:@"feat.profileLayout"];
+    // Refresh the Layout summaries after returning from that screen.
+    [self reloadRowWithID:@"feat.layout"];
+    [self reloadRowWithID:@"interface.avatarShape"];
     // The Setup section footer (onboarding nudge) collapses once a Reddit key
     // exists, which may have just been entered on the pushed API Keys screen.
     // Section 0 is Setup on the hub; reloading it re-evaluates the footer.
@@ -1032,43 +1047,6 @@ typedef NS_ENUM(NSInteger, Tag) {
                                               rows:@[ themeManager, openInApp, pip, translation, savedCategories, tagFilters, colorFlairs ]];
 }
 
-// Shared plain disclosure-row builder for the hub's navigation rows: title
-// (+ optional status subtitle block, re-evaluated on reload) and a push.
-- (ApolloSettingsRow *)hubDisclosureRowWithID:(NSString *)rowID
-                                        title:(NSString *)title
-                                     subtitle:(NSString * (^)(void))subtitle
-                                         push:(UIViewController * (^)(void))makeVC {
-    __weak typeof(self) weakSelf = self;
-    NSString *reuseID = [@"Cell_Hub_" stringByAppendingString:rowID];
-    return [ApolloSettingsRow customRowWithID:rowID
-                                         cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
-        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
-        if (!cell) {
-            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-            cell.detailTextLabel.numberOfLines = 0;
-            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
-        }
-        cell.textLabel.text = title;
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.text = subtitle ? subtitle() : nil;
-        [weakSelf apollo_applyPrimaryTextColorToCell:cell];
-        return cell;
-    }
-                                     onSelect:^{
-        UIViewController *vc = makeVC();
-        if (!vc) return;
-        if (weakSelf.navigationController) {
-            [weakSelf.navigationController pushViewController:vc animated:YES];
-        } else {
-            UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:vc];
-            [weakSelf presentViewController:navigation animated:YES completion:nil];
-        }
-    }];
-}
-
 - (ApolloSettingsSection *)buildSetupSection {
     ApolloSettingsRow *apiKeys =
         [self hubDisclosureRowWithID:@"setup.apiKeys"
@@ -1085,7 +1063,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (ApolloSettingsSection *)buildFeaturesSection {
-    __weak typeof(self) weakSelf = self;
 
     ApolloSettingsRow *posts =
         [self hubDisclosureRowWithID:@"feat.posts" title:@"Posts & Feeds" subtitle:nil
@@ -1107,12 +1084,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                 push:^UIViewController * {
             return [[ApolloSubredditsSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
-    ApolloSettingsRow *profileLayout =
-        [self hubDisclosureRowWithID:@"feat.profileLayout"
-                               title:@"Profile Layout"
-                            subtitle:^NSString * { return [weakSelf profileLayoutSummaryText]; }
+    ApolloSettingsRow *layout =
+        [self hubDisclosureRowWithID:@"feat.layout"
+                               title:@"Profiles & Subreddits Layout"
+                            subtitle:nil
                                 push:^UIViewController * {
-            return [[ApolloProfileLayoutViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            return [[ApolloLayoutViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
     ApolloSettingsRow *interface_ =
         [self hubDisclosureRowWithID:@"feat.interface" title:@"Interface" subtitle:nil
@@ -1127,15 +1104,15 @@ typedef NS_ENUM(NSInteger, Tag) {
     comments.iconSystemName     = @"text.bubble.fill";            comments.iconTileColor     = [UIColor systemGreenColor];
     media.iconSystemName        = @"play.rectangle.fill";         media.iconTileColor        = [UIColor systemPinkColor];
     subreddits.iconSystemName   = @"person.3.fill";               subreddits.iconTileColor   = [UIColor systemRedColor];
-    profileLayout.iconSystemName = @"person.crop.circle.fill";   profileLayout.iconTileColor = [UIColor systemTealColor];
+    layout.iconSystemName = @"photo.fill.on.rectangle.fill";      layout.iconTileColor       = [UIColor systemTealColor];
     interface_.iconSystemName   = @"slider.horizontal.3";         interface_.iconTileColor   = [UIColor systemPurpleColor];
     linkPreviews.iconSystemName = @"link";                        linkPreviews.iconTileColor = [UIColor systemBlueColor];
     polls.iconSystemName        = @"chart.bar.fill";              polls.iconTileColor        = [UIColor systemYellowColor];
     apolloAI.iconSystemName     = @"sparkles";                    apolloAI.iconTileColor     = [UIColor systemIndigoColor];
 
     return [ApolloSettingsSection sectionWithTitle:@"Features"
-                                            footer:@"Fine-tune posts, comments, media, subreddits, profile layout and the interface."
-                                              rows:@[ posts, comments, media, subreddits, profileLayout, interface_,
+                                            footer:nil
+                                              rows:@[ posts, comments, media, subreddits, layout, interface_,
                                                       linkPreviews, polls, apolloAI ]];
 }
 
@@ -1745,10 +1722,15 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf feedVideoScrubberSwitchToggled:sender]; }];
 
     ApolloSettingsRow *forwardSwipeForget =
-        [ApolloSettingsRow switchRowWithID:@"gen.forwardSwipeForget"
-                                     title:@"Forget Forward Swipe After Scrolling"
-                                      isOn:^BOOL { return sForwardSwipeForgetAfterScrolling; }
-                                  onToggle:^(UISwitch *sender) { [weakSelf forwardSwipeForgetSwitchToggled:sender]; }];
+        [ApolloSettingsRow customRowWithID:@"gen.forwardSwipeForget"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_Gen_ForwardSwipeForget"
+                                                label:@"Forget Forward Swipe After Scrolling"
+                                               detail:@"Prevents an accidental forward swipe from reopening a post after you scroll several rows away."
+                                                   on:sForwardSwipeForgetAfterScrolling
+                                               action:@selector(forwardSwipeForgetSwitchToggled:)];
+        }
+                                  onSelect:nil];
 
     ApolloSettingsRow *blockAnnouncements =
         [ApolloSettingsRow switchRowWithID:@"gen.blockAnnouncements"
@@ -1778,7 +1760,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments."
+                                             footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments."
                                               rows:@[ textPostThumbnails, infoRow, feedScrubber, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
 }
 
@@ -1912,18 +1894,57 @@ typedef NS_ENUM(NSInteger, Tag) {
                                      title:@"Move Tab Bar to Bottom"
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf iPadTabBarBottomSwitchToggled:sender]; }];
+    // Meaningless once the pane layout hides the floating pill entirely.
     iPadTabBarBottom.visible = ^BOOL {
-        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && IsLiquidGlass();
+        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && IsLiquidGlass() &&
+               !ApolloPaneLayoutActive();
     };
+
+    // See ApolloLiquidGlass.xm — either/or with drag-to-switch-tab.
+    ApolloSettingsRow *tabBarSwipeNavigation =
+        [ApolloSettingsRow switchRowWithID:@"gen.tabBarSwipeNavigation"
+                                     title:@"Swipe Tab Bar to Navigate"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf tabBarSwipeNavigationSwitchToggled:sender]; }];
+    tabBarSwipeNavigation.visible = ^BOOL { return IsLiquidGlass(); };
 
     NSString *footer = ApolloSupportsNativeTabBarScrollBehavior()
         ? @"After the tab bar reappears, Two-Gesture hides it on the second downward gesture; Classic hides it on the first. Both re-expand after 30 seconds of inactivity."
         : @"Hide Bars on Scroll uses the classic on/off behavior on this version of iOS.";
+    if (IsLiquidGlass()) {
+        footer = [footer stringByAppendingString:@"\n\nSwipe Tab Bar to Navigate disables the native drag-to-switch-tab gesture."];
+    }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
                                               rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
                                                       hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
-                                                      iPadTabBarBottom ]];
+                                                      iPadTabBarBottom, tabBarSwipeNavigation ]];
+}
+
+// Interface → Menus: the ••• menus' item order and visibility live on their own
+// screen (ApolloActionMenuSettingsViewController); the hub row summarises how
+// many menus differ from Apollo's default.
+- (NSString *)actionMenusSummaryText {
+    NSMutableArray<NSString *> *customized = [NSMutableArray array];
+    for (ApolloActionMenuContext context in ApolloActionMenuAllContexts()) {
+        if (ApolloActionMenuContextIsCustomized(context)) [customized addObject:ApolloActionMenuContextTitle(context)];
+    }
+    if (customized.count == 0) return @"Default";
+    return [NSString stringWithFormat:@"Customized: %@", [customized componentsJoinedByString:@", "]];
+}
+
+- (ApolloSettingsSection *)buildInterfaceMenusSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *actionMenus =
+        [self hubDisclosureRowWithID:@"interface.actionMenus"
+                               title:@"Action Menus"
+                            subtitle:^NSString * { return [weakSelf actionMenusSummaryText]; }
+                                push:^UIViewController * {
+            return [[ApolloActionMenuSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    return [ApolloSettingsSection sectionWithTitle:@"Menus"
+                                            footer:@"Reorder or hide the items in the ••• menus of feeds, posts and comments."
+                                              rows:@[ actionMenus ]];
 }
 
 - (ApolloSettingsSection *)buildInterfaceDisplayNavigationSection {
@@ -1935,8 +1956,38 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf userAvatarsSwitchToggled:sender]; }];
 
+    ApolloSettingsRow *avatarShape =
+        [ApolloSettingsRow valueRowWithID:@"interface.avatarShape"
+                                    title:@"Profile Picture Shape"
+                                   detail:^NSString * { return [weakSelf profilePictureShapeText]; }
+                                 onSelect:^{
+            [weakSelf presentProfilePictureShapePickerFromSourceView:
+                [weakSelf cellForRowID:@"interface.avatarShape"]];
+        }];
+    avatarShape.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
     // "Color Flairs" now rides Appearance → Flair (native injection) —
     // -flairColorsSwitchToggled: below stays as the shared toggle handler.
+
+    // Keep the opt-in visible even in a narrow supported phone window. The
+    // saved choice is read on launch; resizing then adapts the same hierarchy.
+    ApolloSettingsRow *iPadPaneLayout =
+        [ApolloSettingsRow customRowWithID:@"gen.iPadPaneLayout"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf switchCellWithIdentifier:@"Cell_Gen_IPadPaneLayout"
+                                                                 label:@"Multi-Column Layout (Experimental)"
+                                                                detail:ApolloIPadPaneLayoutSettingDetail()
+                                                                    on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout]
+                                                               enabled:YES
+                                                                action:@selector(iPadPaneLayoutSwitchToggled:)];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+    iPadPaneLayout.visible = ^BOOL {
+        return ApolloPaneLayoutSupported();
+    };
 
     // Overrides the top scroll-edge glass under the nav bar (iOS 26+). Liquid
     // Glass only — hidden otherwise rather than shown-disabled, since the row
@@ -2001,8 +2052,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     centerBetween.visible = ^BOOL { return IsLiquidGlass() && !sCollapseNavigationActions; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
-                                            footer:@"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Liquid Glass is required for the remaining options.\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."
-                                              rows:@[ userAvatars, scrollReturnButton, collapseActions, centerBetween, scrollEdgeEffect ]];
+                                            footer:@"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows. Liquid Glass is required for the remaining options.\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."
+                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
@@ -2242,7 +2293,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) { [weakSelf swipeUpCommentsSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Browsing"
-                                            footer:@"Swipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: keep swiping at the first or last image to go back or forward a page instead of bouncing. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media."
+                                            footer:@"Swipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: keep swiping at the first or last image to go back or forward a page instead of bouncing. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media. Off by default."
                                               rows:@[ feedGalleries, edgeSwipeNav, swipeComments ]];
 }
 
@@ -2429,26 +2480,33 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                               rows:@[ proxyImgur, albumFallback ]];
 }
 
-- (NSString *)profileLayoutSummaryText {
-    if (!sShowDetailedProfiles) return @"Native (Apollo)";
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    [parts addObject:sProfileHeaderImmersive ? @"Immersive" : @"Compact"];
+- (NSString *)profilePictureShapeText {
     switch (sProfileAvatarStyle) {
-        case 1:  [parts addObject:@"Circle"]; break;
-        case 2:  [parts addObject:@"Square"]; break;
-        default: [parts addObject:@"Full"]; break;
+        case 1:  return @"Circle";
+        case 2:  return @"Square";
+        default: return @"Full";
     }
-    NSInteger hiddenCount = (!sProfileShowBanner ? 1 : 0)
-        + (!sProfileShowStatCards ? 1 : 0)
-        + (!sProfileShowSocialLinks ? 1 : 0)
-        + (!sBadgeBookEnabled ? 1 : 0)
-        + (!sProfileShowActions ? 1 : 0);
-    if (hiddenCount > 0) {
-        [parts addObject:[NSString stringWithFormat:@"%ld hidden", (long)hiddenCount]];
-    }
-    return [parts componentsJoinedByString:@" · "];
 }
 
+- (void)presentProfilePictureShapePickerFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Profile Picture Shape",
+                                @[@"Full", @"Circle", @"Square"],
+                                sProfileAvatarStyle, ^(NSInteger pickedIndex) {
+        if (pickedIndex < 0 || pickedIndex > 2) return;
+        sProfileAvatarStyle = pickedIndex;
+        [[NSUserDefaults standardUserDefaults] setInteger:pickedIndex
+                                                   forKey:UDKeyProfileAvatarStyle];
+        [weakSelf reloadRowWithID:@"interface.avatarShape"];
+        [weakSelf reloadRowWithID:@"feat.layout"];
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"ApolloUserAvatarsToggleChangedNotification"
+                          object:@"ApolloProfileAvatarStyleChanged"];
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification"
+                          object:nil];
+    });
+}
 // Subreddits group screen (ApolloSubredditsSettingsViewController), two
 // sections: the list/browsing toggles and the custom Sources.
 - (ApolloSettingsSection *)buildSubredditsMainSection {
@@ -2466,14 +2524,6 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
         }];
 
-    ApolloSettingsRow *subredditLayout =
-        [self hubDisclosureRowWithID:@"sub.layout"
-                                title:@"Subreddit Layout"
-                             subtitle:^NSString * { return [weakSelf subredditLayoutSummaryText]; }
-                                 push:^UIViewController * {
-            return [[ApolloSubredditLayoutViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
-        }];
-
     // Pushes the dedicated Subreddit Sections screen: the FOLLOWING section
     // for followed users, drag-to-reorder for the special sections, and a
     // live preview of the list layout (see ApolloSubredditSectionsViewController).
@@ -2486,8 +2536,8 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         }];
 
     return [ApolloSettingsSection sectionWithTitle:nil
-                                            footer:@"Feed Shortcuts customizes the Home, Popular, All and Moderator Posts rows — their icons, layout, visibility and descriptions. Subreddit Sections arranges the rest of the subreddit list — section order, followed users, multireddit descriptions and the list style toggles live there. Subreddit Layout customizes subreddit pages."
-                                              rows:@[ feedShortcuts, subredditSections, subredditLayout ]];
+                                            footer:@"Feed Shortcuts customizes the Home, Popular, All and Moderator Posts rows — their icons, layout, visibility and descriptions. Subreddit Sections arranges the rest of the subreddit list — section order, followed users, multireddit descriptions and the list style toggles live there."
+                                              rows:@[ feedShortcuts, subredditSections ]];
 }
 
 - (ApolloSettingsSection *)buildFeedShortcutsVisibilitySection {
@@ -2660,24 +2710,6 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     return [ApolloSettingsSection sectionWithTitle:@"Favorites"
                                             footer:@"Per-Account Favorites saves a separate list and sorting preference for each account. First enable copies the current list to existing accounts; new accounts start empty. Turning it off restores the shared list.\nAlphabetical sorting keeps existing and new favorites in order. Turn it off to rearrange them manually while editing the subreddit list."
                                               rows:@[ perAccountFavorites, sortFavoritesAlphabetically ]];
-}
-
-- (NSString *)subredditLayoutSummaryText {
-    if (!sShowSubredditHeaders) return @"Native";
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    [parts addObject:sSubredditHeaderImmersive ? @"Immersive" : @"Compact"];
-    NSMutableArray<NSString *> *hidden = [NSMutableArray array];
-    if (!sSubredditShowBanner) [hidden addObject:@"Banner"];
-    if (!sSubredditShowJoinButton) [hidden addObject:@"Join Button"];
-    if (!sSubredditShowUserFlairButton) [hidden addObject:@"User Flair Button"];
-    if (!sSubredditShowSidebarButton) [hidden addObject:@"Sidebar Button"];
-    if (!sSubredditShowDisplayName) [hidden addObject:@"Subreddit Name"];
-    if (!sSubredditShowSubtitle) [hidden addObject:@"Subtitle"];
-    if (!sSubredditShowDescription) [hidden addObject:@"Description"];
-    if (hidden.count > 0) {
-        [parts addObject:[NSString stringWithFormat:@"%@ off", [hidden componentsJoinedByString:@", "]]];
-    }
-    return [parts componentsJoinedByString:@" · "];
 }
 
 - (ApolloSettingsSection *)buildSubredditsSourcesSection {
@@ -4197,6 +4229,53 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
 }
 
+// The split controllers are built during scene connect, which already happened
+// for this process, so there is no live path — quit & reopen is the honest
+// option. The default is written FIRST so the choice survives either way: quit
+// now, or next time the user relaunches for any reason. `sIPadPaneLayout` is
+// deliberately NOT updated here — it must keep describing the layout this
+// process actually installed, or every module that gates on it starts lying.
+- (void)iPadPaneLayoutSwitchToggled:(UISwitch *)sender {
+    BOOL on = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyIPadPaneLayout];
+    // Dependent rows describe the hierarchy that is active in THIS process,
+    // while this switch and its pending subtitle describe the saved choice.
+    [self visibilityDidChange];
+    [self reloadRowWithID:@"gen.iPadPaneLayout"];
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Restart to Apply"
+                         message:on
+            ? @"The multi-column layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
+            : @"Apollo needs to quit and reopen to return to the single-column layout."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        exit(0);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Later"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// Takes effect on next relaunch — see ApolloLiquidGlass.xm.
+- (void)tabBarSwipeNavigationSwitchToggled:(UISwitch *)sender {
+    sTabBarSwipeNavigation = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sTabBarSwipeNavigation forKey:UDKeyTabBarSwipeNavigation];
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Restart Required"
+                         message:@"Quit and reopen Apollo for this change to take effect."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit & Reopen"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { exit(0); }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)proxyImgurDDGSwitchToggled:(UISwitch *)sender {
     sProxyImgurDDG = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sProxyImgurDDG forKey:UDKeyProxyImgurDDG];
@@ -4959,7 +5038,13 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
 - (NSString *)apollo_screenTitle { return @"Interface"; }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildInterfaceTabBarSection],
-              [self buildInterfaceDisplayNavigationSection] ];
+              [self buildInterfaceDisplayNavigationSection],
+              [self buildInterfaceMenusSection] ];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // Refresh the Action Menus summary after returning from that screen.
+    [self reloadRowWithID:@"interface.actionMenus"];
 }
 @end
 

@@ -218,11 +218,11 @@ maximumResponseTokens:(NSInteger)maximumResponseTokens
         [messages addObject:@{@"role": @"system", @"content": instructions}];
     }
     [messages addObject:@{@"role": @"user", @"content": text ?: @""}];
-    // Reasoning/thinking tokens count against max_tokens on both OpenRouter and
+    // Reasoning/thinking tokens count against the completion-token cap on both OpenRouter and
     // Gemini, so the caller's ~80-110-token visible-summary budget starves any
     // thinking model: it burns the whole cap reasoning and the actual summary
     // arrives empty ("In 1") or truncated mid-thought. The prompt instructions
-    // are what bound the visible length; max_tokens is only a runaway cap, so
+    // are what bound the visible length; the token field is only a runaway cap, so
     // give it generous headroom. Custom gets a smaller cap: local servers
     // (Ollama / llama.cpp / vLLM) reject prompt+max_tokens beyond the loaded
     // model's context window, and 2k stays inside even a 4k-context model.
@@ -232,9 +232,16 @@ maximumResponseTokens:(NSInteger)maximumResponseTokens
     NSMutableDictionary *payload = [NSMutableDictionary dictionaryWithDictionary:@{
         @"model": model,
         @"messages": messages,
-        @"max_completion_tokens": @(tokenBudget),
         @"stream": @YES,
     }];
+    // OpenAI's newer Chat Completions models reject the deprecated max_tokens
+    // field and require max_completion_tokens (#801 / upstream PR #890). Keep
+    // max_tokens everywhere else: the Custom provider intentionally covers local
+    // OpenAI-compatible servers such as oMLX, llama.cpp, Ollama, and vLLM, and a
+    // blanket rename would turn an OpenAI compatibility fix into a regression for
+    // endpoints that only implement the established field.
+    BOOL isOpenAIEndpoint = [[endpoint.host lowercaseString] isEqualToString:@"api.openai.com"];
+    payload[isOpenAIEndpoint ? @"max_completion_tokens" : @"max_tokens"] = @(tokenBudget);
     if ([sAISummaryProvider isEqualToString:@"openrouter"]) {
         // Keep reasoning out of the response entirely: some hosts (notably free
         // tiers) otherwise stream chain-of-thought as ordinary content deltas.

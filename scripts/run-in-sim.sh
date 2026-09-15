@@ -38,6 +38,9 @@
 #     Contents/SharedFrameworks/. Xcode.app's bundle can't be patched (write-protected),
 #     so for now drive taps manually in Device Hub until idb_companion ships a fix.
 #
+# --resizable: opt the cached Apollo shell into iOS 27 continuous resizing.
+# Enable Multi-Column Layout in Settings separately; this flag never sets it.
+#
 # Env overrides:
 #   BASE_IPA (./apollo-base.ipa)  BUNDLE_ID (com.christianselig.Apollo)
 #   SIM_NAME (Apollo-Sim)  SIM_DEVICE_TYPE (iPhone 16 Pro)  SIM_RUNTIME (newest iOS)
@@ -60,6 +63,7 @@ APP_GROUP_SUITE="group.com.christianselig.apollo"   # tweak hardcodes this regar
 BACKUP_ZIP="${BACKUP_ZIP:-}"
 APPEARANCE="${APPEARANCE:-}"
 GLASS="${GLASS:-0}"
+RESIZABLE_APP=0
 
 DO_BUILD=1; FRESH_APP=0; DO_LOGS=0; DO_DRIVE=0
 while [[ $# -gt 0 ]]; do
@@ -70,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --drive)      DO_DRIVE=1 ;;
         --dark)       APPEARANCE=dark ;;
         --light)      APPEARANCE=light ;;
+        --resizable)  RESIZABLE_APP=1 ;;
         --glass)      GLASS=1 ;;
         --no-glass)   GLASS=0 ;;
         --backup)     BACKUP_ZIP="${2:-}"; shift ;;
@@ -79,6 +84,8 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+# SDK 27 also opts into modern chrome; use the canonical Glass preparation.
+if [[ "$RESIZABLE_APP" == 1 ]]; then GLASS=1; fi
 # Convention: if no backup was named, auto-load ./.sim/backup.zip when present, so
 # agents/devs can drop a settings backup there once and have it preloaded on every
 # run. (./.sim/ is gitignored; a backup zip carries live credentials — never commit
@@ -174,6 +181,9 @@ fi
 # >= 19.0 (iOS 26) means glass is on.
 if [[ -f "$APP_DIR/Apollo" ]]; then
     CACHED_SDK_MAJOR="$(vtool -show-build "$APP_DIR/Apollo" 2>/dev/null | awk '/sdk/{split($2,v,"."); print v[1]}')"
+    CACHED_RESIZABLE=0
+    [[ -n "$CACHED_SDK_MAJOR" && "$CACHED_SDK_MAJOR" -ge 27 ]] && CACHED_RESIZABLE=1
+    if [[ "$CACHED_RESIZABLE" != "$RESIZABLE_APP" ]]; then FRESH_APP=1; fi
     CACHED_GLASS=0; [[ -n "$CACHED_SDK_MAJOR" && "$CACHED_SDK_MAJOR" -ge 19 ]] && CACHED_GLASS=1
     if [[ "$CACHED_GLASS" != "$GLASS" ]]; then
         log "Requested glass=$GLASS differs from prepared glass=$CACHED_GLASS — re-preparing app"
@@ -183,6 +193,11 @@ fi
 
 if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
     [[ -f "$BASE_IPA" ]] || die "base IPA not found at $BASE_IPA (set BASE_IPA=...)"
+    if [[ "$RESIZABLE_APP" == 1 ]]; then
+        # A resizable run will feed this archive through multiple mutation
+        # helpers. Reject unsafe members before patch.sh performs any extraction.
+        python3 scripts/validate-resizable-ipa.py "$BASE_IPA"
+    fi
 
     # With --glass, prep from a Liquid-Glass-patched base produced by the canonical
     # patch.sh --liquid-glass (SDK bump to iOS 26 + duplicate-LC_RPATH fix + Assets.car
@@ -199,6 +214,11 @@ if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
     fi
 
     log "Preparing simulator app shell from $SRC_IPA (one-time; re-run with --fresh-app to redo)"
+    if [[ "$RESIZABLE_APP" == 1 ]]; then
+        # Validate the generated or cached Glass IPA independently before this
+        # extraction; a stale cache is not trusted merely because the base passed.
+        python3 scripts/validate-resizable-ipa.py "$SRC_IPA"
+    fi
     rm -rf "$WORK_DIR/Payload"
     unzip -q "$SRC_IPA" 'Payload/*' -d "$WORK_DIR"
     [[ -d "$APP_DIR" ]] || die "extracted IPA has no Payload/Apollo.app"
@@ -211,7 +231,14 @@ if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
     # (not LC_BUILD_VERSION), so the platform patcher below can't flip it to
     # Simulator; dyld_sim hard-fails resolving its rootless-path dependency and
     # SIGABRTs the whole app at launch. Strip both before patching.
-    rm -rf "$APP_DIR/Frameworks/ApolloImprovedCustomApi.dylib" "$APP_DIR/Frameworks/CydiaSubstrate.framework"
+    # Official 3.7.1 IPAs use ApolloReborn.dylib rather than the old name.
+    # These are weak loads; remove every bundled device-only tweak dependency
+    # so this run loads only the freshly built simulator dylib.
+    rm -rf "$APP_DIR/Frameworks/ApolloImprovedCustomApi.dylib" \
+           "$APP_DIR/Frameworks/ApolloReborn.dylib" \
+           "$APP_DIR/Frameworks/ApolloOpenInFix.dylib" \
+           "$APP_DIR/Frameworks/libFLEX.dylib" \
+           "$APP_DIR/Frameworks/CydiaSubstrate.framework"
 
     write_patcher
     # Patch every Mach-O in the bundle (main binary + appex + frameworks).
@@ -261,6 +288,11 @@ if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
     codesign -f -s - "$APP_DIR" >/dev/null 2>&1
 fi
 
+if [[ "$RESIZABLE_APP" == 1 ]]; then
+    python3 scripts/prepare-resizable-app.py "$APP_DIR"
+    codesign -f -s - "$APP_DIR" >/dev/null 2>&1
+fi
+
 # Stage the tweak's resource bundle inside the app so ApolloBundledResourcePath()
 # resolves (<App>.app/ApolloReborn.bundle/). Cheap; refresh every run.
 if [[ -n "$BUNDLE_SRC" ]]; then
@@ -304,6 +336,42 @@ fi
 # next launch instead of being shadowed by stale cached values.
 if [[ -n "$BACKUP_ZIP" ]]; then
     xcrun simctl uninstall "$DEV" "$BUNDLE_ID" >/dev/null 2>&1 || true
+fi
+
+# ----------------------------------------------------------------------------
+# 3b. Bake the tweak into the app bundle so it survives a cold launch.
+# ----------------------------------------------------------------------------
+# DYLD_INSERT_LIBRARIES (via SIMCTL_CHILD_) only applies to the single process
+# `simctl launch` spawns — environment variables belong to a process, not to an
+# app. Quitting Apollo and reopening it from the home screen therefore used to
+# give you stock Apollo with the tweak silently absent, which is easy to mistake
+# for "my change did nothing".
+#
+# So install it properly instead: drop the dylib into Frameworks/ (already an
+# rpath, and already signed as nested code) and add a real LC_LOAD_DYLIB to the
+# main binary. Then dyld loads it however the app is started — icon tap, cold
+# boot, or this script — which also matches how the device build behaves.
+#
+# The load command only needs adding once and the helper is idempotent, but the
+# dylib file itself is replaced on every run, so the app is re-signed each time.
+INJECTED=0
+BAKED_DYLIB="$APP_DIR/Frameworks/ApolloReborn.dylib"
+if cp "$DYLIB_DST" "$BAKED_DYLIB" 2>/dev/null; then
+    install_name_tool -id "@rpath/ApolloReborn.dylib" "$BAKED_DYLIB" 2>/dev/null || true
+    codesign -f -s - "$BAKED_DYLIB" >/dev/null 2>&1
+    if python3 "$(dirname "$0")/macho-add-load-dylib.py" \
+            "$APP_DIR/Apollo" "@rpath/ApolloReborn.dylib"; then
+        codesign -f -s - "$APP_DIR" >/dev/null 2>&1
+        INJECTED=1
+    fi
+fi
+
+if [[ "$INJECTED" != 1 ]]; then
+    # Not fatal: fall back to the old per-launch injection so the script still
+    # works, but say so, because the difference is invisible until you quit the
+    # app and wonder where the tweak went.
+    echo "  (could not bake the dylib into the bundle; falling back to per-launch" >&2
+    echo "   injection — the tweak will NOT survive quitting and reopening Apollo)" >&2
 fi
 
 log "Installing app"
@@ -358,12 +426,30 @@ if [[ "$DO_LOGS" == 1 ]]; then
     LOG_PID="$(cat "$WORK_DIR/logpid" 2>/dev/null || true)"
 fi
 
-log "Launching $BUNDLE_ID with ApolloReborn.dylib injected"
-DYLIB_INJECT="/tmp/ApolloRebornSim-${BUNDLE_ID//[^A-Za-z0-9_.-]/_}.dylib"
-cp "$DYLIB_DST" "$DYLIB_INJECT"
-codesign -f -s - "$DYLIB_INJECT" >/dev/null 2>&1
-SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$DYLIB_INJECT" \
+if [[ "$INJECTED" == 1 ]]; then
+    # The load command does the work; injecting as well would load the dylib
+    # twice in one process and run every %ctor twice, double-installing hooks.
+    log "Launching $BUNDLE_ID (tweak linked into the bundle)"
     xcrun simctl launch "$DEV" "$BUNDLE_ID"
+else
+    log "Launching $BUNDLE_ID with ApolloReborn.dylib injected"
+    # The fallback is executable code. Keep it in a private random directory so
+    # another local process cannot pre-create a symlink and redirect cp/codesign.
+    DYLIB_INJECT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apollo-sim-inject.XXXXXX")"
+    chmod 700 "$DYLIB_INJECT_DIR"
+    DYLIB_INJECT="$DYLIB_INJECT_DIR/ApolloReborn.dylib"
+    cleanup_fallback_dylib() {
+        rm -f "$DYLIB_INJECT"
+        rmdir "$DYLIB_INJECT_DIR" 2>/dev/null || true
+    }
+    trap cleanup_fallback_dylib EXIT
+    install -m 600 "$DYLIB_DST" "$DYLIB_INJECT"
+    codesign -f -s - "$DYLIB_INJECT" >/dev/null 2>&1
+    SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$DYLIB_INJECT" \
+        xcrun simctl launch "$DEV" "$BUNDLE_ID"
+    cleanup_fallback_dylib
+    trap - EXIT
+fi
 
 # ----------------------------------------------------------------------------
 # 5. Optional: idb UI smoke test (accessibility tree + screenshot).
