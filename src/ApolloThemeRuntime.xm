@@ -2,6 +2,7 @@
 #import "ApolloThemeStore.h"
 #import "ApolloThemeCompiler.h"
 #import "ApolloThemeGalleryCatalog.h"
+#import "ApolloClassicBarTheme.h"
 #import "ApolloCommon.h"
 #import "ApolloState.h"
 #import <CoreText/CoreText.h>
@@ -2154,11 +2155,11 @@ void ApolloThemeRuntimeInvalidate(void) {
         sources[@(state)] = title ? [title copy] : NSNull.null;
         UIView *control = NavigationTitleControlForDescendant(self);
         // Recoloring this system button after attachment triggers UIKit's title
-        // fade-out/in. Apply the glass appearance on its first assignment;
-        // classic builds retain their attach path and the original button.
-        BOOL prepareGlassDualTitle = dualTitle && IsLiquidGlass() &&
-            NSClassFromString(@"UIGlassEffect") != Nil;
-        if (prepareGlassDualTitle ||
+        // fade-out/in. Apollo assigns the comments title before the button
+        // reaches the title control, so the attach path can only correct it
+        // afterwards — one white frame, then a 600ms fade, on every refresh
+        // that changes the count. Color it on its first assignment instead.
+        if (dualTitle ||
             (control && ChromeBarLooksApolloOwned(NavigationBarForDescendant(control)))) {
             %orig(NavigationTitleAttributedText(title, self, NavigationTitlePrimaryColor()), state);
             return;
@@ -2239,6 +2240,44 @@ static ASImageNodeTintColorModificationBlockFn ASImageNodeTintColorModificationB
 
 %end
 
+// Classic (non-glass) bar chrome (#787). Apollo fills UINavigationBar and
+// UITabBar from the donor's tertiaryBG constant (stock Outrun #C1C8D9 light /
+// #041129 dark), while ApolloSearchToolbar already uses the donor's bar
+// constant (#C5CAD9 / #031229). The donor remap turns those into Raised and
+// Bars respectively. The editor defines Bars as navigation bars, tab-bar
+// backing, and other app chrome, so replace only an opaque, already-remapped
+// Raised fill at the nav/tab appearance sinks. Exact token matching preserves
+// unrelated colours; stock themes, disabled custom themes, transparent fills,
+// generic toolbar appearances, and Liquid Glass all pass through unchanged.
+static UIColor *ApolloThemeClassicBarFill(UIColor *color) {
+    if (!color) return color;
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    BOOL liquidGlass = IsLiquidGlass();
+    BOOL hasComponents = snapshot->enabled && !liquidGlass && ColorComponents(color, &r, &g, &b, &a);
+    uint32_t rgb = hasComponents ? ApolloThemeRGBKeyFromComponents(r, g, b) : 0;
+    if (!ApolloClassicBarShouldRouteRaisedToBars(
+            snapshot->enabled, liquidGlass, hasComponents, a, rgb,
+            snapshot->tokens[ApolloThemeModeLight][ApolloThemeTokenTertiaryBackground],
+            snapshot->tokens[ApolloThemeModeDark][ApolloThemeTokenTertiaryBackground])) return color;
+
+    return ApolloThemeRuntimeColor(ApolloThemeTokenBarBackground) ?: color;
+}
+
+%hook UIBarAppearance
+
+- (void)setBackgroundColor:(UIColor *)color {
+    // UINavigationBar and UITabBar only. UIToolbar and other appearance
+    // subclasses keep the colour Apollo assigned them.
+    if ([self isKindOfClass:[UINavigationBarAppearance class]] ||
+        [self isKindOfClass:[UITabBarAppearance class]]) {
+        color = ApolloThemeClassicBarFill(color);
+    }
+    %orig(color);
+}
+
+%end
+
 %hook UITabBar
 - (void)didMoveToWindow {
     %orig;
@@ -2253,12 +2292,29 @@ static ASImageNodeTintColorModificationBlockFn ASImageNodeTintColorModificationB
     if (IsLiquidGlass()) color = ApolloThemeAccentColor() ?: color;
     %orig(color);
 }
+
+- (void)setBarTintColor:(UIColor *)color {
+    %orig(ApolloThemeClassicBarFill(color));
+}
 %end
 
 %hook UINavigationItem
 
 - (void)setTitleView:(UIView *)view {
-    if (IsLiquidGlass() && view) {
+    if (IsLiquidGlass() && [view isKindOfClass:[UITextField class]]) {
+        // A text field is never a title. UIKit lends a titleView UISearchBar's
+        // own search field to its private _UISearchBarNavigationItem the first
+        // time the bar shows Cancel (setShowsCancelButton:animated: ->
+        // displayNavBarCancelButton:animated: -> searchNavigationItem ->
+        // setUpSearchNavigationItem -> setTitleView:field). The Search tab's
+        // bar is one: Apollo shows Cancel when editing begins, and the prep
+        // below baked the chrome colour into the field's placeholder label and
+        // tagged the field as a neutral title for good, so the dim placeholder
+        // came back in the title colour after Cancel until the screen was
+        // rebuilt.
+        ApolloLog(@"ThemeRuntime: setTitleView: %@ on %@ is a text field; skipping neutral title prep",
+                  NSStringFromClass(view.class), NSStringFromClass(object_getClass(self)));
+    } else if (IsLiquidGlass() && view) {
         // Prepare custom titles before UIKit snapshots the incoming page.
         objc_setAssociatedObject(view, &kApolloNeutralNavigationTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         view.tintColor = ApolloNavigationChromeColor();
@@ -2515,7 +2571,7 @@ static char kApolloNavigationDualTitleTintPinnedKey;
 
 - (void)setTintColor:(UIColor *)color {
     // System-button vibrancy uses tint even when attributed text is neutral.
-    UIColor *chrome = ApolloNavigationChromeColor();
+    UIColor *chrome = NavigationTitlePrimaryColor();
     // Install an explicit tint once; later native nil resets must not restart
     // UIKit's title transition or return the button to its inherited accent.
     if (objc_getAssociatedObject(self, &kApolloNavigationDualTitleTintPinnedKey) &&
@@ -2537,11 +2593,9 @@ static char kApolloNavigationDualTitleTintPinnedKey;
         FindRuntimeImages();
         BuildByteFilter();
         %init(ApolloThemeRuntimeHooks);
-        if (IsLiquidGlass() && NSClassFromString(@"UIGlassEffect")) {
-            Class dualTitleButton = NSClassFromString(@"Apollo.DualLabelTitleButton");
-            if (dualTitleButton) {
-                %init(ApolloNavigationDualTitleChrome, ApolloDualLabelTitleButton = dualTitleButton);
-            }
+        Class dualTitleButton = NSClassFromString(@"Apollo.DualLabelTitleButton");
+        if (dualTitleButton) {
+            %init(ApolloNavigationDualTitleChrome, ApolloDualLabelTitleButton = dualTitleButton);
         }
         BOOL haveTM = objc_getClass("_TtC6Apollo12ThemeManager") != nil;
         if (haveTM) %init(ApolloThemeRuntimeManagerHook);

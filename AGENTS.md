@@ -104,6 +104,7 @@ xcrun simctl spawn "$(cat .sim/device.txt)" log show --last 2m --predicate 'subs
 | `src/Apollo*.xm` | Feature-focused Logos modules; see `Makefile` for the current build list |
 | `src/ApolloCommon.{h,m}` | Shared utilities, including `ApolloLog` and helper functions |
 | `src/ApolloWebTextDecoding.{h,m}` | Charset-aware decode of bytes fetched from arbitrary third-party pages (BOM → `Content-Type` → `<meta charset>`, plus the WHATWG label upgrades). Use this instead of `initWithData:encoding:NSUTF8StringEncoding` for any *foreign* page — a UTF-8 guess mojibakes EUC-KR/Shift_JIS/GB18030/Big5 sites. Foundation-only, so the `.m` compiles straight into a host-side harness |
+| `src/ApolloWebJSONWriteRepair.{h,m}` | The comment/self-text write-response repair (legacy old-reddit shape → modern JSON), split out of `ApolloWebJSON.m` so it stays Foundation-only. Network-free by design: it runs inside `RDKResponseSerializer`; edits are filled from the pre-edit model captured at submit time. Host-side harness: `tests/run_web_json_write_repair_tests.sh` |
 | `src/ApolloState.{h,m}` | Global state, captured singletons, and feature flags |
 
 ### Settings & UI (`src/settings/`)
@@ -176,6 +177,7 @@ Testing: with FLEX debugging enabled, Settings → Privacy → Crash Reports gai
 - **`%orig` passes original arguments**: `%orig;` always calls the original method with the original captured arguments, even if you've reassigned the local parameter variables. To pass modified values, use explicit arguments: `%orig(arg1, modifiedArg2, arg3)`. This matters when normalizing URLs in blocks/callbacks — the ignoreHandler must use `%orig(textNode, attr, val, point, range)` not bare `%orig;` if `val` was modified.
 - **`MSHookIvar` only works inside `%hook` blocks**: It's a Logos macro. In static helper functions, use `class_getInstanceVariable` + `object_getIvar` from the ObjC runtime instead.
 - **Avoid layout-driving writes inside `layoutSubviews` hooks**: Writing `frame`, `bounds`, `layoutMargins`, `separatorInset`, stack spacing, or other Auto Layout inputs from `layoutSubviews` can loop during rotation. Do one-shot row/cell prep from non-layout entry points such as `tableView:willDisplayCell:forRowAtIndexPath:` and clear flags in `prepareForReuse`.
+- **Hooked `self` is `__unsafe_unretained`**: under ARC, Logos declares a `%hook` method's `self` as `T *const __unsafe_unretained`, so a block queued from a hook (`dispatch_async`/`dispatch_after`, completion handlers) must capture a strong local or a `__weak` ref, never bare `self`. `__typeof__(self)` carries the same qualifier, so the strong half of a weak/strong pair needs an explicit `__strong` (`__strong __typeof__(self) strongSelf = weakSelf;`) or a concrete type (`UIViewController *strongSelf = weakSelf;`); without it the local is a nil check that owns nothing. Tweak-owned `@implementation` methods are unaffected (their `self` is strong).
 
 ## Code Style
 

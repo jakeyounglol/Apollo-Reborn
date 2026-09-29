@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import "ApolloWebJSONWriteRepair.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,6 +20,10 @@ extern "C" {
 //              inbox/messages, "about", and every /api/* GET endpoint.
 //   • Writes — vote/comment/save/submit/subscribe/… POST/PUT/DELETE to /api/*,
 //              authenticated with the session cookie + X-Modhash.
+//   • OAuth-only moderator endpoints (removal reasons, /api/v1/modactions/*) —
+//              the cookie can't authenticate these at all, so they go to
+//              oauth.reddit.com with the account's web-session bearer
+//              (ApolloWebJSONPathNeedsWebBearer).
 //   • Session lifecycle — a 403 HTML "block page" on a previously-good request
 //              is detected (ApolloWebJSONNoteResponse) and surfaced as a
 //              "session expired" prompt so the user can re-harvest.
@@ -45,16 +50,6 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response);
 // response before RDKResponseSerializer parses them. This preserves the real
 // preview URL and aspect ratio instead of fabricating dimensions.
 NSData *ApolloWebJSONFixupListingMediaResponseData(NSURLResponse *response, NSData *data);
-
-// Fixes up the parsed response object for comment writes (/api/editusertext,
-// /api/comment) in EVERY auth mode. www.reddit.com always returns each thing's
-// data in the legacy old-reddit {parent, content:"<html>"} shape, and since
-// 2026-08 oauth.reddit.com has intermittently done the same to API-key (OAuth)
-// clients; Apollo renders such a comment with no author/score/timestamp. This
-// swaps in the modern comment JSON (info.json refetch, else local synthesis).
-// Returns the input unchanged when the shape is already modern. Called from the
-// RDKResponseSerializer hook with the serializer's output.
-id ApolloWebJSONFixupWriteResponseObject(NSURLResponse *response, id responseObject);
 
 // Fixes up the parsed response object for the cookie-routed moderators-list
 // read (redirected by ApolloWebJSONRewriteRequest from the OAuth2-only
@@ -106,10 +101,12 @@ BOOL ApolloWebJSONShouldStubFlairList(NSURLResponse *response);
 NSArray *ApolloWebJSONRescueFlairList(NSHTTPURLResponse *response);
 
 // YES for requests the WebJSON layer authors itself (session probes, token_v2
-// mints, flair rescue fetches), marked by an internal URL fragment that never
-// reaches the wire. Transport-level observers — in particular the bearer
-// capture feeding sLatestRedditBearerToken — must skip these: their bearer is
-// the web-session account's token_v2, not Apollo's own OAuth credential.
+// mints, flair rescue fetches) or authenticates for a web-session account
+// (cookie rewrites, moderator requests sent with the account's web bearer),
+// marked by an internal URL fragment that never reaches the wire.
+// Transport-level observers — in particular the bearer capture feeding
+// sLatestRedditBearerToken — must skip these: any bearer they carry is the
+// web-session account's, not Apollo's own OAuth credential.
 BOOL ApolloWebJSONRequestIsInternal(NSURL *url);
 
 // A token_v2-derived OAuth bearer for `username` (or the active web-session
@@ -121,35 +118,33 @@ BOOL ApolloWebJSONRequestIsInternal(NSURL *url);
 // request with ApolloWebJSONProbeURL so the transport hooks leave it alone.
 NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username);
 
-// Captures the write context for the write-response repair. Called from the
-// identity module's RDKClient submit/edit hooks with the client that issued the
-// write plus everything the call site knows about WHERE the write landed; the
-// repair reads it (TTL-bounded) when a degraded response is missing those
-// fields. The client resolves the posting identity (each account owns its own
-// RDKClient, so the submitting client's currentUser is the true posting
-// identity even for temporaryPostingAccount); subreddit/subredditFullName come
-// from the target link/parent comment, linkFullName is the t3 the comment
-// lives under, and parentFullName is the t1 being replied to (nil for
-// top-level comments and edits). Any argument may be nil — the repair fills
-// only what it has.
-//
-// `body` is the submitted markdown and is what keys this capture to its own
-// response: writes can overlap (a second comment submitted while the first is
-// still in flight), and Reddit echoes the markdown back as the response thing's
-// body/contentText, so the repair can tell which outstanding write a degraded
-// response belongs to instead of taking whichever was captured last. Pass it
-// whenever the call site has it; a capture with no body still participates, it
-// just can't be matched exactly.
-void ApolloWebJSONNoteCommentWriteContext(id client, NSString *body, NSString *subreddit,
-                                          NSString *subredditFullName,
-                                          NSString *linkFullName, NSString *parentFullName);
-
 // Fetch-outcome feedback for ApolloWebJSONKeylessOAuthBearer callers: report a
 // 401/403 so a minted bearer proven dead (an anonymous token from a signed-out
 // session) is dropped and its account backs off instead of re-minting a doomed
 // token every attempt. No-op for a token_v2 bearer. Pass the SAME username you
 // gave ApolloWebJSONKeylessOAuthBearer (the mint cache keys on it).
 void ApolloWebJSONInvalidateOAuthBearerForAccount(NSString *username, NSString *bearer);
+
+// YES for the moderator endpoints Reddit serves to OAuth bearers only (a
+// subreddit's removal reasons, /api/v1/modactions/*). ApolloWebJSONRewriteRequest
+// sends a web-session account's requests to them to oauth.reddit.com with the
+// account's web bearer instead of the cookie. Takes a URL path or RedditKit's
+// relative "api/v1/..." path.
+BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path);
+
+// The web-session account a Reddit request carrying `bearer` belongs to (nil
+// for an OAuth account's request) — the transport's per-request attribution.
+NSString *ApolloWebJSONWebSessionUsernameForBearer(NSString *bearer);
+
+// The account's web bearer if one is on hand without a network round trip
+// (fresh token_v2, or a minted one still cached), else nil — also nil for a
+// minute after oauth.reddit.com refused it with a 401.
+NSString *ApolloWebJSONReadyWebBearer(NSString *username);
+
+// YES when a web-session account has no web bearer on hand and a mint is worth
+// trying now (none held off, no recent mint failure). The RedditKit request
+// hook mints before sending an ApolloWebJSONPathNeedsWebBearer request then.
+BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username);
 
 // Hydrates the legacy single-session globals from the keychain, migrating any
 // legacy NSUserDefaults cookie value, then any legacy single-global session,
@@ -197,6 +192,13 @@ void ApolloWebJSONNoteSessionReauthenticationDeferred(NSString *username);
 // can coexist with other OAuth or web-session accounts. The settings UI/Tweak.xm
 // listens to offer re-login for that specific account.
 extern NSString *const ApolloWebJSONSessionExpiredNotification;
+
+// Posted (on the main thread) when Reddit starts refusing the ACTIVE web-session
+// account's requests with HTTP 429, so a feed that won't load gets an
+// explanation instead of an endless spinner. userInfo[@"username"] is the
+// lowercased account, userInfo[@"seconds"] the expected wait (see
+// ApolloWebJSONOptionalReadBackoff). Tweak.xm shows it as a toast.
+extern NSString *const ApolloWebJSONSessionRateLimitedNotification;
 
 // Sentinel access-token string the identity layer (ApolloWebJSONIdentity.xm)
 // installs as a synthetic OAuth credential so Apollo proceeds to issue requests
@@ -283,6 +285,18 @@ NSURL *ApolloWebJSONProbeURL(NSURL *url);
 // requests must pass through the network hooks completely untouched: no Web
 // JSON rewrite, no User-Agent stamping (they pick their UA deliberately).
 BOOL ApolloWebJSONURLIsProbe(NSURL *url);
+
+// Seconds the tweak's optional reads (author avatars, subreddit header info)
+// for `username`'s web session should wait, or 0 when they may go ahead.
+// Reddit doesn't report a web session's remaining request budget (cookie
+// responses carry no x-ratelimit headers); the only signal is the HTTP 429 it
+// sends once the budget is spent, and that 429 also stops Apollo's own feed and
+// comment loads until the window resets. After one, this returns the time left
+// until the reset so the optional reads stop adding to it. Fed by
+// ApolloWebJSONNoteResponse from every cookie-authenticated response. 0 for
+// API-key accounts, when Web JSON is off, or when no 429 has been seen. Any
+// thread.
+NSTimeInterval ApolloWebJSONOptionalReadBackoff(NSString *username);
 
 // Verify the requesting web account independently of public HTTP successes.
 void ApolloWebJSONCheckAccountSession(NSString *username);

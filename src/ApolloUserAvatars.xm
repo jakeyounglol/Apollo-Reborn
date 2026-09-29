@@ -2764,6 +2764,58 @@ static void ApolloApplyInlineAvatarInfoToCell(id cell, NSString *username, Apoll
     }];
 }
 
+// ---- API-Key-Free: wait for the batched lookup ----
+// An API-Key-Free account has no OAuth bearer of its own, so every profile lookup
+// goes out on the web session's cookie, against the same Reddit request budget
+// as the feed and comment loads (see ApolloWebJSONOptionalReadBackoff). Comment
+// authors are queued for the batched lookup as their cells enter the preload
+// range (ApolloInlineAvatarBatchEnqueueFromCommentCell), and a batch lands within
+// a second or so. A cell whose author is still waiting on one holds off instead
+// of racing it with its own about.json; on a busy thread that race used to cost
+// one request per author on screen. Lowercased username -> when it was queued.
+// Main thread only; entries expire after ApolloInlineAvatarBatchWaitLimit.
+static NSMutableDictionary<NSString *, NSDate *> *sApolloInlineAvatarAwaitingBatchSince;
+static NSTimeInterval const ApolloInlineAvatarBatchWaitLimit = 3.0;
+
+// Main thread. YES when the profile lookups go out without a bearer, the same
+// call ApolloActiveAccountRedditBearerToken() makes for them: no bearer captured
+// yet, or the active account is API-Key-Free. The captured bearer can belong to
+// another signed-in account, so having one doesn't mean these lookups use it.
+// That helper reads the keychain, so this checks the defaults-backed web
+// session index instead, once per queued author.
+static BOOL ApolloInlineAvatarLookupsAreBearerless(void) {
+    if (sLatestRedditBearerToken.length == 0) return YES;
+    NSString *activeUsername = ApolloActiveWebSessionUsername().lowercaseString;
+    return activeUsername.length > 0 && [ApolloWebSessionUsernames() containsObject:activeUsername];
+}
+
+static void ApolloInlineAvatarNoteQueuedForBatch(NSString *username) {
+    NSString *key = ApolloAvatarNormalizedUsername(username).lowercaseString;
+    if (key.length == 0) return;
+    // Only when the lookup would draw on a web session's budget (Web JSON on,
+    // no bearer); API-key lookups keep racing the batch as they always have.
+    if (!sWebJSONEnabled || !ApolloInlineAvatarLookupsAreBearerless()) return;
+    if (!sApolloInlineAvatarAwaitingBatchSince) sApolloInlineAvatarAwaitingBatchSince = [NSMutableDictionary dictionary];
+    if (sApolloInlineAvatarAwaitingBatchSince.count >= 256) {
+        NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-ApolloInlineAvatarBatchWaitLimit];
+        for (NSString *queued in sApolloInlineAvatarAwaitingBatchSince.allKeys) {
+            if ([sApolloInlineAvatarAwaitingBatchSince[queued] compare:cutoff] == NSOrderedAscending) {
+                [sApolloInlineAvatarAwaitingBatchSince removeObjectForKey:queued];
+            }
+        }
+    }
+    sApolloInlineAvatarAwaitingBatchSince[key] = [NSDate date];
+}
+
+static BOOL ApolloInlineAvatarShouldAwaitBatch(NSString *username) {
+    NSString *key = ApolloAvatarNormalizedUsername(username).lowercaseString;
+    NSDate *queuedAt = key.length > 0 ? sApolloInlineAvatarAwaitingBatchSince[key] : nil;
+    if (!queuedAt) return NO;
+    if (-[queuedAt timeIntervalSinceNow] < ApolloInlineAvatarBatchWaitLimit) return YES;
+    [sApolloInlineAvatarAwaitingBatchSince removeObjectForKey:key];
+    return NO;
+}
+
 static void ApolloScheduleInlineAvatarInfoFetchAttempt(id cell, NSString *username, NSUInteger attempt) {
     __weak id weakCell = cell;
     NSTimeInterval delay = ApolloInlineAvatarBindDelayForAttempt(attempt);
@@ -2802,6 +2854,14 @@ static void ApolloScheduleInlineAvatarInfoFetchAttempt(id cell, NSString *userna
         if (cachedInfo.iconURL) {
             ApolloClearPendingInlineAvatarFetch(strongCell, username);
             ApolloApplyInlineAvatarInfoToCell(strongCell, username, cachedInfo);
+            return;
+        }
+        // Still waiting on the batched lookup (API-Key-Free only, see above):
+        // check the cache again on the next rung instead of fetching now. The
+        // last rung falls through, so an author the batch didn't cover still
+        // gets their own lookup.
+        if (attempt + 1 < ApolloInlineAvatarMaxBindAttempts && ApolloInlineAvatarShouldAwaitBatch(username)) {
+            ApolloScheduleInlineAvatarInfoFetchAttempt(strongCell, username, attempt + 1);
             return;
         }
 
@@ -4563,20 +4623,22 @@ static void ApolloInlineAvatarFireBatchNow(void) {
 // preload range at once → fire promptly once a burst accumulates; a slow trickle of
 // cells is gathered over a short window so it still collapses into one request rather
 // than many 1-id calls. Main-thread only, so the statics need no locking.
-static void ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
-    if (!sShowUserAvatars) return;
-    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return;
+// YES when `fullName` joined a batch (and will be looked up within ~0.6s).
+static BOOL ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+    if (!sShowUserAvatars) return NO;
+    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return NO;
     if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
     [sApolloPendingBatchFullNames addObject:fullName];
     if (sApolloPendingBatchFullNames.count >= 25) {
         ApolloInlineAvatarFireBatchNow();
-        return;
+        return YES;
     }
-    if (sApolloBatchFireScheduled) return;
+    if (sApolloBatchFireScheduled) return YES;
     sApolloBatchFireScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApolloInlineAvatarFireBatchNow();
     });
+    return YES;
 }
 
 // Read the comment cell's own RDKComment (the same safe ivar path the avatar binding
@@ -4591,7 +4653,7 @@ static void ApolloInlineAvatarBatchEnqueueFromCommentCell(id cell) {
     if (fullName.length == 0) return;
     NSString *username = ApolloUsernameFromModelObject(comment);
     if (username.length > 0 && [[ApolloUserProfileCache sharedCache] cachedInfoForUsername:username].iconURL) return;
-    ApolloInlineAvatarEnqueueFullNameForBatch(fullName);
+    if (ApolloInlineAvatarEnqueueFullNameForBatch(fullName)) ApolloInlineAvatarNoteQueuedForBatch(username);
 }
 
 // ASSizeRange { CGSize min; CGSize max; } — same -layoutSpecThatFits: ABI
@@ -5162,18 +5224,22 @@ static void ApolloProfileZeroNodeHeight(id node) {
 
 %end
 
-// The first time an account's username appears with no per-account credential
-// override yet (a brand new sign-in, or an existing account's first launch
-// under a build with this feature), pin it to whatever Reddit API client is
-// the CURRENT default. That "session was issued under this key" snapshot is
-// exactly what makes per-account credentials useful: if the user later
-// changes the global default key (e.g. to onboard a different account), this
-// account's refresh keeps using the key it actually has a valid
-// refresh_token for — Reddit binds refresh tokens to the issuing client_id,
-// so naively following a changed global default 400s with invalid_grant
-// (see the AFHTTPRequestSerializer hook in Tweak.xm for the other half of
-// this fix). Never overwrites an existing override — only fills the gap once.
-static void ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(id currentUser) {
+// Pin every account to the Reddit API key its session was issued under. That
+// "session was issued under this key" snapshot is exactly what makes
+// per-account credentials useful: if the user later changes the global
+// default key (e.g. to onboard a different account), this account's refresh
+// keeps using the key it actually has a valid refresh_token for — Reddit
+// binds refresh tokens to the issuing client_id, so naively following a
+// changed global default 400s with invalid_grant (see the
+// AFHTTPRequestSerializer hook in Tweak.xm for the other half of this fix).
+//   • The client of a sign-in that just finished (Add Account / the signed-out
+//     splash) carries the key it signed in with, and that key is pinned,
+//     replacing any older entry for the username (see
+//     ApolloAccountCredentialsPinInteractiveSignIn).
+//   • Any other account whose username appears with no entry yet (e.g. one
+//     that signed in before this feature, on its first launch with it) is
+//     pinned to the CURRENT default. This never overwrites an existing entry.
+static void ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(id client, id currentUser) {
     NSString *username = nil;
     @try { username = [currentUser valueForKey:@"username"]; }
     @catch (__unused NSException *e) { return; }
@@ -5197,6 +5263,8 @@ static void ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(id currentUser) 
         ApolloLog(@"[AccountCredentials] u/%@ signed in with an API key — removed its stale web session (now an OAuth account)", username);
     }
 
+    if (ApolloAccountCredentialsPinInteractiveSignIn(client, username)) return;
+
     if (ApolloAccountCredentialsFor(username) != nil) return;
 
     ApolloAccountCredentialsSet(username, sRedditClientId, sRedditClientSecret, sRedirectURI);
@@ -5206,13 +5274,13 @@ static void ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(id currentUser) 
 
 - (void)setCurrentUser:(id)currentUser {
     %orig(currentUser);
-    ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(currentUser);
+    ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(self, currentUser);
     ApolloProfileScheduleAccountChangeTabAvatarRefresh(@"RDKClient currentUser");
 }
 
 - (void)updateCurrentUserWithNewUser:(id)newUser {
     %orig(newUser);
-    ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(newUser);
+    ApolloPinAccountToCurrentDefaultCredentialsIfNeeded(self, newUser);
     ApolloProfileScheduleAccountChangeTabAvatarRefresh(@"RDKClient user update");
 }
 
