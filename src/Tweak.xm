@@ -36,11 +36,13 @@
 #import "ApolloToast.h"
 #import "ApolloWebJSON.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloReduceRateLimiting.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloMessageDraftStore.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloPerAccountFavorites.h"
 #import "ApolloFavoritesSorting.h"
+#import "ApolloAICloudBridge.h"
 #import "crash/ApolloCrashManager.h"
 #import "crash/ApolloCrashContext.h"
 #import "crash/ApolloCrashPromptCoordinator.h"
@@ -3785,6 +3787,8 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyPostFilterNameSubstrings: @[],
                                     UDKeyImgurAlbumFallbackProxies: @YES,
                                     UDKeyWebJSONEnabled: @NO,
+                                    UDKeyReduceRateLimiting: @NO,
+                                    UDKeyReduceRateLimitingOffered: @NO,
                                     UDKeyUseModernRedditChat: @NO,
                                     UDKeyUseModernRedditModmail: @NO,
                                     UDKeyNotificationBackendURL: @"",
@@ -3913,6 +3917,17 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
         sCustomAIAPIKey = loadKey(UDKeyCustomAIAPIKey);
         sCustomAIModel = loadKey(UDKeyCustomAIModel);
         sCustomAIBaseURL = loadKey(UDKeyCustomAIBaseURL);
+        // Custom-provider headers: invalid entries (hand-edited or restored
+        // defaults) are dropped from the in-memory list only; the next save from
+        // Apollo AI settings rewrites the stored list.
+        id storedAIHeaders = [standardDefaults objectForKey:UDKeyCustomAIHeaders];
+        sCustomAIHeaders = ApolloAICloudSanitizedCustomHeaders(storedAIHeaders);
+        NSUInteger storedAIHeaderCount = [storedAIHeaders isKindOfClass:[NSArray class]]
+            ? [(NSArray *)storedAIHeaders count] : (storedAIHeaders ? 1 : 0);
+        if (storedAIHeaderCount != sCustomAIHeaders.count) {
+            ApolloLog(@"[AICloud] Ignoring %lu invalid custom header entries from settings",
+                      (unsigned long)(storedAIHeaderCount - sCustomAIHeaders.count));
+        }
     }
     sInlineImageAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyInlineImageAlignment];
     if (sInlineImageAlignment < ApolloInlineImageAlignmentCenter || sInlineImageAlignment > ApolloInlineImageAlignmentRight) {
@@ -4162,6 +4177,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // installed below — in the simulator the keychain is virtualized by those
     // hooks, so reading before they're in place returns nothing.
     sWebJSONEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONEnabled];
+    sReduceRateLimiting = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyReduceRateLimiting];
     sPollsFeatureEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPollsEnabled];
     sPollOptionAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPollOptionAlignment];
     if (sPollOptionAlignment != ApolloPollOptionAlignmentCenter && sPollOptionAlignment != ApolloPollOptionAlignmentLeft) {
@@ -4185,7 +4201,11 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        ApolloShowRedditRateLimitToast([note.userInfo[@"seconds"] doubleValue]);
+        NSTimeInterval seconds = [note.userInfo[@"seconds"] doubleValue];
+        // An account that signed in before the Reduce Rate Limiting offer
+        // existed gets it here, once, in place of the toast.
+        if (ApolloReduceRateLimitingOfferAtRateLimit(seconds)) return;
+        ApolloShowRedditRateLimitToast(seconds);
     }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil

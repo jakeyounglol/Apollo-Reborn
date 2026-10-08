@@ -406,6 +406,9 @@ extern NSString *sGeminiAIModel;
 extern NSString *sCustomAIAPIKey;
 extern NSString *sCustomAIModel;
 extern NSString *sCustomAIBaseURL;
+// Extra request headers for the custom provider: always the output of
+// ApolloAICloudSanitizedCustomHeaders (nil when none). Main thread only.
+extern NSArray<NSDictionary<NSString *, NSString *> *> *sCustomAIHeaders;
 
 // AI summary tuning shared by the settings UI and generation pipeline.
 // The threshold applies only to a Reddit self-post body; external article
@@ -601,6 +604,10 @@ static inline BOOL IsAppleTranslationSupported(void) {
 // authenticated with a WKWebView-harvested session cookie instead of a bearer
 // token. Dormant escape hatch for Reddit API-key revocation waves. Default NO.
 extern BOOL sWebJSONEnabled;
+// Reduce Rate Limiting (UDKeyReduceRateLimiting). Only takes effect while the
+// active account is API-key-free; read it through
+// ApolloReduceRateLimitingActive() (ApolloReduceRateLimiting.h). Default NO.
+extern BOOL sReduceRateLimiting;
 // Native Polls (ApolloPollVoting.xm / ApolloPollCompose.xm): master gate for
 // the experimental poll voting + creation feature. Default NO. Cached here (not
 // re-read from NSUserDefaults per call) because the poll node's layoutSubviews

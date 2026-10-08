@@ -24,6 +24,8 @@
 #import "ApolloCommon.h"
 #import "ApolloFloatingTabs.h"
 #import "ApolloGoogleSearch.h"
+#import "ApolloKagiSearch.h"
+#import "ApolloGoogleSearchTab.h"
 #import "ApolloLinkPreviewFetcher.h"
 #import "ApolloTranslation.h"
 #import "ApolloGalleryImageLoader.h"
@@ -1196,7 +1198,8 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         // search the way the Search tab's Google mode does and log every result;
         // "gsearchjs <js>": evaluate JS in the last results page (kept alive in
         // sim builds); "gsearchdebug <knobs>": the Google mode test switches
-        // (verification sheet, Reddit read off, error, saved page, link delay).
+        // (verification sheet, Reddit read off, error, saved page, link delay,
+        // the pre-iOS 17 cookie jar, a listing of the jar's cookies).
         // See ApolloGoogleSearch.{h,m}.
         if ([contents hasPrefix:@"gsearch "]) {
             ApolloGoogleSearchDebugRun([contents substringFromIndex:8]);
@@ -1208,6 +1211,25 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         }
         if ([contents hasPrefix:@"gsearchjs "]) {
             ApolloGoogleSearchDebugEvaluateJS([contents substringFromIndex:10]);
+            return;
+        }
+        // "ksearch [p=N t=d|w|m|y x=1 |] <query>": run a Kagi (Reddit-only)
+        // search with the saved Session Link and log every result;
+        // "ksearchdebug <knobs>": Kagi mode test switches (saved page instead
+        // of the network, signed-out answer, error, Reddit read off). See
+        // ApolloKagiSearch.{h,m}.
+        if ([contents hasPrefix:@"ksearch "]) {
+            ApolloKagiSearchDebugRun([contents substringFromIndex:8]);
+            return;
+        }
+        if ([contents hasPrefix:@"ksearchdebug "]) {
+            ApolloKagiSearchDebugConfigure([contents substringFromIndex:13]);
+            return;
+        }
+        // "searchtab <query>": submit a query in the Search tab's Google/Kagi
+        // mode through the tab's own submit path (list, cards, paging).
+        if ([contents hasPrefix:@"searchtab "]) {
+            ApolloGoogleSearchTabDebugSubmit([contents substringFromIndex:10]);
             return;
         }
         // "devvitjs <js>" command: evaluate JS in the live interactive-post

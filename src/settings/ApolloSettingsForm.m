@@ -249,6 +249,76 @@ static const void *kApolloSFSwitchRowKey = &kApolloSFSwitchRowKey;
     [self.tableView reloadData];
 }
 
+// A reload or batch update runs UIKit's post-update scroll restore, which saves
+// the position against one row and puts it back against another when the top
+// edge of the screen sits inside a section footer (see "section footer
+// heights"): on Apollo AI, saving a custom header with the list scrolled down
+// to it moved the list ~210pt. So note where every row on screen sits, run the
+// update, let UIKit's restore happen, then put the first of those rows that is
+// still in the form back in its place. Rows only, by identity: the edit may
+// have removed the row that was first on screen, and the next one then holds
+// the list. Anything that comes on screen while the list is put back is
+// measured as it is laid out and can push that row down again (after a
+// reloadData every height is an estimate until then), so correct until the row
+// holds.
+- (void)performUpdateKeepingVisibleRowsInPlace:(void (NS_NOESCAPE ^)(void))update {
+    UITableView *tableView = self.tableView;
+    if (!tableView.window) {
+        update();
+        return;
+    }
+    CGFloat offsetY = tableView.contentOffset.y;
+    CGFloat visibleTop = offsetY + tableView.adjustedContentInset.top;
+    NSMutableArray<NSString *> *anchorIDs = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *anchorOffsets = [NSMutableArray array];
+    NSArray<NSIndexPath *> *visible = [tableView.indexPathsForVisibleRows sortedArrayUsingSelector:@selector(compare:)];
+    for (NSIndexPath *indexPath in visible) {
+        NSString *rowID = [self apollo_sf_rowAtIndexPath:indexPath].rowID;
+        CGRect rect = [tableView rectForRowAtIndexPath:indexPath];
+        if (rowID.length == 0 || CGRectGetMaxY(rect) <= visibleTop) continue;   // under the bars
+        [anchorIDs addObject:rowID];
+        [anchorOffsets addObject:@(CGRectGetMinY(rect) - offsetY)];
+    }
+
+    [UIView performWithoutAnimation:^{
+        update();
+        [tableView layoutIfNeeded];   // the update, and UIKit's restore, happen here
+        CGFloat restored = tableView.contentOffset.y;
+        for (NSUInteger i = 0; i < anchorIDs.count; i++) {
+            if (![self indexPathForRowID:anchorIDs[i]]) continue;
+            NSInteger passes = 0;
+            for (; passes < 4; passes++) {
+                NSIndexPath *indexPath = [self indexPathForRowID:anchorIDs[i]];
+                UIEdgeInsets insets = tableView.adjustedContentInset;
+                CGFloat minY = -insets.top;
+                CGFloat maxY = MAX(minY, tableView.contentSize.height + insets.bottom - CGRectGetHeight(tableView.bounds));
+                CGFloat target = CGRectGetMinY([tableView rectForRowAtIndexPath:indexPath]) - anchorOffsets[i].doubleValue;
+                target = MIN(MAX(target, minY), maxY);
+                if (fabs(target - tableView.contentOffset.y) < 0.5) break;
+                tableView.contentOffset = CGPointMake(tableView.contentOffset.x, target);
+                [tableView layoutIfNeeded];
+            }
+            ApolloLog(@"[SettingsForm] update kept visible rows in place: offset was %.1f, UIKit restored %.1f, put back to %.1f in %ld pass(es)",
+                      offsetY, restored, tableView.contentOffset.y, (long)passes);
+            break;
+        }
+    }];
+}
+
+// Section titles restyled for a new theme font (see the settings base's
+// -viewWillAppear:) take their new heights in one pass that keeps the rows on
+// screen in place. The footer heights the form measured were for the old font,
+// the ones off screen too, so measure them again in that pass, as after a text
+// size change (see "section footer heights"). Left to the footer check the
+// restyled footers queued, they'd get a second pass right after this one,
+// without that protection, and the list moved (9pt on the hub).
+- (void)apollo_takeSectionTitleHeights {
+    [_footerMeasuredHeights removeAllObjects];
+    [_footerMeasureChanges removeAllObjects];
+    [self apollo_sf_adoptMeasuredFooterHeights];
+    [super apollo_takeSectionTitleHeights];
+}
+
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
     [super traitCollectionDidChange:previousTraitCollection];
     // Icon tiles bake a trait-resolved fill color at render time (see
@@ -559,7 +629,11 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
             // Shared pool: reset what a sibling's configure block may have added
             // (e.g. Translation's "Add Language…" disclosure chevron).
             cell.accessoryType = UITableViewCellAccessoryNone;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            // Match switch/disclosure rows: unavailable actions must look
+            // disabled too. Reset both values for this shared reuse pool.
+            BOOL enabled = row.enabled ? row.enabled() : YES;
+            cell.textLabel.enabled = enabled;
+            cell.selectionStyle = enabled ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
             [self apollo_applyAccentActionTextColorToCell:cell];
             break;
         }
@@ -697,7 +771,9 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
     if (!pending || !template) return NO;
 
     UILabel *label = template.textLabel;
-    NSString *ownText = label.text;
+    // Preserve attributed content: assigning label.text for measurement strips
+    // attachments and other attributes from the borrowed footer.
+    NSAttributedString *ownAttributedText = label.attributedText;
     BOOL adopted = NO;
     for (NSInteger section = 0; section < sections; section++) {
         if (![pending containsIndex:(NSUInteger)section]) continue;
@@ -718,7 +794,7 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
         adopted = YES;
         ApolloLog(@"[SettingsForm] footer %ld is not on screen yet — measured it ahead at %.1fpt", (long)section, fitted);
     }
-    label.text = ownText;
+    label.attributedText = ownAttributedText;
     [template setNeedsLayout];
     [template layoutIfNeeded];
     return adopted;

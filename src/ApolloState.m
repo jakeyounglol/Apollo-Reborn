@@ -114,6 +114,7 @@ NSString *sGeminiAIModel = nil;
 NSString *sCustomAIAPIKey = nil;
 NSString *sCustomAIModel = nil;
 NSString *sCustomAIBaseURL = nil;
+NSArray<NSDictionary<NSString *, NSString *> *> *sCustomAIHeaders = nil;
 NSInteger sAIPostWordThreshold = 150;
 ApolloAISummaryDetail sAIPostSummaryDetail = ApolloAISummaryDetailBalanced;
 ApolloAISummaryDetail sAICommentSummaryDetail = ApolloAISummaryDetailBalanced;
@@ -169,6 +170,7 @@ NSArray<NSString *> *sTranslationSkipLanguages = nil;
 BOOL sAppleTranslateSheet = NO;
 
 BOOL sWebJSONEnabled = NO;
+BOOL sReduceRateLimiting = NO;
 BOOL sPollsFeatureEnabled = NO;
 NSInteger sPollOptionAlignment = ApolloPollOptionAlignmentCenter;
 NSString *sWebSessionCookieHeader = nil;

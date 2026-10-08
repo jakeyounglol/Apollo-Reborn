@@ -18,12 +18,17 @@ extern "C" {
 // Coverage (see docs/web-json-spike-findings.md → "Deferred work"):
 //   • Reads  — listings, comments, user pages, search, multis, subscriptions,
 //              inbox/messages, "about", and every /api/* GET endpoint.
-//   • Writes — vote/comment/save/submit/subscribe/… POST/PUT/DELETE to /api/*,
+//   • Writes — vote/comment/save/submit/subscribe/… POST/PUT/DELETE to /api/*
+//              (post flair, flair visibility and wiki saves, which Apollo sends
+//              to /r/<sub>/api/<action>, go to /api/<action> with an `r` field),
 //              authenticated with the session cookie + X-Modhash.
-//   • OAuth-only moderator endpoints (removal reasons, /api/v1/modactions/*) —
+//   • OAuth-only moderator endpoints (removal reasons, /api/v1/modactions/*,
+//              the approved/banned/muted/moderator lists, ban, mod invites) —
 //              the cookie can't authenticate these at all, so they go to
 //              oauth.reddit.com with the account's web-session bearer
 //              (ApolloWebJSONPathNeedsWebBearer).
+//   • New modmail (/api/mod/conversations and everything under it) — OAuth-only
+//              as well, so it takes the same web-bearer route.
 //   • Session lifecycle — a 403 HTML "block page" on a previously-good request
 //              is detected (ApolloWebJSONNoteResponse) and surfaced as a
 //              "session expired" prompt so the user can re-harvest.
@@ -70,13 +75,15 @@ id ApolloWebJSONGuardListingTaskResponse(NSString *method, NSString *path,
                                         NSHTTPURLResponse *response, id responseObject,
                                         NSError **error);
 
-// YES if `response` is GET /api/v1/<sub>/moderators_invited and a cookie
-// session is active — this endpoint is OAuth2-only with no cookie-compatible
-// equivalent at all (unlike /moderators), so the caller should override the
-// parsed result to an empty array (and clear any parse/status error) rather
-// than let the underlying 403 surface as a visible error. NO for any other
-// endpoint, or when the active account isn't a web-session account (the real
-// OAuth path is untouched). Called from the RDKResponseSerializer hook.
+// YES if `response` is GET /api/v1/<sub>/moderators_invited, a cookie session
+// is active, and no web bearer got a real answer for it — this endpoint is
+// OAuth2-only with no cookie-compatible equivalent at all (unlike
+// /moderators), so the caller should override the parsed result to an empty
+// array (and clear any parse/status error) rather than let the refusal surface
+// as a visible error. NO for a successful oauth.reddit.com answer (the
+// web-bearer route), any other endpoint, or when the active account isn't a
+// web-session account (the real OAuth path is untouched). Called from the
+// RDKResponseSerializer hook.
 BOOL ApolloWebJSONShouldStubInvitedModerators(NSURLResponse *response);
 
 // YES if `response` is a cookie-routed GET /r/<sub>/api/link_flair(_v2) or
@@ -126,10 +133,12 @@ NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username);
 void ApolloWebJSONInvalidateOAuthBearerForAccount(NSString *username, NSString *bearer);
 
 // YES for the moderator endpoints Reddit serves to OAuth bearers only (a
-// subreddit's removal reasons, /api/v1/modactions/*). ApolloWebJSONRewriteRequest
-// sends a web-session account's requests to them to oauth.reddit.com with the
-// account's web bearer instead of the cookie. Takes a URL path or RedditKit's
-// relative "api/v1/..." path.
+// subreddit's removal reasons, /api/v1/modactions/*, its approved-submitter,
+// banned, muted, moderator and invited-moderator lists, declining a mod invite,
+// and the /r/<sub>/api/friend and accept_moderator_invite writes).
+// ApolloWebJSONRewriteRequest sends a web-session account's requests to them to
+// oauth.reddit.com with the account's web bearer instead of the cookie. Takes a
+// URL path or RedditKit's relative "api/v1/..." / "r/<sub>/api/..." path.
 BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path);
 
 // The web-session account a Reddit request carrying `bearer` belongs to (nil
@@ -297,6 +306,28 @@ BOOL ApolloWebJSONURLIsProbe(NSURL *url);
 // API-key accounts, when Web JSON is off, or when no 429 has been seen. Any
 // thread.
 NSTimeInterval ApolloWebJSONOptionalReadBackoff(NSString *username);
+
+// Duplicate account reads for API-Key-Free accounts. Apollo asks for the same
+// account data twice in quick succession (at launch its account refresh repeats
+// the subscriptions, multireddits, moderated subreddits, /api/v1/me and inbox
+// reads its screens made a second earlier; returning to the app fetches the
+// inbox twice at once), and for a web session every one of them spends the
+// budget above. Called from the RDKClient request chokepoint with the
+// requesting web-session account (nil for an API-key account, which this never
+// touches) and that request's completion. Returns the completion to send the
+// request with (`completion` itself, or one that also answers the callers that
+// join it), or nil when the request shouldn't go out: it joined an identical
+// read already in flight, or one answered in the last few seconds, and
+// `completion` runs with that answer. Only GETs to those account endpoints are
+// shared, and any write from the account starts over, so a read sent after it
+// is always fresh. Any thread.
+typedef void (^ApolloWebJSONTaskCompletion)(NSHTTPURLResponse *response, id object, NSError *error);
+ApolloWebJSONTaskCompletion ApolloWebJSONShareAccountRead(NSString *username, NSString *method, NSString *path,
+                                                         id parameters, ApolloWebJSONTaskCompletion completion);
+
+// The task handed back to a caller whose read was shared (see above). Never
+// resumed, so cancelling it can't cancel the request another caller waits on.
+NSURLSessionDataTask *ApolloWebJSONSharedReadPlaceholderTask(void);
 
 // Verify the requesting web account independently of public HTTP successes.
 void ApolloWebJSONCheckAccountSession(NSString *username);

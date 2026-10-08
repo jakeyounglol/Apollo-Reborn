@@ -1,5 +1,6 @@
 #import "ApolloSettingsShortcutsViewController.h"
 #import "settings/CustomAPIViewController.h"
+#import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloThemeRuntime.h"
@@ -18,6 +19,9 @@
 #import "ApolloFloatingTabs.h"       // close-all / fan-out entry points for the toggles
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloReduceRateLimiting.h"
+#import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
+#import "ApolloKagiSearchParsing.h"  // ApolloKagiNormalizeSessionToken()
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebJSON.h"           // ApolloWebJSONBearerIsSynthetic() — widget setup code
 #import "ApolloPerAccountFavorites.h"
@@ -447,6 +451,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     TagNotificationBackendURL,
     TagNotificationBackendRegistrationToken,
     TagBarkPushURL,
+    TagKagiSessionLink,
 };
 
 #pragma mark - Helpers
@@ -465,7 +470,8 @@ typedef NS_ENUM(NSInteger, Tag) {
         || tag == TagRedditClientSecret
         || tag == TagImgurClientId
         || tag == TagImageChestAPIToken
-        || tag == TagGiphyAPIKey;
+        || tag == TagGiphyAPIKey
+        || tag == TagKagiSessionLink;
 }
 
 - (void)apollo_applySecureTextEntry:(BOOL)secure toCell:(UITableViewCell *)cell {
@@ -928,6 +934,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     // Refresh the Profile Layout summary after returning from that screen
     // (Density/Avatar/band switches may have just changed).
     [self reloadRowWithID:@"feat.profileLayout"];
+    [self reloadRowWithID:@"siri.settings"];
     // The Setup section footer (onboarding nudge) collapses once a Reddit key
     // exists, which may have just been entered on the pushed API Keys screen.
     // Section 0 is Setup on the hub; reloading it re-evaluates the footer.
@@ -992,6 +999,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[
         [self buildSetupSection],
+        [self buildSiriSection],
         [self buildFeaturesSection],
         [self buildShortcutsSection],
         [self buildDataSection],
@@ -1102,14 +1110,14 @@ typedef NS_ENUM(NSInteger, Tag) {
     ApolloSettingsRow *apiKeys =
         [self hubDisclosureRowWithID:@"setup.apiKeys"
                                title:@"Accounts & API Keys"
-                            subtitle:^NSString * { return @"Reddit · Imgur · Giphy · Image Chest"; }
+                            subtitle:^NSString * { return @"Reddit · Imgur · Giphy · Image Chest · Kagi"; }
                                 push:^UIViewController * {
             return [[ApolloAccountsAPIKeysViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
     apiKeys.iconSystemName = @"key.fill";
     apiKeys.iconTileColor = [UIColor systemGrayColor];
     return [ApolloSettingsSection sectionWithTitle:@"Setup"
-                                            footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs."
+                                            footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs, and a Kagi Session Link for searching Reddit with Kagi."
                                               rows:@[ apiKeys ]];
 }
 
@@ -1392,6 +1400,72 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                       redirectURI, userAgent ]];
 }
 
+// The Search tab's Kagi mode (ApolloKagiSearch.m). The Session Link lives in
+// the Keychain, not NSUserDefaults; the Search tab asks for it the first time
+// Kagi is picked, and this field changes or removes it.
+- (ApolloSettingsSection *)buildAPIKeysKagiSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *kagiLink =
+        [ApolloSettingsRow customRowWithID:@"api.kagiSessionLink"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_KagiSessionLink"
+                                                                           label:@"Kagi Session Link"
+                                                                     placeholder:@"https://kagi.com/search?token=…"
+                                                                            text:ApolloKagiSessionToken() ?: @""
+                                                                             tag:TagKagiSessionLink
+                                                                          detail:@"Search Reddit with Kagi from the Search tab's magnifier. Copy it from Kagi → Settings → Account → Session Link."];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            [weakSelf apollo_textFieldInCell:cell].keyboardType = UIKeyboardTypeURL;
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Kagi Search"
+                                            footer:@"For Kagi subscribers. Each page of Kagi results counts as one search on your Kagi plan. Clear the field to remove the link."
+                                              rows:@[ kagiLink ]];
+}
+
+// Saves (or removes) the Kagi Session Link typed into the settings field.
+// Anything that isn't a Session Link is refused and the saved one shown again.
+- (void)apollo_saveKagiSessionLinkFromField:(UITextField *)textField {
+    NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *current = ApolloKagiSessionToken();
+    if (trimmed.length == 0) {
+        textField.text = @"";
+        if (current.length) ApolloKagiSetSessionToken(nil);
+        return;
+    }
+    NSString *token = ApolloKagiNormalizeSessionToken(trimmed);
+    if (!token) {
+        textField.text = current ?: @"";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Not a Session Link"
+                                                                        message:@"Paste the whole Session Link from Kagi → Settings → Account. It starts with https://kagi.com/search?token="
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    textField.text = token;
+    if ([token isEqualToString:current]) return;
+    if (!ApolloKagiSetSessionToken(token)) {
+        textField.text = current ?: @"";
+        return;
+    }
+    // Saved either way; warn if Kagi turns it away, so a bad paste doesn't
+    // only show up later as "Kagi Session Expired" in the Search tab.
+    __weak typeof(self) weakSelf = self;
+    ApolloKagiCheckSessionToken(token, ^(ApolloKagiSessionCheck result, __unused NSError *error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || result != ApolloKagiSessionCheckRejected || !strongSelf.view.window) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Kagi Didn't Accept This Link"
+                                                                        message:@"It may have expired or been reset. Copy a fresh Session Link from Kagi → Settings → Account."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [strongSelf presentViewController:alert animated:YES completion:nil];
+    });
+}
+
 - (ApolloSettingsSection *)buildAPIKeysSignInSection {
     __weak typeof(self) weakSelf = self;
 
@@ -1587,6 +1661,22 @@ typedef NS_ENUM(NSInteger, Tag) {
     // Only exists while API-Key-Free Mode is on (see -_applyWebJSONEnabled:).
     webSessionLogin.visible = ^BOOL { return sWebJSONEnabled; };
 
+    // Reddit gives API-key-free accounts a much smaller request budget, so this
+    // trades a little polish for fewer requests while one is active (see
+    // ApolloReduceRateLimiting.h). Offered once at the first API-key-free sign-in.
+    ApolloSettingsRow *reduceRateLimiting =
+        [ApolloSettingsRow customRowWithID:@"api.reduceRateLimiting"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_ReduceRateLimiting"
+                                                label:@"Reduce Rate Limiting"
+                                               detail:@"Reddit limits API-key-free accounts more tightly. This uses fewer requests: profile pictures load in batches (without frames), Community Highlights refresh every 30 minutes, and your sign-in is checked less often."
+                                                   on:sReduceRateLimiting
+                                               action:@selector(reduceRateLimitingSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+    reduceRateLimiting.visible = ^BOOL { return sWebJSONEnabled; };
+
     // Modern Reddit Chat / Moderator Mail. Both work for API-key and
     // API-key-free accounts alike, so both are a plain choice that stays
     // switchable for everyone. These preferences are app-wide, like the rest of
@@ -1612,7 +1702,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             return [weakSelf switchCellWithIdentifier:@"Cell_API_ModernModmail"
                                                 label:@"Use Modern Moderator Mail"
-                                               detail:@"On uses Reddit's current Modmail with the active web-session account. Off keeps Apollo's native Moderator Mail, which only works for accounts signed in with an API key."
+                                               detail:@"On uses Reddit's current Modmail with the active web-session account. Off keeps Apollo's native Moderator Mail."
                                                    on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseModernRedditModmail]
                                               enabled:YES
                                                action:@selector(modernRedditModmailSwitchToggled:)]
@@ -1622,7 +1712,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Experimental"
                                             footer:@"Sign in to reddit.com instead of using API keys."
-                                              rows:@[ webJSON, webSessionLogin, modernChat, modernModmail ]];
+                                              rows:@[ webJSON, webSessionLogin, reduceRateLimiting, modernChat, modernModmail ]];
 }
 
 - (ApolloSettingsSection *)buildAPIKeysExtrasSection {
@@ -1862,6 +1952,11 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHideTabBarTitles]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf iconOnlyTabBarSwitchToggled:sender]; }];
 
+    // iPad horizontal bars deliberately preserve labels in both positions.
+    iconOnlyTabBar.visible = ^BOOL {
+        return !(IsLiquidGlass() && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad);
+    };
+
     // Icon-Only already hides every tab label. Hide the narrower profile-only
     // option while it is active, then reinsert it with its remembered value.
     ApolloSettingsRow *hideUsernameTab =
@@ -1943,10 +2038,19 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     // Temporary iPad stopgap (#387): only show it where the option can work.
     ApolloSettingsRow *iPadTabBarBottom =
-        [ApolloSettingsRow switchRowWithID:@"gen.iPadTabBarBottom"
-                                     title:@"Move Tab Bar to Bottom"
-                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom]; }
-                                  onToggle:^(UISwitch *sender) { [weakSelf iPadTabBarBottomSwitchToggled:sender]; }];
+        [ApolloSettingsRow valueRowWithID:@"gen.iPadTabBarBottom"
+                                   title:@"Tab Bar Position"
+                                  detail:^NSString * { return sIPadTabBarBottom ? @"Bottom" : @"Top"; }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"gen.iPadTabBarBottom"],
+                @"Tab Bar Position", @[@"Top", @"Bottom"], sIPadTabBarBottom ? 1 : 0,
+                ^(NSInteger index) {
+                    sIPadTabBarBottom = index == 1;
+                    [NSUserDefaults.standardUserDefaults setBool:sIPadTabBarBottom forKey:UDKeyIPadTabBarBottom];
+                    [NSNotificationCenter.defaultCenter postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
+                    [weakSelf reloadRowWithID:@"gen.iPadTabBarBottom"];
+                });
+        }];
     iPadTabBarBottom.visible = ^BOOL {
         return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && IsLiquidGlass();
     };
@@ -2087,9 +2191,27 @@ typedef NS_ENUM(NSInteger, Tag) {
         }];
     centerBetween.visible = ^BOOL { return IsLiquidGlass() && !sCollapseNavigationActions; };
 
+    NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
+    ApolloSettingsRow *trueBlackKeyboard =
+        [ApolloSettingsRow valueRowWithID:@"interface.trueBlackKeyboard"
+                                    title:@"True Black Keyboard"
+                                   detail:^NSString * {
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            return trueBlackTitles[MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1))];
+        }
+                                 onSelect:^{
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.trueBlackKeyboard"],
+                @"True Black Keyboard", trueBlackTitles, MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1)),
+                ^(NSInteger picked) {
+                    [NSUserDefaults.standardUserDefaults setInteger:picked forKey:UDKeyTrueBlackKeyboardMode];
+                    [weakSelf reloadRowWithID:@"interface.trueBlackKeyboard"];
+                });
+        }];
+
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
-                                            footer:@"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Liquid Glass is required for the remaining options.\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."
-                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, collapseActions, centerBetween, scrollEdgeEffect ]];
+                                            footer:@"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. True Black Keyboard paints the keyboard background pure black in the chosen appearance (takes effect the next time the keyboard appears). Liquid Glass is required for the remaining options.\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."
+                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
@@ -3028,6 +3150,24 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     crashReports.iconTileColor = [UIColor systemOrangeColor];
 
     return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, crashReports ]];
+}
+
+// An opt-in integration belongs near Setup, with its own explanation rather
+// than below crash reports and the unrelated anonymous-heartbeat footer.
+- (ApolloSettingsSection *)buildSiriSection {
+    ApolloSettingsRow *siri = [ApolloSettingsRow disclosureRowWithID:@"siri.settings" title:@"Siri & Spotlight"
+        detail:^NSString * {
+            return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySiriContentIndexing] ? @"On" : @"Off";
+        } push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"siri-spotlight");
+        }];
+    siri.iconSystemName = @"sparkle.magnifyingglass";
+    siri.iconTileColor = UIColor.systemPurpleColor;
+    ApolloSettingsSection *section = [ApolloSettingsSection sectionWithTitle:nil
+        footer:@"Find Apollo posts and communities with Siri, Spotlight and Shortcuts. Content indexing is off until you enable it."
+        rows:@[siri]];
+    section.visible = ^BOOL { return NSClassFromString(@"ApolloContentBridge") != Nil; };
+    return section;
 }
 
 - (ApolloSettingsSection *)buildAboutSection {
@@ -4107,6 +4247,8 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     } else if (textField.tag == TagGiphyAPIKey) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         [[NSUserDefaults standardUserDefaults] setValue:textField.text ?: @"" forKey:UDKeyGiphyAPIKey];
+    } else if (textField.tag == TagKagiSessionLink) {
+        [self apollo_saveKagiSessionLinkFromField:textField];
     } else if (textField.tag == TagRedirectURI) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sRedirectURI = textField.text;
@@ -4300,6 +4442,10 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     [self visibilityDidChange];
 }
 
+- (void)reduceRateLimitingSwitchToggled:(UISwitch *)sender {
+    ApolloReduceRateLimitingSetEnabled(sender.isOn);
+}
+
 // Modern Chat / Modmail are a plain app-wide choice for every account.
 - (void)modernRedditChatSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseModernRedditChat];
@@ -4438,12 +4584,6 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
         [[NSNotificationCenter defaultCenter] postNotificationName:ApolloTabBarScrollBehaviorChangedNotification object:nil];
     }
     [self reloadRowWithID:@"interface.tabBarScrollBehavior"];
-}
-
-- (void)iPadTabBarBottomSwitchToggled:(UISwitch *)sender {
-    sIPadTabBarBottom = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sIPadTabBarBottom forKey:UDKeyIPadTabBarBottom];
-    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
 }
 
 // Takes effect on next relaunch — see ApolloLiquidGlass.xm.
@@ -4777,8 +4917,30 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 
 @implementation ApolloAccountsAPIKeysViewController
 - (NSString *)apollo_screenTitle { return @"Accounts & API Keys"; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // The sign-in and rate-limit offers can turn Reduce Rate Limiting on while
+    // this screen stays on the stack (the sign-in sheet doesn't trigger
+    // another viewWillAppear), so follow the setting directly.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(apollo_reduceRateLimitingDidChange:)
+                                                 name:ApolloReduceRateLimitingDidChangeNotification
+                                               object:nil];
+}
+- (void)apollo_reduceRateLimitingDidChange:(NSNotification *)notification {
+    (void)notification;
+    // Update the switch in place: a reload here would cut short the switch's
+    // own animation when the change came from tapping it.
+    UITableViewCell *cell = [self cellForRowID:@"api.reduceRateLimiting"];
+    for (UIView *subview in cell.contentView.subviews) {
+        if (![subview isKindOfClass:[UISwitch class]]) continue;
+        UISwitch *toggle = (UISwitch *)subview;
+        if (toggle.isOn != sReduceRateLimiting) [toggle setOn:sReduceRateLimiting animated:YES];
+    }
+}
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildAPIKeysDefaultSection],
+              [self buildAPIKeysKagiSection],
               [self buildAPIKeysSignInSection],
               [self buildAPIKeysExperimentalSection],
               [self buildAPIKeysExtrasSection] ];
