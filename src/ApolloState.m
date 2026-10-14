@@ -85,6 +85,7 @@ BOOL sInfoRowTapComments = YES;    // effective default ON via registerDefaults 
 BOOL sInfoRowPopupMode = YES;      // info details + comment insights → popup; default ON (UDKeyInfoRowPopupMode)
 BOOL sInfoRowOverlayMode = NO;     // info details + comment insights → overlay; default OFF (UDKeyInfoRowOverlayMode)
 BOOL sInfoRowTapTranslation = YES; // effective default ON via registerDefaults (UDKeyInfoRowTapTranslation)
+BOOL sThreeStateVoting = NO;
 BOOL sCollapseNavigationActions = NO;
 BOOL sScrollReturnButton = YES;
 BOOL sCenterTitleBetweenButtons = NO;
