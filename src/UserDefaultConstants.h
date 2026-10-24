@@ -3,6 +3,11 @@
 static NSString *const UDKeySettingsTabShortcuts = @"SettingsTabShortcuts";
 
 // UserDefaults keys
+// Not registered: absence distinguishes upgrades from fresh installs before
+// constructors write preferences. 1 pending, 2 completed/restored, 3 skipped,
+// 4 existing installation. The preset records a starting point, never a policy.
+static NSString *const UDKeySetupAssistantState = @"ApolloRebornSetupAssistantState";
+static NSString *const UDKeySetupPreset = @"ApolloRebornSetupPreset";
 // Optional iOS 27 Siri framework's preference; default OFF. The actor owns
 // state, with no duplicate BOOL mirror (Shortcuts can change it out of UI).
 static NSString *const UDKeySiriContentIndexing = @"ApolloSiriContentEnabled";
@@ -152,7 +157,6 @@ static NSString *const UDKeyEnableFlairColors = @"EnableFlairColors";
 static NSString *const UDKeyBoldPostTitles = @"BoldPostTitles";
 static NSString *const ApolloFlairColorsChangedNotification = @"ApolloFlairColorsChangedNotification";
 static NSString *const UDKeyReadPostMaxCount = @"ReadPostMaxCount";
-static NSString *const UDKeyShowRecentlyReadThumbnails = @"ShowRecentlyReadThumbnails";
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
 // "Unmute Videos in Feed": how feed videos behave when they autoplay while
@@ -231,6 +235,8 @@ static NSString *const UDKeyTapToRevealDeletedComments = @"TapToRevealDeletedCom
 // resets when that thread is left. See ApolloDeletedCommentsMenu.xm.
 static NSString *const UDKeyPassiveDeletedComments = @"PassiveDeletedComments";
 static NSString *const UDKeyFilterNSFWRecentlyRead = @"FilterNSFWRecentlyRead";
+// Recently Read's own post size (BOOL, compact when YES); unset follows Apollo's.
+static NSString *const UDKeyRecentlyReadCompactPosts = @"RecentlyReadCompactPosts";
 static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 // Allow non-DDG public text proxies (r.jina.ai, allorigins, codetabs) as a
 // last resort for album metadata when Imgur is unreachable — DDG itself cannot
@@ -352,6 +358,23 @@ static NSString *const UDKeyLiquidGlassEnabled = @"LiquidGlassEnabled";
 // dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
 // default OFF via registerDefaults. See ApolloLiquidGlass.xm.
 static NSString *const UDKeyTabBarSwipeNavigation = @"TabBarSwipeNavigation";
+// Experimental large post cards on Duo's opened landscape display:
+// 0 = Original (default), 2 = Focused feed; value 1 is retired.
+static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
+// Open Duo subreddit panel appearance: NO = Standard
+// (default), YES = Liquid Glass. The panel keeps the same size and navigation.
+static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelGlassEnabled";
+// iPad only. When ON, replaces each tab's single navigation stack with a
+// multi-column UISplitViewController: sidebar (the tab's own root list) →
+// content → detail. Opt-in; default OFF via registerDefaults. Installation
+// happens at scene connect, so a change needs a relaunch to apply — the
+// settings row confirms and restarts rather than pretending it is live.
+// Supersedes UDKeyIPadTabBarBottom while active (the floating pill is hidden).
+// See src/ipad/ and docs/ipad-pane-layout-plan.md.
+static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
+// Consumed after the one-time iPad Layout invitation is actually presented.
+// Independent of the layout toggle: declining never enables or re-prompts.
+static NSString *const UDKeyIPadLayoutWelcomeSeen = @"IPadLayoutWelcomeSeen";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill
@@ -704,16 +727,21 @@ static NSString *const UDKeyBarkSelectedIconName = @"BarkSelectedIconName";
 // on-by-default). See ApolloUsageHeartbeat.{h,m}.
 static NSString *const UDKeyDisableUsageHeartbeat = @"DisableUsageHeartbeat";
 
-// In-app update check (ApolloUpdateChecker.{h,m}). Once a day it reads
+// In-app update check (ApolloUpdateChecker.{h,m}). Every 15 active minutes it reads
 // release-manifest.json from GitHub and offers to hand off to the user's
 // sideloader. Default ON; the Manual "Check for Updates" row works either way.
 static NSString *const UDKeyAutomaticUpdateChecks = @"AutomaticUpdateChecks";
 // Internal bookkeeping (not user-facing).
 static NSString *const UDKeyUpdateLastCheck = @"UpdateLastCheck";           // NSDate of the last good fetch
+static NSString *const UDKeyUpdateLastFailure = @"UpdateLastFailure";       // NSDate; short automatic retry backoff
+static NSString *const UDKeyUpdateDeferredReminder = @"UpdateDeferredReminder"; // {version, date}; Later snoozes for 24h
 static NSString *const UDKeyUpdateSkippedVersion = @"UpdateSkippedVersion"; // "3.9.0" the user chose to skip
 
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
+// Restores the last feed, open post and reading position after process eviction.
+// Default YES. Turning it off deletes any saved or pending reading session.
+static NSString *const UDKeyRestoreReadingSession = @"RestoreReadingSession";
 // Replaces Apollo's fixed two/three-tile Reddit-gallery mosaic in large feed
 // cards with a horizontally paging image carousel. Default YES. See
 // ApolloFeedGalleryCarousel.xm.

@@ -671,8 +671,8 @@ static NSString *const kApolloDevvitInventoryScript = @""
 "    if (t.indexOf('-') > 0) { tags[t] = (tags[t] || 0) + 1; }"
 "  }"
 "  var sp = document.querySelector('shreddit-post');"
-"  return JSON.stringify({ t: (document.title || '').slice(0, 60),"
-"    u: location.pathname.slice(0, 70),"
+"  return JSON.stringify({ tl: (document.title || '').length,"
+"    u: location.pathname.split('/').slice(0, 5).join('/'),"
 "    pt: sp ? sp.getAttribute('post-type') : null,"
 "    tags: Object.keys(tags).slice(0, 30) });"
 "})();";
@@ -1486,13 +1486,20 @@ static const NSUInteger kApolloDevvitMaxLiveWidgets = 4;
         // a bot-challenge auto-redirect); poll fast for ~18s then give up into
         // the retry cover (after one silent reload).
         if (attempt >= kApolloDevvitPreRevealMaxAttempts) {
-            ApolloLog(@"[Devvit] %@ never produced a devvit element (last=%@)", self.fullName, result);
+            // Not the raw probe JSON: its title field is the post title (it is
+            // only read for the "humanity" interstitial check above).
+            NSString *lastTitle = [info[@"title"] isKindOfClass:[NSString class]] ? info[@"title"] : @"";
+            ApolloLog(@"[Devvit] %@ never produced a devvit element (last state=%@ title=%lu chars)",
+                      self.fullName, info[@"state"] ?: @"?", (unsigned long)lastTitle.length);
             // Dump what the page actually is (bot-block page vs stuck shell)
             // before giving up — reddit's edge intermittently serves a plain
-            // block page that never hydrates.
+            // block page that never hydrates. Shape only, never page text: the
+            // title/body are the post and its comments, and the path ends in
+            // the title slug (kept to /r/<sub>/comments/<id>).
             [self.webView evaluateJavaScript:
-                @"JSON.stringify({t:document.title.slice(0,60),u:location.pathname.slice(0,80),"
-                 "b:(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,120)})"
+                @"(function(){var t=document.title||'',b=(document.body&&document.body.innerText)||'';"
+                 "return JSON.stringify({tl:t.length,bl:b.length,u:location.pathname.split('/').slice(0,5).join('/'),"
+                 "block:/blocked|verif|moment|security|captcha|robot/i.test(t+' '+b.slice(0,300))})})()"
                               completionHandler:^(id r, __unused NSError *e) {
                 ApolloLog(@"[Devvit] page state at failure: %@", r);
             }];
@@ -2404,7 +2411,7 @@ static void ApolloDevvitRegisterHostParent(id parentNode) {
 
 static UITableView *ApolloDevvitTableViewForNode(id node) {
     if (![node isNodeLoaded]) return nil;
-    UIView *v = [node view];
+    UIView *v = ApolloNodeView(node);
     while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
     return (UITableView *)v;
 }
@@ -2614,7 +2621,7 @@ static void ApolloDevvitReloadRowForParentAttempt(id parentNode, NSString *fullN
     }
     UITableViewCell *cell = nil;
     UITableView *table = nil;
-    for (UIView *v = [parentNode view]; v; v = v.superview) {
+    for (UIView *v = ApolloNodeView(parentNode); v; v = v.superview) {
         if (!cell && [v isKindOfClass:[UITableViewCell class]]) cell = (UITableViewCell *)v;
         if (cell && [v isKindOfClass:[UITableView class]]) { table = (UITableView *)v; break; }
     }
@@ -2742,7 +2749,7 @@ static void ApolloDevvitRelayoutHosts(BOOL feedOnly) {
         for (id parent in sDevvitHostParents.allObjects) {
             BOOL isFeedRow = richMediaClass && [parent isKindOfClass:richMediaClass];
             if (feedOnly && !isFeedRow) continue;
-            if (![parent isNodeLoaded] || ![parent view].window) continue;
+            if (![parent isNodeLoaded] || !ApolloNodeView(parent).window) continue;
             if (!isFeedRow) {
                 ApolloDevvitInvalidateUpToCell((ASDisplayNode *)parent);
                 UITableView *table = ApolloDevvitTableViewForNode(parent);
@@ -2779,8 +2786,8 @@ static void ApolloDevvitRelayoutHosts(BOOL feedOnly) {
                            dispatch_get_main_queue(), ^{
                 for (id parent in sDevvitHostParents.allObjects) {
                     if (richMediaClass && [parent isKindOfClass:richMediaClass]) continue;
-                    if (![parent isNodeLoaded] || ![parent view].window) continue;
-                    ApolloDevvitMountCommentsHeadersInView([parent view].window);
+                    if (![parent isNodeLoaded] || !ApolloNodeView(parent).window) continue;
+                    ApolloDevvitMountCommentsHeadersInView(ApolloNodeView(parent).window);
                     break;
                 }
             });
@@ -3069,7 +3076,7 @@ static void ApolloDevvitMountCommentsHeadersInView(UIView *root) {
     Class richMediaClass = ApolloClassRichMediaNode;
     for (id parent in sDevvitHostParents.allObjects) {
         if (richMediaClass && [parent isKindOfClass:richMediaClass]) continue;  // feed rows
-        if (![parent isNodeLoaded] || ![[parent view] isDescendantOfView:root]) continue;
+        if (![parent isNodeLoaded] || ![ApolloNodeView(parent) isDescendantOfView:root]) continue;
         ASDisplayNode *host = objc_getAssociatedObject(parent, kApolloDevvitHostNodeKey);
         if (!host || ![host isNodeLoaded]) continue;
         // A widget shell without a page (torn down, or failed) must not
@@ -3103,7 +3110,7 @@ static void ApolloDevvitReleaseCommentsWidgetsInView(UIView *root) {
         if (!sDevvitFeedWidgets) continue;  // rows show no widgets while that setting is off
         for (id parent in sDevvitHostParents.allObjects) {
             if (!richMediaClass || ![parent isKindOfClass:richMediaClass]) continue;
-            if (![parent isNodeLoaded] || ![parent view].window) continue;
+            if (![parent isNodeLoaded] || !ApolloNodeView(parent).window) continue;
             RDKLink *link = ApolloDevvitLinkOfParent(parent);
             if (!fullName || ![ApolloDevvitFullName(link) isEqualToString:fullName]) continue;
             ASDisplayNode *host = objc_getAssociatedObject(parent, kApolloDevvitHostNodeKey);
@@ -3201,7 +3208,7 @@ void ApolloDevvitDebugSweep(void) {
             @try { pf = ((CGRect (*)(id, SEL))objc_msgSend)(parent, @selector(frame)); } @catch (__unused id e) {}
             UITableViewCell *cell = nil; UITableView *table = nil;
             if ([parent isNodeLoaded]) {
-                for (UIView *v = [parent view]; v; v = v.superview) {
+                for (UIView *v = ApolloNodeView(parent); v; v = v.superview) {
                     if (!cell && [v isKindOfClass:[UITableViewCell class]]) cell = (UITableViewCell *)v;
                     if (cell && [v isKindOfClass:[UITableView class]]) { table = (UITableView *)v; break; }
                 }

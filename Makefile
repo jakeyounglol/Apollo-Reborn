@@ -1,7 +1,27 @@
 export ARCHS = arm64
 export libFLEX_ARCHS = arm64
 
-TARGET := iphone:clang:26.0:14.0
+# SDK 26.0 preserves the supported iOS 14 device deployment floor. Merely
+# pinning SDK 27.1 by name does not bypass its iOS 15 minimum deployment target.
+# Alternate SDK pins are developer builds and require an explicit iOS 15+ floor.
+# Simulator callers pass TARGET explicitly and bypass this device configuration.
+APOLLO_DEVICE_SDK ?= 26.0
+_APOLLO_XCODE_DEVELOPER := $(or $(DEVELOPER_DIR),$(shell xcode-select -p 2>/dev/null))
+
+ifeq ($(filter command line,$(origin TARGET)),)
+  ifneq ($(APOLLO_DEVICE_SDK),26.0)
+    ifeq ($(origin APOLLO_DEVICE_DEPLOY),undefined)
+      $(error An alternate APOLLO_DEVICE_SDK requires an explicit compatible APOLLO_DEVICE_DEPLOY; SDK 27.1 requires 15.0 or newer)
+    endif
+    ifneq ($(shell printf '%s\n' '$(APOLLO_DEVICE_DEPLOY)' | awk -F. '{ print ($$1 + 0 >= 15) }'),1)
+      $(error Alternate device SDK builds require APOLLO_DEVICE_DEPLOY=15.0 or newer; use SDK 26.0 for iOS 14 support)
+    endif
+  endif
+  APOLLO_DEVICE_DEPLOY ?= 14.0
+  TARGET := iphone:clang:$(APOLLO_DEVICE_SDK):$(APOLLO_DEVICE_DEPLOY)
+  $(info [ApolloReborn] Device Theos SDK pin $(APOLLO_DEVICE_SDK) (TARGET=$(TARGET)))
+endif
+
 INSTALL_TARGET_PROCESSES = Apollo
 THEOS_LEAN_AND_MEAN = 1
 
@@ -55,7 +75,20 @@ ApolloReborn_FILES = \
     $(WHATS_NEW_GEN_M) \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloCommon.m \
+    $(SRC_DIR)/ApolloLogRedaction.m \
+    $(SRC_DIR)/ApolloSessionState.m \
+    $(SRC_DIR)/ApolloSessionRestoration.xm \
     $(SRC_DIR)/ApolloInlineImageMetadata.m \
+    $(SRC_DIR)/ApolloDeviceGeometry.m \
+    $(SRC_DIR)/ApolloDeviceDisplay.m \
+    $(SRC_DIR)/ApolloDeviceDisplayHooks.xm \
+    $(SRC_DIR)/ApolloDuoSplitView.xm \
+    $(SRC_DIR)/ApolloDuoAccount.m \
+    $(SRC_DIR)/ApolloDuoRailCore.m \
+    $(SRC_DIR)/ApolloDuoNavigationGestures.m \
+    $(SRC_DIR)/ApolloDuoRail.xm \
+    $(SRC_DIR)/ApolloDuoSubsChrome.m \
+    $(SRC_DIR)/ApolloDuoSubsChromeHooks.xm \
     $(SRC_DIR)/ApolloProfilePagination.xm \
     $(SRC_DIR)/ApolloListEmptyState.xm \
     $(SRC_DIR)/ApolloEmptyFeedNextPage.xm \
@@ -64,6 +97,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsForm.m \
+    $(SRC_DIR)/settings/ApolloSetupPreset.m \
+    $(SRC_DIR)/settings/ApolloSetupAssistant.m \
     $(SRC_DIR)/settings/ApolloSettingsShortcutsViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsPinnedPreview.m \
     $(SRC_DIR)/settings/ApolloProfilePicturesPreview.m \
@@ -83,11 +118,13 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsSearch.m \
     $(SRC_DIR)/ApolloToast.m \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
+    $(SRC_DIR)/ApolloUploadAlbumCompatibility.m \
     $(SRC_DIR)/ApolloNotificationBackend.m \
     $(SRC_DIR)/ApolloBarkIconResolver.m \
     $(SRC_DIR)/ApolloUsageHeartbeat.m \
     $(SRC_DIR)/ApolloAppIcon.m \
     $(SRC_DIR)/ApolloUpdateManifest.m \
+    $(SRC_DIR)/ApolloUpdateManifestCache.m \
     $(SRC_DIR)/ApolloUpdatePromptViewController.m \
     $(SRC_DIR)/ApolloUpdateChecker.m \
     $(SRC_DIR)/ApolloPushNotifications.m \
@@ -116,9 +153,12 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditHeaders.xm \
     $(SRC_DIR)/ApolloSubredditHighlights.xm \
     $(SRC_DIR)/ApolloGalleryFeed.m \
+    $(SRC_DIR)/ApolloGallerySource.xm \
     $(SRC_DIR)/ApolloGalleryImageLoader.m \
+    $(SRC_DIR)/ApolloGalleryMediaActions.m \
     $(SRC_DIR)/ApolloGalleryImageViewer.m \
     $(SRC_DIR)/ApolloGalleryViewController.m \
+    $(SRC_DIR)/ApolloGalleryPinchIntroduction.m \
     $(SRC_DIR)/ApolloGalleryVideoExport.xm \
     $(SRC_DIR)/ApolloSaveAllMediaItems.m \
     $(SRC_DIR)/ApolloSaveAllMedia.xm \
@@ -193,6 +233,24 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloListBottomInsetGuard.xm \
     $(SRC_DIR)/ApolloTabBarHideStyle.xm \
     $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
+    $(SRC_DIR)/ipad/ApolloPaneLayout.m \
+    $(SRC_DIR)/ipad/ApolloIPadLayoutWelcome.m \
+    $(SRC_DIR)/ipad/ApolloPaneDiagnostics.m \
+    $(SRC_DIR)/ipad/ApolloPaneGeometry.m \
+    $(SRC_DIR)/ipad/ApolloPaneTransitionObserver.m \
+    $(SRC_DIR)/ipad/ApolloPaneChrome.m \
+    $(SRC_DIR)/ipad/ApolloPaneSidebar.m \
+    $(SRC_DIR)/ipad/ApolloPaneFocus.m \
+    $(SRC_DIR)/ipad/ApolloPaneMenus.xm \
+    $(SRC_DIR)/ipad/ApolloPaneContent.xm \
+    $(SRC_DIR)/ipad/ApolloPaneColumnHostViewController.m \
+    $(SRC_DIR)/ipad/ApolloPaneRouting.m \
+    $(SRC_DIR)/ipad/ApolloPaneForwardHistory.m \
+    $(SRC_DIR)/ipad/ApolloPaneSplitViewController.m \
+    $(SRC_DIR)/ipad/ApolloPaneInstall.xm \
+    $(SRC_DIR)/ipad/ApolloPaneEntryPoints.xm \
+    $(SRC_DIR)/ipad/ApolloPaneRouter.xm \
+    $(SRC_DIR)/ipad/ApolloPaneGallery.m \
     $(SRC_DIR)/ApolloScrollEdgeEffect.xm \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \
@@ -202,8 +260,6 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloIntelligenceBridge.xm \
     $(SRC_DIR)/settings/ApolloSiriSettingsViewController.m \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
-    $(SRC_DIR)/ApolloSaveAllMediaItems.m \
-    $(SRC_DIR)/ApolloSaveAllMedia.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
     $(SRC_DIR)/ApolloHiddenContentMedia.m \
@@ -287,6 +343,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSearchNativeBar.xm \
     $(SRC_DIR)/ApolloSearchObserverCleanup.xm \
     $(SRC_DIR)/ApolloJumpBarSuggestionTint.xm \
+    $(SRC_DIR)/ApolloJumpBarTitle.xm \
     $(SRC_DIR)/ApolloSubredditSwitcherSheet.xm \
     $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloSearchTabFixes.xm \
@@ -315,6 +372,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDirectChatWeb.xm \
     $(SRC_DIR)/ApolloLinkCardTitleFallback.xm \
     $(SRC_DIR)/ApolloFeedTextPostThumbnails.xm \
+    $(SRC_DIR)/ApolloMediaHinge.xm \
     $(SRC_DIR)/ApolloTweetBuddy.xm \
 	$(SRC_DIR)/ApolloVisionOSFix.xm \
     $(SRC_DIR)/ApolloVisionOSHover.xm \
@@ -378,9 +436,10 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/crash/ApolloCrashBugsnagNeutralize.xm \
     $(KSCRASH_FILES) \
     $(SSZIPARCHIVE_FILES)
-ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion
+ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion SpriteKit
 # The YouTube caption guard reads the per-app subtitle setting (ApolloYouTubeCaptions.xm).
 ApolloReborn_FRAMEWORKS += MediaAccessibility
+ApolloReborn_WEAK_FRAMEWORKS += Symbols
 ApolloReborn_LIBRARIES = z iconv
 # FoundationModels (Apple on-device AI) only ships in the iOS 26+ SDK. Weak-link
 # it so the dylib still loads on older OSes (the Swift bridge guards every call
@@ -402,9 +461,9 @@ endif
 # dir explicitly, only when it's present. (Nothing uses the macros right now —
 # theme generation moved off guided generation entirely — but the flag is
 # harmless and any future @Generable use silently needs it.)
-FM_PLUGIN_PATH := $(shell xcode-select -p)/Platforms/iPhoneOS.platform/Developer/usr/lib/swift/host/plugins
-ifneq ($(wildcard $(FM_PLUGIN_PATH)/libFoundationModelsMacros.dylib),)
-ApolloReborn_SWIFTFLAGS += -plugin-path $(FM_PLUGIN_PATH)
+FM_PLUGIN_PATH := $(_APOLLO_XCODE_DEVELOPER)/Platforms/iPhoneOS.platform/Developer/usr/lib/swift/host/plugins
+ifneq ($(shell test -f "$(FM_PLUGIN_PATH)/libFoundationModelsMacros.dylib" && echo yes),)
+ApolloReborn_SWIFTFLAGS += -plugin-path "$(FM_PLUGIN_PATH)"
 endif
 # Apple's Translation framework (used by the on-device "apple" translation provider in
 # ApolloAppleTranslation.swift) only exists on iOS 18.0+. Weak-link it so the tweak still

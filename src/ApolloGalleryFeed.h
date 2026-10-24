@@ -23,7 +23,8 @@
 //     to somebody other than the visible account.
 //   • Signed out / neither — the www.reddit.com public JSON is used as-is.
 // If the first attempt comes back 401/403 the fetch retries once on the other
-// host, so a stale captured bearer can't strand the gallery.
+// host, so a stale captured bearer can't strand the gallery. Private Saved
+// feeds only retry a rotated credential on the bound account, never anonymously.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -166,6 +167,10 @@ static inline BOOL ApolloGallerySortUsesWindow(ApolloGallerySort sort) {
 // posts (`/user/<name>/submitted`), defaulting to New — a person's gallery
 // reads most naturally in the order they posted.
 - (instancetype)initWithUsername:(NSString *)username NS_DESIGNATED_INITIALIZER;
+// The active account's Saved listing. A non-nil category selects Apollo's
+// local Saved category database; nil loads All. Captures the account when
+// opened, just like the other feeds, and keeps the native saved order.
+- (instancetype)initWithSavedCategory:(nullable NSString *)category NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
 // Populated for a single-subreddit feed and empty for every other feed kind.
@@ -191,6 +196,8 @@ static inline BOOL ApolloGallerySortUsesWindow(ApolloGallerySort sort) {
 // those entries there.
 @property (nonatomic, readonly) BOOL supportsRisingSort;
 @property (nonatomic, readonly) BOOL supportsBestSort;
+// Saved has its own order and does not accept subreddit listing sorts.
+@property (nonatomic, readonly) BOOL supportsSorting;
 
 // Changing either resets the feed (items cleared, cursor dropped). Use
 // -setSort:topWindow: to change both at once so only one reset happens.
@@ -208,14 +215,27 @@ static inline BOOL ApolloGallerySortUsesWindow(ApolloGallerySort sort) {
 // Human-readable label for the current sort, e.g. "Top: This Week".
 @property (nonatomic, readonly) NSString *sortDisplayName;
 
-// Loads the next batch, walking as many listing pages as it takes to gather a
-// batch worth of media the CURRENT FILTER admits (a video-only filter on a
-// mostly-photo subreddit would otherwise return a page of nothing). The
-// completion runs on the main thread with the index range appended to `items`;
-// `addedCount` is 0 when the batch found nothing new. A call made while a load
+// Loads through the next page with new media the CURRENT FILTER admits and
+// publishes it immediately, for both fresh and already-populated feeds. Pages
+// with no matching media are skipped within bounded request/empty-page limits.
+// The completion runs on the main thread with the range appended to `items`;
+// its length is 0 when no new matching media was found. A call made while a load
 // is already in flight, or after the feed is exhausted, completes immediately
-// with addedCount 0 and does not start a second request.
+// with an empty range and does not start a second request.
 - (void)loadNextBatchWithCompletion:(nullable void (^)(NSRange addedRange, NSString *_Nullable errorMessage))completion;
+
+// Populate a fresh feed synchronously from the source screen's complete loaded
+// listing (the data dictionary: children + after). Uses the same media parser,
+// deduplication and filtering as network pages. The caller must match the source
+// account, listing and sort before handing over its continuation cursor.
+// Non-Saved snapshots with no media return NO without consuming the cursor.
+// Saved snapshots retain their continuation even when media-free, and finish
+// immediately when the listing or all category members have been inspected.
+- (BOOL)seedFromListing:(NSDictionary *)listing;
+
+// Saved-source entry point: also requires the source's selected category and
+// current account to match this feed before adopting its loaded listing.
+- (BOOL)seedFromSavedListing:(NSDictionary *)listing category:(nullable NSString *)category;
 
 // Drops every item and the cursor so the next load starts from the top.
 - (void)reset;

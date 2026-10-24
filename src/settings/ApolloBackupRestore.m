@@ -1,4 +1,5 @@
 #import "settings/ApolloBackupRestore.h"
+#import "settings/ApolloSetupPreset.h"
 #import "settings/ApolloAutomaticBackup.h"
 
 #import "ApolloCommon.h"
@@ -746,6 +747,8 @@ BOOL ApolloBackupRestoreRestoreFromZipURL(NSURL *zipURL, NSString **outErrorTitl
         }
         [defaults setObject:mainPrefs[key] forKey:key];
     }
+    // A restore is a complete setup, including old and mid-assistant backups.
+    [defaults setInteger:ApolloSetupStateCompleted forKey:UDKeySetupAssistantState];
     [defaults synchronize];
 
     // Sync in-memory globals with restored values.
@@ -774,7 +777,6 @@ BOOL ApolloBackupRestoreRestoreFromZipURL(NSURL *zipURL, NSString **outErrorTitl
     if (sPerPostCommentSort && [defaults boolForKey:UDKeyApolloRememberSubredditCommentsSort]) {
         [defaults setBool:NO forKey:UDKeyApolloRememberSubredditCommentsSort];
     }
-    sShowRecentlyReadThumbnails = [defaults boolForKey:UDKeyShowRecentlyReadThumbnails];
     sEnableFlairColors = [defaults boolForKey:UDKeyEnableFlairColors];
     sPreferredGIFFallbackFormat = ([defaults integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sUnmuteCommentsVideos = [defaults integerForKey:UDKeyUnmuteCommentsVideos];
