@@ -107,6 +107,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloBackupDocument.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackup.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackupViewController.m \
+    $(SRC_DIR)/settings/ApolloKeylessRouteStatusViewController.m \
     $(SRC_DIR)/settings/ApolloLocalBackupsViewController.m \
     $(SRC_DIR)/settings/ApolloBackupActionsCell.m \
     $(SRC_DIR)/settings/ApolloThanksToViewController.m \
@@ -383,6 +384,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWebJSON.m \
     $(SRC_DIR)/ApolloReduceRateLimiting.m \
     $(SRC_DIR)/ApolloWebJSONWriteRepair.m \
+    $(SRC_DIR)/ApolloWebJSONRoutes.m \
+    $(SRC_DIR)/ApolloWebJSONRouteUpdates.m \
     $(SRC_DIR)/ApolloWebJSONIdentity.xm \
     $(SRC_DIR)/ApolloWebSessionLoginViewController.m \
     $(SRC_DIR)/ApolloWebSessionStore.m \

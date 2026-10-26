@@ -26,6 +26,8 @@
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloReduceRateLimiting.h"
+#import "ApolloWebJSONRouteUpdates.h"
+#import "settings/ApolloKeylessRouteStatusViewController.h"
 #import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
 #import "ApolloKagiSearchParsing.h"  // ApolloKagiNormalizeSessionToken()
 #import "ApolloAccountCredentials.h"
@@ -1842,6 +1844,18 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onSelect:nil];
     reduceRateLimiting.visible = ^BOOL { return sWebJSONEnabled; };
 
+    // Which routes API-key-free reads are taking, what Reddit has blocked
+    // since launch, and the Use Route Updates switch
+    // (ApolloKeylessRouteStatusViewController).
+    ApolloSettingsRow *routeStatus =
+        [ApolloSettingsRow disclosureRowWithID:@"api.routeStatus"
+                                         title:@"Routes"
+                                        detail:^NSString *{ return ApolloWebJSONRouteStatusHeadline(); }
+                                          push:^UIViewController *{
+            return [[ApolloKeylessRouteStatusViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    routeStatus.visible = ^BOOL { return sWebJSONEnabled; };
+
     // Modern Reddit Chat / Moderator Mail. Both work for API-key and
     // API-key-free accounts alike, so both are a plain choice that stays
     // switchable for everyone. These preferences are app-wide, like the rest of
@@ -1877,7 +1891,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Experimental"
                                             footer:@"Sign in to reddit.com instead of using API keys."
-                                              rows:@[ webJSON, webSessionLogin, reduceRateLimiting, modernChat, modernModmail ]];
+                                              rows:@[ webJSON, webSessionLogin, reduceRateLimiting, routeStatus, modernChat, modernModmail ]];
 }
 
 - (ApolloSettingsSection *)buildAPIKeysExtrasSection {
