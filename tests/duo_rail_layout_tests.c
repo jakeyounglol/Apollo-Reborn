@@ -108,6 +108,100 @@ int main(void) {
     Check(!ApolloDuoFeedRestsAtTop(-122.5, -136), "a feed scrolled a little is anchored");
     Check(!ApolloDuoFeedRestsAtTop(400, -136), "a feed scrolled down is anchored");
 
+    /* Comment jump button: Apollo stores CommentJumpButtonPosition as a
+       string. In a split pane every position stays inside the pane. */
+    Check(ApolloDuoJumpButtonPositionKind("center") == ApolloDuoJumpButtonCenter,
+          "the center jump button position is centered");
+    Check(ApolloDuoJumpButtonPositionKind("bottom-right") == ApolloDuoJumpButtonRight,
+          "bottom right is a right jump button position");
+    Check(ApolloDuoJumpButtonPositionKind("middle-right") == ApolloDuoJumpButtonRight,
+          "middle right is a right jump button position");
+    Check(ApolloDuoJumpButtonPositionKind("top-left") == ApolloDuoJumpButtonLeft,
+          "top left is a left jump button position");
+    Check(ApolloDuoJumpButtonPositionKind("middle-left") == ApolloDuoJumpButtonLeft,
+          "middle left is a left jump button position");
+    Check(ApolloDuoJumpButtonPositionKind("bottom-left") == ApolloDuoJumpButtonLeft,
+          "bottom left is a left jump button position");
+    Check(ApolloDuoJumpButtonPositionKind("") == ApolloDuoJumpButtonRight,
+          "an empty jump button position falls back to right");
+    Check(ApolloDuoJumpButtonPositionKind("left") == ApolloDuoJumpButtonRight,
+          "an unknown jump button position falls back to right");
+    Check(ApolloDuoJumpButtonPositionKind(0) == ApolloDuoJumpButtonRight,
+          "the unset default (bottom right) is a right position");
+
+    /* Pane 400..1000, 56pt button. Trailing limit is the pane's 16pt margin
+       (984), or 15pt before a rail at 920 (905). */
+    Check(ApolloDuoJumpButtonPaneTrailingLimit(400.0, 600.0, 0, 0.0) == 984.0,
+          "without a rail the trailing limit is the pane's margin");
+    Check(ApolloDuoJumpButtonPaneTrailingLimit(400.0, 600.0, 1, 920.0) == 905.0,
+          "a visible rail pulls the trailing limit 15pt before the rail");
+    Check(ApolloDuoJumpButtonPaneTrailingLimit(400.0, 600.0, 1, 1100.0) == 984.0,
+          "a rail beyond the pane keeps the pane's margin");
+
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonCenter, 1, 400.0, 600.0, 1, 920.0, 56.0, 572.0) == 672.0,
+          "a centered jump button centers on the split pane's column");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonLeft, 1, 400.0, 600.0, 1, 920.0, 56.0, 20.0) == 416.0,
+          "a left jump button sits at the split pane's leading margin");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonRight, 1, 400.0, 600.0, 1, 920.0, 56.0, 300.0) == 849.0,
+          "a right jump button ends at the rail's trailing limit");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonRight, 1, 400.0, 600.0, 0, 0.0, 56.0, 300.0) == 928.0,
+          "a right jump button without a rail ends at the pane's trailing margin");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonRight, 1, 400.0, 600.0, 1, 920.0, 56.0, 380.0) == 849.0,
+          "a right jump button Apollo put under the posts column moves to the pane's trailing limit");
+
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonCenter, 0, 0.0, 0.0, 1, 920.0, 56.0, 572.0) == 572.0,
+          "a centered jump button outside a split keeps Apollo's x");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonLeft, 0, 0.0, 0.0, 0, 0.0, 56.0, 20.0) == 20.0,
+          "a left jump button outside a split keeps Apollo's x");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonRight, 0, 0.0, 0.0, 1, 920.0, 56.0, 300.0) == 300.0,
+          "a right jump button outside a split keeps Apollo's x");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonLeft, 1, 400.0, 0.0, 0, 0.0, 56.0, 20.0) == 20.0,
+          "a collapsed pane keeps Apollo's x");
+    Check(ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonRight, 1, 400.0, 60.0, 0, 0.0, 56.0, 300.0) == 400.0,
+          "a pane narrower than the button keeps it at the pane's leading edge");
+    {
+        const int kinds[] = { ApolloDuoJumpButtonRight, ApolloDuoJumpButtonCenter, ApolloDuoJumpButtonLeft };
+        const double currents[] = { -40.0, 0.0, 20.0, 380.0, 416.0, 672.0, 849.0, 920.0 };
+        const int rails[] = { 0, 1 };
+        for (unsigned k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+            for (unsigned r = 0; r < sizeof(rails) / sizeof(rails[0]); r++) {
+                double limit = ApolloDuoJumpButtonPaneTrailingLimit(400.0, 600.0, rails[r], 920.0);
+                double first = ApolloDuoJumpButtonPaneX(kinds[k], 1, 400.0, 600.0, rails[r], 920.0, 56.0, 0.0);
+                Check(ApolloDuoJumpButtonPaneX(kinds[k], 1, 400.0, 600.0, rails[r], 920.0, 56.0, first) == first,
+                      "a split jump button position is stable across layout passes");
+                for (unsigned c = 0; c < sizeof(currents) / sizeof(currents[0]); c++) {
+                    double x = ApolloDuoJumpButtonPaneX(kinds[k], 1, 400.0, 600.0, rails[r], 920.0, 56.0, currents[c]);
+                    Check(x == first, "a split jump button ignores Apollo's x");
+                    Check(x >= 400.0 && x + 56.0 <= limit,
+                          "a split jump button stays between the pane's leading edge and its trailing limit");
+                }
+            }
+        }
+    }
+
+    /* Book posture: when the divider rests on the fold (Half at the fold's
+       leading edge, 455.7 on the Duo) or inside it (475.5, mid fold), the
+       thread pane's usable part starts past the fold, so a left or center
+       button never sits on the hinge. */
+    Check(ApolloDuoJumpButtonPaneAfterFold(455.7, 495.3, 1, 455.7, 495.3) == 495.3,
+          "a fold starting at the pane's leading edge moves the pane past it");
+    Check(ApolloDuoJumpButtonPaneAfterFold(475.5, 475.5, 1, 455.7, 495.3) == 495.3,
+          "a divider resting inside the fold moves the pane past it");
+    Check(ApolloDuoJumpButtonPaneAfterFold(237.75, 713.25, 1, 455.7, 495.3) == 237.75,
+          "a fold well inside a wide pane leaves its leading edge alone");
+    Check(ApolloDuoJumpButtonPaneAfterFold(713.25, 237.75, 1, 455.7, 495.3) == 713.25,
+          "a fold behind the posts column leaves the pane alone");
+    Check(ApolloDuoJumpButtonPaneAfterFold(475.5, 475.5, 0, 0.0, 0.0) == 475.5,
+          "flat open, no fold, the pane is unchanged");
+    {
+        double leading = ApolloDuoJumpButtonPaneAfterFold(455.7, 495.3, 1, 455.7, 495.3);
+        double width = 455.7 + 495.3 - leading;
+        double x = ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonLeft, 1, leading, width, 1, 882.0, 70.0, 20.0);
+        Check(x >= 495.3, "a left jump button at the fold sits in the pane past the hinge");
+        x = ApolloDuoJumpButtonPaneX(ApolloDuoJumpButtonCenter, 1, leading, width, 1, 882.0, 70.0, 20.0);
+        Check(x >= 495.3 && x + 70.0 <= 882.0 - 15.0, "a centered jump button at the fold stays clear of the hinge and the rail");
+    }
+
     printf("OK: %u checks\n", checks);
     return 0;
 }

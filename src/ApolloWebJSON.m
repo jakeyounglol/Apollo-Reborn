@@ -488,6 +488,19 @@ static NSUInteger ApolloWebJSONTriedRoutesFromURL(NSURL *url) {
 // block, so the fallback can be exercised against a real block page. A bit per
 // ApolloWebJSONRoute; 0 when off.
 static _Atomic NSUInteger sApolloWebJSONSimBlockedRoutes = 0;
+// "routegate <route>[,<route>]": those routes' requests carry a cookie Reddit
+// doesn't know instead of the session's, so old.reddit.com answers with its
+// sign-in gate (ApolloWebJSONRouteResponseIsSignInGate).
+static _Atomic NSUInteger sApolloWebJSONSimGatedRoutes = 0;
+
+void ApolloWebJSONSimSetGatedRoutes(NSUInteger routeMask) {
+    atomic_store(&sApolloWebJSONSimGatedRoutes, routeMask);
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSInteger r = ApolloWebJSONRouteWww; r <= ApolloWebJSONRouteLast; r++) {
+        if (routeMask & (1u << r)) [names addObject:ApolloWebJSONRouteName((ApolloWebJSONRoute)r)];
+    }
+    ApolloLog(@"[WebJSON] (sim) Routes sent signed out: %@", names.count ? [names componentsJoinedByString:@", "] : @"none");
+}
 
 void ApolloWebJSONSimSetBlockedRoutes(NSUInteger routeMask) {
     atomic_store(&sApolloWebJSONSimBlockedRoutes, routeMask);
@@ -707,10 +720,29 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
     // Most requests have only the www route. The few www refuses at their usual
     // path (ApolloWebJSONRoutes.m) take the first route that isn't on cooldown
     // for this account, and a resend after a block page skips the ones tried.
-    NSInteger chosenRoute = ApolloWebJSONRouteChoose(sessionUsername, method, path, ApolloWebJSONTriedRoutesFromURL(url),
-                                                     [NSDate timeIntervalSinceReferenceDate]);
-    ApolloWebJSONRoute route = chosenRoute >= 0 ? (ApolloWebJSONRoute)chosenRoute
-                                                : (ApolloWebJSONRoute)ApolloWebJSONRoutesForRequest(method, path).firstObject.integerValue;
+    NSUInteger triedMask = ApolloWebJSONTriedRoutesFromURL(url);
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    NSInteger chosenRoute = ApolloWebJSONRouteChoose(sessionUsername, method, path, triedMask, now);
+    // A bearer route is only chosen while its bearer is on hand; one that
+    // expired since passes to the next route.
+    NSString *routeBearer = nil;
+    while (chosenRoute >= 0 && ApolloWebJSONRouteGetAuth((ApolloWebJSONRoute)chosenRoute) == ApolloWebJSONRouteAuthBearer) {
+        routeBearer = ApolloWebJSONReadyRouteBearer(sessionUsername);
+        if (routeBearer.length > 0) break;
+        triedMask |= 1u << chosenRoute;
+        chosenRoute = ApolloWebJSONRouteChoose(sessionUsername, method, path, triedMask, now);
+    }
+    // Nothing left to choose (only a resend can get here, or a bearer route
+    // with no bearer): the first cookie route listed, else www.
+    if (chosenRoute < 0) {
+        chosenRoute = ApolloWebJSONRouteWww;
+        for (NSNumber *listed in ApolloWebJSONRoutesForRequest(method, path)) {
+            if (ApolloWebJSONRouteGetAuth((ApolloWebJSONRoute)listed.integerValue) != ApolloWebJSONRouteAuthCookie) continue;
+            chosenRoute = listed.integerValue;
+            break;
+        }
+    }
+    ApolloWebJSONRoute route = (ApolloWebJSONRoute)chosenRoute;
     components.host = ApolloWebJSONRouteHost(route);
     if (route != ApolloWebJSONRouteWww) {
         components.path = ApolloWebJSONRoutePath(route, path);
@@ -718,6 +750,7 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
         if (atomic_load(&sApolloWebJSONSimBlockedRoutes) & (1u << route)) {
             components.host = @"www.reddit.com";
             components.path = path;
+            routeBearer = nil;
         }
 #endif
         ApolloWebJSONNoteRoute(method, path, route, components.path);
@@ -758,13 +791,28 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
                   method, url.path, subredditWritePath, writeSubreddit);
     }
 
-    // Cookie auth replaces the bearer token outright.
-    [mutable setValue:nil forHTTPHeaderField:@"Authorization"];
-    // Set the Cookie header explicitly rather than relying on a cookie jar —
-    // RDKClient's AFHTTPSessionManager session config may use a non-shared jar,
-    // and HTTPShouldHandleCookies=NO stops the session from overriding our
-    // header with (or storing) jar cookies.
-    [mutable setValue:session.cookieHeader forHTTPHeaderField:@"Cookie"];
+    if (routeBearer.length > 0) {
+        // A bearer route (ApolloWebJSONRouteAuthBearer): the account's minted
+        // mobile-client bearer and no cookie. The URL already carries the
+        // account marker, which keeps the bearer-capture hook on
+        // -[NSMutableURLRequest setValue:forHTTPHeaderField:] from taking it
+        // for Apollo's own token (ApolloWebJSONRequestIsInternal).
+        [mutable setValue:[@"Bearer " stringByAppendingString:routeBearer] forHTTPHeaderField:@"Authorization"];
+        [mutable setValue:nil forHTTPHeaderField:@"Cookie"];
+    } else {
+        // Cookie auth replaces the bearer token outright.
+        [mutable setValue:nil forHTTPHeaderField:@"Authorization"];
+        // Set the Cookie header explicitly rather than relying on a cookie jar —
+        // RDKClient's AFHTTPSessionManager session config may use a non-shared jar,
+        // and HTTPShouldHandleCookies=NO stops the session from overriding our
+        // header with (or storing) jar cookies.
+        [mutable setValue:session.cookieHeader forHTTPHeaderField:@"Cookie"];
+#if APOLLO_SIM_BUILD
+        if (atomic_load(&sApolloWebJSONSimGatedRoutes) & (1u << route)) {
+            [mutable setValue:@"apollo_sim_signed_out=1" forHTTPHeaderField:@"Cookie"];
+        }
+#endif
+    }
     mutable.HTTPShouldHandleCookies = NO;
 
     // Writes need the modhash. Reddit's web API accepts it either as the
@@ -1299,6 +1347,14 @@ static void ApolloWebJSONNoteAccountWrite(NSString *user) {
     }
 }
 
+NSUInteger ApolloWebJSONAccountWriteCount(NSString *username) {
+    NSString *user = username.lowercaseString;
+    if (user.length == 0) return 0;
+    @synchronized (ApolloWebJSONSharedReadLock()) {
+        return sAccountWriteCounts[user].unsignedIntegerValue;
+    }
+}
+
 ApolloWebJSONTaskCompletion ApolloWebJSONShareAccountRead(NSString *username, NSString *method, NSString *path,
                                                          id parameters, ApolloWebJSONTaskCompletion completion) {
     NSString *user = username.lowercaseString;
@@ -1384,22 +1440,28 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     if (ApolloWebJSONURLIsProbe(url)) return;
 
     // Moderator requests sent to oauth.reddit.com with a web-session bearer
-    // (ApolloWebJSONWebBearerRequest) have their own failure handling.
-    if ([url.host.lowercaseString isEqualToString:@"oauth.reddit.com"]) {
+    // (ApolloWebJSONWebBearerRequest) have their own failure handling. The
+    // oauth route goes there with the cookie, so it carries a Cookie header and
+    // is handled like any other cookie read below; a bearer route carries its
+    // route in the URL and is counted below too.
+    NSString *noteHost = url.host.lowercaseString;
+    BOOL hasCookie = [request valueForHTTPHeaderField:@"Cookie"].length > 0;
+    NSInteger route = ApolloWebJSONRouteFromURL(url);
+    BOOL bearerRoute = route >= 0 && ApolloWebJSONRouteGetAuth((ApolloWebJSONRoute)route) == ApolloWebJSONRouteAuthBearer;
+    if ([noteHost isEqualToString:@"oauth.reddit.com"] && !hasCookie && !bearerRoute) {
         ApolloWebJSONNoteWebBearerResponse(request, (NSHTTPURLResponse *)response);
         return;
     }
 
     // old.reddit.com and api.reddit.com carry the cookie for fallback routes
-    // (ApolloWebJSONRoutes.m).
-    NSString *noteHost = url.host.lowercaseString;
+    // (ApolloWebJSONRoutes.m), and oauth.reddit.com for the oauth route.
     if (![noteHost isEqualToString:@"www.reddit.com"] && ![noteHost isEqualToString:@"old.reddit.com"] &&
-        ![noteHost isEqualToString:@"api.reddit.com"]) return;
+        ![noteHost isEqualToString:@"api.reddit.com"] && ![noteHost isEqualToString:@"oauth.reddit.com"]) return;
     // Only react to requests we authenticated with the cookie — those carry the
     // Cookie header we set in ApolloWebJSONRewriteRequest. This skips unrelated
     // www.reddit.com traffic (e.g. the trending-subreddits fetch) that could
     // legitimately 403 with HTML without meaning our session died.
-    if ([request valueForHTTPHeaderField:@"Cookie"].length == 0) return;
+    if (!hasCookie && !bearerRoute) return;
 
     // The account marker was stamped (as a URL fragment — never sent to Reddit,
     // see kApolloWebJSONAccountMarkerPrefix) by the rewrite that authenticated
@@ -1410,19 +1472,35 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
 
     // Route health (ApolloWebJSONRoutes.h), for every keyless path: a block page
     // counts toward the route's cooldown, a success clears it. The path a route
-    // sent ("/api/info/.json") groups with the one asked for ("/api/info.json").
+    // sent ("/api/info/.json", "/r/all/api/info.json") groups with the one
+    // asked for ("/api/info.json"), under the entry it matched.
     NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-    NSInteger route = ApolloWebJSONRouteFromURL(url);
-    NSString *requestedPath = url.path ?: @"/";
+    NSString *requestMethod = request.HTTPMethod.uppercaseString ?: @"GET";
+    NSString *requestedPath = route >= 0 ? ApolloWebJSONRouteRequestedPath((ApolloWebJSONRoute)route, url.path ?: @"/") : (url.path ?: @"/");
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (route >= 0 && ApolloWebJSONRouteResponseIsBlockPage(http)) {
-        if (ApolloWebJSONRouteHealthNoteBlockPage(username, requestedPath, (ApolloWebJSONRoute)route, now)) {
-            ApolloLog(@"[WebJSON] Route %@ for %@ keeps getting the block page for u/%@; skipping it for %.0f min",
-                      ApolloWebJSONRouteName((ApolloWebJSONRoute)route), ApolloWebJSONRoutePathPattern(requestedPath), username,
-                      ceil(ApolloWebJSONRouteCooldownRemaining(username, requestedPath, (ApolloWebJSONRoute)route, now) / 60.0));
+    if (route >= 0 && ApolloWebJSONRouteResponseIsRefusal(http)) {
+        if (ApolloWebJSONRouteHealthNoteBlockPage(username, requestMethod, requestedPath, (ApolloWebJSONRoute)route, now)) {
+            ApolloLog(@"[WebJSON] Route %@ for %@ keeps refusing u/%@ (block page or sign-in gate); skipping it for %.0f min",
+                      ApolloWebJSONRouteName((ApolloWebJSONRoute)route), ApolloWebJSONRouteHealthGroup(requestMethod, requestedPath), username,
+                      ceil(ApolloWebJSONRouteCooldownRemaining(username, requestMethod, requestedPath, (ApolloWebJSONRoute)route, now) / 60.0));
         }
     } else if (route >= 0 && http.statusCode >= 200 && http.statusCode < 300) {
-        ApolloWebJSONRouteHealthNoteSuccess(username, requestedPath, (ApolloWebJSONRoute)route, now);
+        ApolloWebJSONRouteHealthNoteSuccess(username, requestMethod, requestedPath, (ApolloWebJSONRoute)route, now);
+    }
+
+    // A bearer route sent no cookie, so its answer says nothing about the
+    // session. A 401 says the minted bearer is no good: drop it, so requests
+    // skip the route until a new one is minted (with the mint's own back-off).
+    if (bearerRoute) {
+        if (http.statusCode == 401) {
+            NSString *authorization = [request valueForHTTPHeaderField:@"Authorization"];
+            NSRange bearerRange = [authorization rangeOfString:@"Bearer " options:NSCaseInsensitiveSearch | NSAnchoredSearch];
+            NSString *bearer = bearerRange.location != NSNotFound ? [authorization substringFromIndex:NSMaxRange(bearerRange)] : nil;
+            ApolloWebJSONInvalidateOAuthBearerForAccount(username.lowercaseString, bearer);
+            ApolloLog(@"[WebJSON] Route %@ refused u/%@'s minted bearer (HTTP 401) on %@",
+                      ApolloWebJSONRouteName((ApolloWebJSONRoute)route), username, url.path);
+        }
+        return;
     }
 
     // Ahead of the expiry bookkeeping's early returns: a 429 limits the session
@@ -1447,13 +1525,24 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     if ([url.path hasPrefix:@"/api/mod/"]) return;
     // Same for the other OAuth-only moderator endpoints. They normally go out
     // with a web bearer instead; one only reaches www with the cookie when no
-    // bearer could be minted, and then its refusal is guaranteed.
-    if (ApolloWebJSONPathNeedsWebBearer(url.path)) return;
+    // bearer could be minted, and then its refusal is guaranteed. Search is
+    // left out too: Reddit already refuses post search for the cookie on www
+    // and for desktop-client tokens on oauth, so a block page there may be
+    // Reddit closing oauth search to the cookie as well, not the session
+    // expiring. Its old route is limited to accounts with
+    // recent Old Reddit use, so a block page there says nothing either. The
+    // same goes for every read with more than one route (/r/all, and anything
+    // keyless-routes.json adds): its block page is route health's business.
+    if (ApolloWebJSONPathNeedsWebBearer(url.path) || ApolloWebJSONRequestIsSearchRead(request.HTTPMethod, url.path) ||
+        ApolloWebJSONRouteRequestMayRetry(requestMethod, requestedPath)) return;
 
     // Reddit's anonymous block page is HTTP 403 with a ~190 KB text/html body.
     // A 403 with a JSON body (e.g. a private/quarantined subreddit) is a normal
     // per-content error — and proves the cookie still authenticates — so it must
     // NOT count toward expiry. Hence the text/html gate.
+    // Old Reddit's sign-in gate on a fallback route says nothing about the
+    // cookie on www either way, so it holds the streak like a 429.
+    if (ApolloWebJSONRouteResponseIsSignInGate(http)) return;
     NSString *contentType = [http.allHeaderFields[@"Content-Type"] lowercaseString] ?: @"";
     BOOL isBlockPage = (http.statusCode == 403) && [contentType containsString:@"text/html"];
 
@@ -1704,7 +1793,12 @@ NSData *ApolloWebJSONFixupListingMediaResponseData(NSURLResponse *response, NSDa
     if (![response isKindOfClass:[NSHTTPURLResponse class]]) return data;
 
     NSURL *responseURL = ((NSHTTPURLResponse *)response).URL;
-    if (![responseURL.host.lowercaseString isEqualToString:@"www.reddit.com"]) return data;
+    // Listings a route sends elsewhere (search on oauth.reddit.com or
+    // old.reddit.com) are cookie listings too. Their URL carries the route
+    // marker; an API-key account's oauth listings, and the moderator requests
+    // sent with a web bearer, carry none and are left alone.
+    BOOL otherRoute = ApolloWebJSONRouteFromURL(responseURL) > ApolloWebJSONRouteWww;
+    if (![responseURL.host.lowercaseString isEqualToString:@"www.reddit.com"] && !otherRoute) return data;
     if ([responseURL.path.lowercaseString hasPrefix:@"/api/"]) return data;
 
     id root = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:NULL];
@@ -1801,7 +1895,13 @@ void ApolloWebJSONPrefetchModernThingData(NSString *fullname, void (^completion)
 
     NSString *base = @"https://oauth.reddit.com/api/info.json";
     if (cookie.length > 0) {
-        ApolloWebJSONRoute route = (ApolloWebJSONRoute)ApolloWebJSONRoutesForRequest(@"GET", @"/api/info.json").firstObject.integerValue;
+        // The first route that takes the cookie: this probe has no bearer.
+        ApolloWebJSONRoute route = ApolloWebJSONRouteWww;
+        for (NSNumber *listed in ApolloWebJSONRoutesForRequest(@"GET", @"/api/info.json")) {
+            if (ApolloWebJSONRouteGetAuth((ApolloWebJSONRoute)listed.integerValue) != ApolloWebJSONRouteAuthCookie) continue;
+            route = (ApolloWebJSONRoute)listed.integerValue;
+            break;
+        }
         base = [NSString stringWithFormat:@"https://%@%@", ApolloWebJSONRouteHost(route),
                 ApolloWebJSONRoutePath(route, @"/api/info.json")];
     }
@@ -1960,10 +2060,26 @@ static BOOL ApolloWebJSONPathExpectsListingDictionary(NSString *path) {
     return YES;
 }
 
+// A post with its comments: /comments/<id>[/...] or /r/<sub>/comments/<id>[/...]
+// (RedditKit's linkAndComments and linkAndContext reads). Reddit answers these
+// with an array of two listings. /comments and /r/<sub>/comments with no id are
+// recent-comment listings (dictionaries), so they don't count.
+static BOOL ApolloWebJSONPathIsCommentThread(NSString *path) {
+    NSString *p = path;
+    if ([p hasSuffix:@".json"]) p = [p substringToIndex:p.length - 5];
+    if (![p hasPrefix:@"/"]) return NO;
+    NSArray<NSString *> *seg = [[p substringFromIndex:1] componentsSeparatedByString:@"/"];
+    if (seg.count >= 2 && [seg[0] isEqualToString:@"comments"]) return seg[1].length > 0;
+    if (seg.count >= 4 && [seg[0] isEqualToString:@"r"] && [seg[2] isEqualToString:@"comments"]) return seg[3].length > 0;
+    return NO;
+}
+
 id ApolloWebJSONGuardListingTaskResponse(NSString *method, NSString *path,
                                         NSHTTPURLResponse *response, id responseObject,
                                         NSError **error) {
     BOOL nonDictionary = responseObject && ![responseObject isKindOfClass:[NSDictionary class]];
+    // A dictionary is still the wrong shape for a comment thread (#1531).
+    BOOL nonArray = responseObject && ![responseObject isKindOfClass:[NSArray class]];
     // A refusal RedditKit doesn't report (#1420). RDKResponseSerializer answers
     // anything that isn't application/json with no object AND no error (Reddit's
     // HTML 429 and 403 block pages, an empty 429, an HTML 5xx), and RedditKit
@@ -1973,12 +2089,35 @@ id ApolloWebJSONGuardListingTaskResponse(NSString *method, NSString *path,
     // www.reddit.com all the time; oauth.reddit.com answers in JSON.
     NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? response.statusCode : 0;
     BOOL unreportedFailure = !(error && *error) && (responseObject == nil || status >= 400);
-    if (!nonDictionary && !unreportedFailure) return responseObject;
+    if (!nonDictionary && !nonArray && !unreportedFailure) return responseObject;
     if (!method || [method caseInsensitiveCompare:@"GET"] != NSOrderedSame) return responseObject;
     // RDKClient supplies relative paths (with or without a leading slash).
     if (![path isKindOfClass:[NSString class]] || path.length == 0) return responseObject;
     NSString *requestPath = [[path componentsSeparatedByString:@"?"] firstObject];
     if (![requestPath hasPrefix:@"/"]) requestPath = [@"/" stringByAppendingString:requestPath];
+
+    if (ApolloWebJSONPathIsCommentThread(requestPath)) {
+        if (!nonArray) return responseObject;
+        // RedditKit's post-and-comments completion checks only `count >= 2`
+        // before reading root[0] and root[1] on a background queue, so any JSON
+        // dictionary with two keys that RedditKit doesn't map to an error
+        // crashes the app there (-[__NSDictionaryI objectAtIndexedSubscript:]).
+        // A 429's {"message", "error"} is one: RedditKit maps no error for 429
+        // (#1531). Report a failed load instead; Apollo shows its usual
+        // comments error and the next pull to refresh asks again.
+        ApolloLog(@"[WebJSON] Rejected non-array comments response (class=%@, HTTP=%ld)",
+                  NSStringFromClass([responseObject class]), (long)status);
+        if (error && !*error) {
+            *error = [NSError errorWithDomain:@"ApolloReborn.WebJSON.Response"
+                                         code:1531
+                                     userInfo:@{ NSLocalizedDescriptionKey: status == 429
+                                                 ? @"Reddit is limiting requests right now. Try again in a minute."
+                                                 : @"Reddit sent an unexpected response. Pull to refresh to try again." }];
+        }
+        return nil;
+    }
+
+    if (!nonDictionary && !unreportedFailure) return responseObject;
     if (!ApolloWebJSONPathExpectsListingDictionary(requestPath)) return responseObject;
 
     if (!nonDictionary) {
@@ -2350,6 +2489,53 @@ BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username) {
     if (key.length == 0 || ApolloWebSessionFor(key) == nil) return NO;
     if (ApolloWebJSONWebBearerHeldForUser(key) || ApolloWebJSONMintFailedRecentlyForUser(key)) return NO;
     return ApolloWebJSONReadyWebBearer(key).length == 0;
+}
+
+#pragma mark - Minted bearer for bearer routes
+
+// Routes with bearer auth (ApolloWebJSONRoutes.h) need a bearer Reddit's
+// oauth.reddit.com doesn't treat as the desktop web client's: it refuses post
+// search for those (cid 0R-WAMhuoo-MyQ, which token_v2 is) and accepts ones
+// minted for the mobile client (ApolloWebJSONMintWebBearerForAccount). So only
+// a minted bearer counts, never token_v2. The rewrite can't wait for a mint,
+// so the bearer is minted ahead of time in the background, and a request with
+// none on hand goes by its next route.
+NSString *ApolloWebJSONReadyRouteBearer(NSString *username) {
+    NSString *key = username.lowercaseString;
+    if (key.length == 0 || ApolloWebSessionFor(key).cookieHeader.length == 0) return nil;
+    return ApolloWebJSONCachedMintedBearerForUser(key);
+}
+
+// Lowercased usernames with a mint queued here; mint state lock.
+static NSMutableSet<NSString *> *sRouteBearerMintsInFlight;
+
+void ApolloWebJSONPrepareRouteBearer(NSString *username) {
+    if (!ApolloWebJSONRouteTableUsesBearerAuth()) return;
+    NSString *key = (username.length ? username : ApolloActiveWebSessionUsername()).lowercaseString;
+    if (key.length == 0 || ApolloWebSessionFor(key).cookieHeader.length == 0) return;
+    if (ApolloWebJSONCachedMintedBearerForUser(key) || ApolloWebJSONMintFailedRecentlyForUser(key)) return;
+    @synchronized (ApolloWebJSONMintStateLock()) {
+        if (!sRouteBearerMintsInFlight) sRouteBearerMintsInFlight = [NSMutableSet set];
+        if ([sRouteBearerMintsInFlight containsObject:key]) return;
+        [sRouteBearerMintsInFlight addObject:key];
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL minted = ApolloWebJSONMintWebBearerForAccount(key).length > 0;
+        @synchronized (ApolloWebJSONMintStateLock()) {
+            [sRouteBearerMintsInFlight removeObject:key];
+        }
+        ApolloLog(@"[WebJSON] %@ a bearer for u/%@'s bearer routes", minted ? @"Minted" : @"Could not mint", key);
+    });
+}
+
+// Route choice asks this for every bearer route it considers. Not ready starts
+// a mint, so a later request can use the route.
+__attribute__((constructor)) static void ApolloWebJSONRegisterRouteBearer(void) {
+    ApolloWebJSONRouteSetBearerReadyHandler(^BOOL(NSString *account) {
+        if (ApolloWebJSONReadyRouteBearer(account).length > 0) return YES;
+        ApolloWebJSONPrepareRouteBearer(account);
+        return NO;
+    });
 }
 
 static void ApolloWebJSONNoteWebBearerResponse(NSURLRequest *request, NSHTTPURLResponse *http) {

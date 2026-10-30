@@ -1,6 +1,8 @@
 #ifndef APOLLO_DUO_RAIL_LAYOUT_H
 #define APOLLO_DUO_RAIL_LAYOUT_H
 
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -151,6 +153,77 @@ static inline double ApolloDuoAnchoredOffset(double rowMinY, double rowHeight, d
 // search bar, and UIKit collapses a bar the list has scrolled into.
 static inline int ApolloDuoFeedRestsAtTop(double offset, double minimum) {
     return offset <= minimum + 1.0;
+}
+
+// Apollo stores CommentJumpButtonPosition as a string raw value ("top-left"
+// ... "bottom-right", or "center"); unset means bottom right.
+enum {
+    ApolloDuoJumpButtonRight = 0,
+    ApolloDuoJumpButtonCenter = 1,
+    ApolloDuoJumpButtonLeft = 2,
+};
+
+// Gap between the jump button and a split pane's edges, and between the
+// button and the trailing rail (the gap Duo settings rows and profile cards
+// use).
+enum {
+    ApolloDuoJumpButtonPaneMargin = 16,
+    ApolloDuoJumpButtonRailGap = 15,
+};
+
+static inline int ApolloDuoJumpButtonPositionKind(const char *position) {
+    if (!position) return ApolloDuoJumpButtonRight;
+    if (strcmp(position, "center") == 0) return ApolloDuoJumpButtonCenter;
+    size_t length = strlen(position);
+    if (length >= 5 && strcmp(position + length - 5, "-left") == 0) return ApolloDuoJumpButtonLeft;
+    return ApolloDuoJumpButtonRight;
+}
+
+// Rightmost edge a jump button may reach in a split pane: the pane's
+// trailing margin, pulled in to clear a visible trailing rail.
+static inline double ApolloDuoJumpButtonPaneTrailingLimit(double paneMinX, double paneWidth,
+                                                          int rail, double railMinX) {
+    double limit = paneMinX + paneWidth - (double)ApolloDuoJumpButtonPaneMargin;
+    if (rail && railMinX - (double)ApolloDuoJumpButtonRailGap < limit) {
+        limit = railMinX - (double)ApolloDuoJumpButtonRailGap;
+    }
+    return limit;
+}
+
+// Where a split pane's usable part begins in book posture: a fold whose
+// division region covers the pane's leading edge (the divider resting at or
+// inside the fold) moves it past the fold, so no position lands on the hinge.
+// A fold elsewhere, or none, leaves the pane alone.
+static inline double ApolloDuoJumpButtonPaneAfterFold(double paneMinX, double paneWidth,
+                                                      int fold, double foldMinX, double foldMaxX) {
+    if (!fold || foldMaxX <= paneMinX || foldMinX > paneMinX + 1.0) return paneMinX;
+    double end = paneMinX + paneWidth;
+    return foldMaxX < end ? foldMaxX : paneMinX;
+}
+
+// Apollo places the jump button against geometry that a split pane does not
+// match: the full-screen comments table for left and center, which extends
+// beneath the posts column, and a narrower width for right. In a split pane,
+// place every position from the pane itself: left at the pane's leading
+// margin, center on the pane's column, right at its trailing limit. The x is
+// computed rather than offset, so repeated layout passes are stable.
+// Unsplit layouts keep Apollo's x.
+static inline double ApolloDuoJumpButtonPaneX(int kind, int split,
+                                              double paneMinX, double paneWidth,
+                                              int rail, double railMinX,
+                                              double buttonWidth, double currentX) {
+    if (!split || paneWidth <= 0.0 || buttonWidth <= 0.0) return currentX;
+    double limit = ApolloDuoJumpButtonPaneTrailingLimit(paneMinX, paneWidth, rail, railMinX);
+    double x;
+    if (kind == ApolloDuoJumpButtonCenter) {
+        x = paneMinX + (paneWidth - buttonWidth) / 2.0;
+    } else if (kind == ApolloDuoJumpButtonLeft) {
+        x = paneMinX + (double)ApolloDuoJumpButtonPaneMargin;
+    } else {
+        x = limit - buttonWidth;
+    }
+    if (x + buttonWidth > limit) x = limit - buttonWidth;
+    return x < paneMinX ? paneMinX : x;
 }
 
 #ifdef __cplusplus

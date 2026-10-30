@@ -4,6 +4,7 @@
 #import "ApolloState.h"
 #import "UserDefaultConstants.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloWebJSON.h"
 #import <UIKit/UIKit.h>
 
 static NSString *const kApolloRouteUpdatesURL =
@@ -52,6 +53,9 @@ static BOOL ApolloRouteUpdatesApply(NSData *data, NSString *source) {
     ApolloWebJSONRouteSetRemoteTable(table);
     NSString *after = ApolloWebJSONRouteRemoteTableDescription();
     if (![before isEqualToString:after]) ApolloLog(@"[WebJSON] Route updates (%@):\n%@", source, after);
+    // A table that now lists a bearer route gets its bearer ready ahead of
+    // the first request that would use it.
+    ApolloWebJSONPrepareRouteBearer(nil);
     return YES;
 }
 
@@ -227,6 +231,9 @@ void ApolloWebJSONRouteUpdatesCheckIfNeeded(void) {
     ApolloRouteUpdatesObserveInactivity();
     ApolloRouteUpdatesLoadCacheIfNeeded();
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    // On foreground and every check: a minted bearer lasts about a day, and
+    // one that aged out is replaced before a request has to skip its route.
+    ApolloWebJSONPrepareRouteBearer(nil);
     if (ApolloRouteUpdatesNextDelay() > 0) {
         ApolloRouteUpdatesScheduleNext();
         return;
@@ -267,9 +274,9 @@ NSDictionary<NSString *, id> *ApolloWebJSONRouteUpdatesStatus(void) {
     return status;
 }
 
-// Per fallback endpoint, for `account`: which route a request would take now,
-// and every route's counts. Methods of one path with the same routes share
-// their health (it's kept per path), so they're one entry ("GET/POST …").
+// Per fallback entry, for `account`: which route a request would take now,
+// and every route's counts. Methods of one pattern with the same routes share
+// their health (it's kept per pattern), so they're one entry ("GET/POST …").
 // Shared by the screen, the summary and the headline.
 static NSArray<NSDictionary *> *ApolloRouteUpdatesEndpointStatus(NSString *account, NSTimeInterval now) {
     NSArray<NSDictionary *> *health = ApolloWebJSONRouteHealthSnapshot(account, now);
@@ -287,7 +294,7 @@ static NSArray<NSDictionary *> *ApolloRouteUpdatesEndpointStatus(NSString *accou
             endpoints[same] = merged;
             continue;
         }
-        NSString *pattern = ApolloWebJSONRoutePathPattern(path);
+        NSString *pattern = ApolloWebJSONRouteHealthGroup(method, path);
         NSMutableArray<NSDictionary *> *routes = [NSMutableArray array];
         BOOL allCooling = YES;
         for (NSNumber *route in ApolloWebJSONRoutesForRequest(method, path)) {
@@ -295,7 +302,7 @@ static NSArray<NSDictionary *> *ApolloRouteUpdatesEndpointStatus(NSString *accou
             for (NSDictionary *row in health) {
                 if ([row[@"pattern"] isEqualToString:pattern] && [row[@"route"] isEqual:route]) { found = row; break; }
             }
-            NSTimeInterval cooling = ApolloWebJSONRouteCooldownRemaining(account, path, (ApolloWebJSONRoute)route.integerValue, now);
+            NSTimeInterval cooling = ApolloWebJSONRouteCooldownRemaining(account, method, path, (ApolloWebJSONRoute)route.integerValue, now);
             if (cooling <= 0) allCooling = NO;
             [routes addObject:@{ @"route": route, @"ok": found[@"ok"] ?: @0, @"blocked": found[@"blocked"] ?: @0,
                                  @"lastOkAt": found[@"lastOkAt"] ?: @0, @"cooldownRemaining": @(cooling) }];
@@ -315,7 +322,8 @@ NSArray<NSDictionary<NSString *, id> *> *ApolloWebJSONRouteStatusBlockedPaths(vo
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     NSMutableSet<NSString *> *fallbackPatterns = [NSMutableSet set];
     for (NSString *key in ApolloWebJSONRouteFallbackEndpoints()) {
-        [fallbackPatterns addObject:ApolloWebJSONRoutePathPattern([key componentsSeparatedByString:@" "].lastObject)];
+        NSArray<NSString *> *parts = [key componentsSeparatedByString:@" "];
+        [fallbackPatterns addObject:ApolloWebJSONRouteHealthGroup(parts.firstObject, parts.lastObject)];
     }
     NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
     for (NSDictionary *row in ApolloWebJSONRouteHealthSnapshot(ApolloActiveWebSessionUsername(), now)) {
