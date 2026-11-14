@@ -297,6 +297,12 @@ extern NSString * const ApolloWebJSONEnabledDidChangeNotification;
 // to be harvested under its username. Implemented in ApolloWebJSONIdentity.xm.
 BOOL ApolloWebJSONDiskAccountHasRealCredential(NSString *username);
 
+// The refresh token of `username`'s saved API-key (OAuth) sign-in, read from
+// the same persisted blobs, or nil when it has none. Lets switching an account
+// back to that sign-in check it still works first
+// (ApolloPresentSwitchToAPIKeyFlow). Implemented in ApolloWebJSONIdentity.xm.
+NSString *ApolloWebJSONDiskAccountRefreshToken(NSString *username);
+
 // Returns a copy of `url` with the internal probe fragment applied. The
 // fragment is stripped by NSURLSession before transmission so it never reaches
 // Reddit's servers; the rewrite and block-page counter hooks read it from the
@@ -328,6 +334,12 @@ void ApolloWebJSONSimSetBlockedRoutes(NSUInteger routeMask);
 // Same, but send them with a cookie Reddit doesn't know, so old.reddit.com
 // answers with its real sign-in gate, as it does an account it won't serve.
 void ApolloWebJSONSimSetGatedRoutes(NSUInteger routeMask);
+// "oauthblock on|off": send an API-key account's /api/info and /api/morechildren
+// at their usual path without its token, so the /.json retry runs against
+// oauth.reddit.com's real block page. Applied by the request
+// chokepoint (Tweak.xm) through ApolloWebJSONSimBlockOAuthRead.
+void ApolloWebJSONSimSetOAuthBlockedReads(BOOL on);
+void ApolloWebJSONSimBlockOAuthRead(NSMutableURLRequest *request);
 #endif
 
 // Seconds the tweak's optional reads (author avatars, subreddit header info)

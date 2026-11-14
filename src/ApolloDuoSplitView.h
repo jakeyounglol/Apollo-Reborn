@@ -5,6 +5,14 @@ BOOL ApolloDuoSplitIsResizing(void);
 BOOL ApolloDuoSplitIsUnfolded(void);
 BOOL ApolloDuoRequiresSubredditEnhancements(void);
 BOOL ApolloDuoSplitIsUnfoldedPortrait(void);
+/// The window size the Duo layout follows: while a field is edited, a
+/// height-only change keeps the size from before it.
+CGSize ApolloDuoLayoutSize(CGSize liveSize);
+/// Apollo shares the opened display with a window stacked above or below it
+/// (Picture in Picture or another app on top): full width, but under 600pt tall.
+BOOL ApolloDuoSplitIsShortPane(void);
+/// The Original/Focused feed layout applies: unfolded, or a short pane.
+BOOL ApolloDuoSplitShowsFeedLayout(void);
 CGFloat ApolloDuoSplitTransitionContentWidth(UIView *view, CGFloat trailingInset);
 UINavigationController *ApolloDuoSplitDetailNavigation(UINavigationController *navigation);
 /// The feed column's own stack while the tab shows columns, else nil.
@@ -26,12 +34,21 @@ BOOL ApolloDuoSplitAllowsNavigationSwipe(UINavigationController *navigation);
 BOOL ApolloDuoSplitCanRevealPostsListWithSwipe(UINavigationController *navigation);
 /// Closes the Posts subreddit drawer when it is open; NO when it was not.
 BOOL ApolloDuoSplitDismissPostsList(UINavigationController *navigation);
+/// The Posts subreddit drawer is open and not pinned.
+BOOL ApolloDuoSplitPostsListCanClose(UINavigationController *navigation);
 /// Returns from a visited profile dashboard to its retained Posts Back stack.
 BOOL ApolloDuoSplitCanReturnFromVisitedProfile(UINavigationController *navigation);
 BOOL ApolloDuoSplitReturnFromVisitedProfile(UINavigationController *navigation);
 /// Forward swipes the split owns: back into a visited profile (after a Back
 /// out of it, until the Posts pane moves on), and Account's detail pages.
 BOOL ApolloDuoSplitCanForwardInSplit(UINavigationController *navigation);
+/// The pane holds a forward page Apollo's own Back left.
+BOOL ApolloDuoSplitHasForwardPage(UINavigationController *navigation);
+/// The tab bar's pan drives Apollo's interactive Back on `navigation` (nil clears it).
+void ApolloDuoSplitSetTabBarNativePan(UINavigationController *navigation, UIGestureRecognizer *pan);
+/// Runs Apollo's own tab bar pan handler; on a Duo rail a held release
+/// finishes past half the rail.
+void ApolloDuoRunTabBarPanHandler(UINavigationController *navigation, UIPanGestureRecognizer *pan, void (^handler)(void));
 BOOL ApolloDuoSplitForwardInSplit(UINavigationController *navigation);
 /// Cover drags, Back and forward, for navigation the split lays out itself
 /// (a visited profile, Account's detail, Back from a feed link beside a
@@ -78,6 +95,8 @@ CGFloat ApolloDuoSplitThreadDragTravel(UINavigationController *navigation);
 void ApolloDuoSplitEndThreadDrag(UINavigationController *navigation, BOOL close, CGFloat offset, CGFloat velocity);
 /// Subreddit list drags from the feed root. `shown` runs 0 (hidden) to travel.
 BOOL ApolloDuoSplitBeginListDrag(UINavigationController *navigation);
+/// A closing drag on the shown subreddit list.
+BOOL ApolloDuoSplitBeginListCloseDrag(UINavigationController *navigation);
 CGFloat ApolloDuoSplitListDragTravel(UINavigationController *navigation);
 CGFloat ApolloDuoSplitListDragStart(UINavigationController *navigation);
 void ApolloDuoSplitMoveListDrag(UINavigationController *navigation, CGFloat shown);

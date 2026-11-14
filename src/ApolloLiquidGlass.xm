@@ -6,6 +6,7 @@
 #import <objc/message.h>
 
 #import "ApolloCommon.h"
+#import "ApolloAccountSwitcherViewController.h"
 #import "ApolloDeviceGeometry.h"
 #import "ApolloSwiftRuntime.h"
 #import "ApolloState.h"
@@ -14,8 +15,12 @@
 #import "ApolloNavigationTitlePresentation.h"
 #import "ApolloFindInCommentsGlass.h"
 #import "ApolloDuoRail.h"
+#import "ApolloDuoNavigationGestures.h"
+#import "ApolloFrameRate.h"
+#import "ApolloForwardSwipeCancellation.h"
 #import "ApolloClasses.h"
 #import "ApolloSubredditSwitcherSheet.h"
+#import "ApolloTabBarStyle.h"
 
 /// Helpers for the Posts and account tab long-press shortcuts in Liquid Glass.
 static char kApolloTabButtonSetupKey;
@@ -59,7 +64,8 @@ static BOOL ApolloScrubTabBarItemStateAppearance(UITabBarItemStateAppearance *st
     if (!stateAppearance) return NO;
 
     BOOL changed = NO;
-    if (stateAppearance.iconColor != nil) {
+    // Tint Tab Bar Icons owns its normal-state icon color (ApolloTabBarStyle.xm).
+    if (stateAppearance.iconColor != nil && !ApolloTabBarIconTintOwnsColor(stateAppearance.iconColor)) {
         stateAppearance.iconColor = nil;
         changed = YES;
     }
@@ -277,17 +283,11 @@ static NSInteger ApolloTabShortcutIndexForView(UIView *view) {
     return NSNotFound;
 }
 
-// Opens Apollo's account switcher by invoking ProfileViewController's bar button action.
-// sourceWindow is the window of the long-pressed tab button (the scene the user is in);
-// the app-wide key window / first visible window is only a fallback.
-static void OpenAccountManager(UIWindow *sourceWindow) {
-    static CFTimeInterval lastOpen = 0;
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now - lastOpen < 0.75) {
-        return;
-    }
-    lastOpen = now;
-
+// The Account tab's ProfileViewController, whose accounts bar button presents
+// Apollo's account manager. sourceWindow is the scene the user is in; the
+// app-wide key window / first visible window is only a fallback.
+static UIViewController *ApolloProfileViewControllerForWindow(UIWindow *sourceWindow,
+                                                              UITabBarController **outTabBarController) {
     UIWindow *lastKeyWindow = sourceWindow ?: ApolloKeyWindow();
     if (!lastKeyWindow) {
         for (UIWindow *window in ApolloAllWindows()) {
@@ -299,14 +299,17 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
     }
 
     if (!lastKeyWindow) {
-        return;
+        return nil;
     }
 
     Class profileVCClass = ApolloClassProfileViewController;
     UIViewController *rootVC = lastKeyWindow.rootViewController;
 
     UITabBarController *tabBarController = nil;
-    id mainTabs = ApolloMainTabBarController();
+    // The source window's own scene first: with two iPad windows the app-wide
+    // lookup can answer with the other window's tabs, and Accounts would
+    // open there.
+    id mainTabs = ApolloMainTabBarControllerForScene(lastKeyWindow.windowScene);
     if ([mainTabs isKindOfClass:[UITabBarController class]]) {
         tabBarController = (UITabBarController *)mainTabs;
     }
@@ -347,7 +350,22 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
             }
         }
     }
+    if (outTabBarController) *outTabBarController = tabBarController;
+    return profileVC;
+}
 
+// Opens Apollo's account switcher by invoking ProfileViewController's bar button action.
+// sourceWindow is the window of the long-pressed tab button (the scene the user is in).
+static void OpenAccountManager(UIWindow *sourceWindow) {
+    static CFTimeInterval lastOpen = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastOpen < 0.75) {
+        return;
+    }
+    lastOpen = now;
+
+    UITabBarController *tabBarController = nil;
+    UIViewController *profileVC = ApolloProfileViewControllerForWindow(sourceWindow, &tabBarController);
     if (profileVC && [profileVC respondsToSelector:@selector(accountsBarButtonItemTappedWithSender:)]) {
         // A long press begins on the Profile tab button but should only open
         // the switcher. Preserve the tab that was visible before UIKit's
@@ -361,6 +379,18 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
     } else {
         ApolloLog(@"[LiquidGlassTabBar] Unable to find ProfileViewController for account manager");
     }
+}
+
+BOOL ApolloOpenAccountManager(UIWindow *sourceWindow) {
+    // Same bar button as the tab long press, without the long press's tab
+    // selection guard: the caller here is a button, not a held tab.
+    UIViewController *profileVC = ApolloProfileViewControllerForWindow(sourceWindow, NULL);
+    if (![profileVC respondsToSelector:@selector(accountsBarButtonItemTappedWithSender:)]) {
+        ApolloLog(@"[AccountSwitcher] Unable to find ProfileViewController to open Accounts");
+        return NO;
+    }
+    [profileVC performSelector:@selector(accountsBarButtonItemTappedWithSender:) withObject:nil];
+    return YES;
 }
 
 // Horizontal Posts/Account buttons own recognizers; the vertical rail uses the
@@ -493,29 +523,126 @@ static void ApolloCancelLiquidLensGesture(UITabBar *tabBar) {
     liquidLens.enabled = YES;
 }
 
-// Opt-in (sTabBarSwipeNavigation): Apollo's tab-bar swipe-to-navigate and
-// Liquid Glass's native "Liquid Lens" drag-to-switch-tab both arm on the same
-// touch-down + horizontal drag, and Liquid Lens wins by default, silencing
-// Apollo's gesture. Requiring Liquid Lens to fail against Apollo's pan first
-// flips that priority. No public API undoes a `requireGestureRecognizerToFail:`
-// and wiring only happens once per launch, so the setting needs a relaunch.
-static char kApolloTabBarSwipePriorityWiredKey;
+// Opt-in (sTabBarSwipeNavigation): Liquid Glass's Liquid Lens and Apollo's
+// tab bar swipe both start on a drag along the bar; the lens waits for
+// Apollo's pan to fail. That can't be undone, so the setting needs a relaunch.
+// On the Duo the lens sits on a platter outside the UITabBar (the side rail),
+// so the pan moves to whichever view hosts the visible lens.
+static char kApolloTabBarSwipeLensWiredKey;
+
+// Apollo reads its pan along x (rightward is Back). On a vertical bar it reads
+// y instead: down is Back, up is Forward.
+@interface ApolloTabBarSwipePanGestureRecognizer : UIPanGestureRecognizer
+@end
+
+@implementation ApolloTabBarSwipePanGestureRecognizer
+static BOOL ApolloTabBarSwipeAlongY(UIGestureRecognizer *pan) {
+    CGRect bounds = pan.view.bounds;
+    return CGRectGetHeight(bounds) > CGRectGetWidth(bounds);
+}
+- (CGPoint)translationInView:(UIView *)view {
+    CGPoint translation = [super translationInView:view];
+    return ApolloTabBarSwipeAlongY(self) ? CGPointMake(translation.y, translation.x) : translation;
+}
+- (CGPoint)velocityInView:(UIView *)view {
+    CGPoint velocity = [super velocityInView:view];
+    return ApolloTabBarSwipeAlongY(self) ? CGPointMake(velocity.y, velocity.x) : velocity;
+}
+@end
+
+// The Duo's floating bars, a few levels under the tab bar controller's view.
+static UIView *ApolloFindFloatingBarContainer(UIView *view, NSUInteger depth) {
+    for (UIView *subview in view.subviews) {
+        if (strstr(class_getName(subview.class), "FloatingBarContainer")) return subview;
+        UIView *found = depth > 1 ? ApolloFindFloatingBarContainer(subview, depth - 1) : nil;
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void ApolloCollectLiquidLensGestures(UIView *view, NSMutableArray<UIGestureRecognizer *> *lenses) {
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        if ([gesture isKindOfClass:ApolloClassUIContinuousSelectionGestureRecognizer]) [lenses addObject:gesture];
+    }
+    for (UIView *subview in view.subviews) ApolloCollectLiquidLensGestures(subview, lenses);
+}
 
 static void ApolloPrioritizeSwipeNavigationOverLiquidLens(UITabBarController *tabBarController) {
-    if (!IsLiquidGlass() || !sTabBarSwipeNavigation || !tabBarController) return;
+    if (!IsLiquidGlass() || !sTabBarSwipeNavigation || !tabBarController.isViewLoaded
+        || !ApolloClassUIContinuousSelectionGestureRecognizer) return;
 
-    UITabBar *tabBar = tabBarController.tabBar;
-    if (!tabBar || objc_getAssociatedObject(tabBar, &kApolloTabBarSwipePriorityWiredKey)) return;
-
-    UIGestureRecognizer *liquidLens = ApolloFindLiquidLensGesture(tabBar);
-    if (!liquidLens) return; // not laid out yet; retry on the next viewWillAppear:
-
-    id panGesture = ApolloObjectIvar(tabBarController, "tabBarPanGestureRecognizer");
+    UIPanGestureRecognizer *panGesture = ApolloObjectIvar(tabBarController, "tabBarPanGestureRecognizer");
     if (![panGesture isKindOfClass:[UIPanGestureRecognizer class]]) return;
 
-    [liquidLens requireGestureRecognizerToFail:panGesture];
-    objc_setAssociatedObject(tabBar, &kApolloTabBarSwipePriorityWiredKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ApolloLog(@"[LiquidGlassTabBar] Wired Liquid Lens to require Apollo's swipe-nav pan to fail first (opt-in)");
+    // Steady state: the pan already sits beside a lens that waits for it.
+    UIView *current = panGesture.view;
+    if (current.window && !current.hidden) {
+        for (UIGestureRecognizer *gesture in current.gestureRecognizers) {
+            if ([gesture isKindOfClass:ApolloClassUIContinuousSelectionGestureRecognizer]
+                && objc_getAssociatedObject(gesture, &kApolloTabBarSwipeLensWiredKey)) return;
+        }
+    }
+
+    UITabBar *tabBar = tabBarController.tabBar;
+    NSMutableArray<UIGestureRecognizer *> *lenses = [NSMutableArray array];
+    UIGestureRecognizer *barLens = ApolloFindLiquidLensGesture(tabBar);
+    if (barLens) [lenses addObject:barLens];
+    BOOL duo = ApolloDeviceIsDuo();
+    UIView *floatingBars = duo ? ApolloFindFloatingBarContainer(tabBarController.view, 3) : nil;
+    if (floatingBars) ApolloCollectLiquidLensGestures(floatingBars, lenses);
+    if (lenses.count == 0) return; // not laid out yet
+
+    UIGestureRecognizer *visibleLens = nil;
+    for (UIGestureRecognizer *lens in lenses) {
+        UIView *view = lens.view;
+        if (view.window && !view.hidden && !CGRectIsEmpty(view.bounds)) {
+            visibleLens = lens;
+            break;
+        }
+    }
+    UIView *host = !visibleLens || [visibleLens.view isDescendantOfView:tabBar] ? tabBar : visibleLens.view;
+    // Moving a pan mid-swipe resets it without a Cancelled; the next layout moves it.
+    UIGestureRecognizerState panState = panGesture.state;
+    BOOL swiping = panState == UIGestureRecognizerStateBegan || panState == UIGestureRecognizerStateChanged;
+    if (duo && !swiping && panGesture.view != host) {
+        [host addGestureRecognizer:panGesture];
+        ApolloLog(@"[LiquidGlassTabBar] Swipe-nav pan moved to %@ (%.0fx%.0f)", NSStringFromClass(host.class),
+                  CGRectGetWidth(host.bounds), CGRectGetHeight(host.bounds));
+    }
+    if (duo && object_getClass(panGesture) == UIPanGestureRecognizer.class) {
+        object_setClass(panGesture, ApolloTabBarSwipePanGestureRecognizer.class);
+    }
+
+    for (UIGestureRecognizer *lens in lenses) {
+        if (objc_getAssociatedObject(lens, &kApolloTabBarSwipeLensWiredKey)) continue;
+        [lens requireGestureRecognizerToFail:panGesture];
+        objc_setAssociatedObject(lens, &kApolloTabBarSwipeLensWiredKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[LiquidGlassTabBar] Wired Liquid Lens on %@ to require Apollo's swipe-nav pan to fail first (opt-in)",
+                  NSStringFromClass(lens.view.class));
+    }
+}
+
+// UIKit moves the lens after the tab bar controller's layout, so look again
+// on the next turn and once things settle.
+static char kApolloTabBarSwipeCheckPendingKey;
+
+void ApolloTabBarSwipeScheduleLensCheck(UITabBarController *tabBarController) {
+    // Only the Duo's lens moves.
+    if (!IsLiquidGlass() || !sTabBarSwipeNavigation || !ApolloDeviceIsDuo()
+        || !ApolloObjectIvar(tabBarController, "tabBarPanGestureRecognizer")) return;
+    ApolloPrioritizeSwipeNavigationOverLiquidLens(tabBarController);
+    if (objc_getAssociatedObject(tabBarController, &kApolloTabBarSwipeCheckPendingKey)) return;
+    objc_setAssociatedObject(tabBarController, &kApolloTabBarSwipeCheckPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UITabBarController *weakTabs = tabBarController;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloPrioritizeSwipeNavigationOverLiquidLens(weakTabs);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UITabBarController *tabs = weakTabs;
+            if (!tabs) return;
+            objc_setAssociatedObject(tabs, &kApolloTabBarSwipeCheckPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            ApolloPrioritizeSwipeNavigationOverLiquidLens(tabs);
+        });
+    });
 }
 
 @interface _UITabButton : UIView
@@ -734,16 +861,25 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 %hook _TtC6Apollo22ApolloTabBarController
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)recognizer {
-    // Returning from tabBarPanned: is too late: a recognized Apollo pan
-    // still prevents Liquid Lens through its failure dependency. Fail only
-    // this pan while Duo uses its rail (or is changing pose), so native rail
-    // dragging can proceed. Leave enabled untouched and defer to Apollo's
-    // original policy as soon as the bottom tab bar is available again.
-    if (!ApolloDuoAllowsTabBarScrollHiding() &&
-        recognizer == ApolloObjectIvar(self, "tabBarPanGestureRecognizer")) {
+    // Decide here: a recognized pan holds Liquid Lens up. No swipe while the
+    // Duo changes pose; with the setting off, the rail keeps its native drag.
+    if (recognizer == ApolloObjectIvar(self, "tabBarPanGestureRecognizer")
+        && (ApolloDuoSplitIsResizing() || (!sTabBarSwipeNavigation && !ApolloDuoAllowsTabBarScrollHiding()))) {
         return NO;
     }
     return %orig(recognizer);
+}
+
+// With the Duo's columns the split's pane drags run the swipe; Apollo's
+// handler would navigate the tab's whole stack.
+- (void)tabBarPanned:(UIPanGestureRecognizer *)pan {
+    ApolloFullFrameRateFollowGesture(pan, 0.5);
+    UIViewController *selected = ((UITabBarController *)self).selectedViewController;
+    UINavigationController *outer = [selected isKindOfClass:UINavigationController.class] ? (id)selected : nil;
+    if (ApolloDuoTabBarSwipePanned(outer, pan)) return;
+    // A released forward peek keeps Apollo's forward pages.
+    if (pan.state == UIGestureRecognizerStateBegan) ApolloForwardSwipeNoteSource(outer);
+    ApolloDuoRunTabBarPanHandler(outer, pan, ^{ %orig(pan); });
 }
 
 %end
@@ -2625,6 +2761,15 @@ void ApolloNavigationTitlesRefresh(void) {
 
 %ctor {
     %init;
+    // Back from the background the Duo may have rebuilt its floating bars.
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil queue:NSOperationQueue.mainQueue
+                                                  usingBlock:^(__unused NSNotification *notification) {
+        UIViewController *tabs = ApolloMainTabBarController();
+        if ([tabs isKindOfClass:UITabBarController.class]) {
+            ApolloTabBarSwipeScheduleLensCheck((UITabBarController *)tabs);
+        }
+    }];
     // Programmatic entry also needs a refresh, but editing starts before Apollo
     // finishes replacing the trailing buttons. Measure after that setup returns.
     [[NSNotificationCenter defaultCenter] addObserverForName:UITextFieldTextDidBeginEditingNotification

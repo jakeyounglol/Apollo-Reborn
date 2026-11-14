@@ -12,6 +12,8 @@
 
 __BEGIN_DECLS
 
+extern Class ApolloClassUIViewReservedRegionKind;
+
 extern Class ApolloClassASBackgroundLayoutSpec;
 extern Class ApolloClassASBatchContext;
 extern Class ApolloClassASButtonNode;
@@ -117,6 +119,7 @@ extern Class ApolloClassThinSeparatorCellNode;
 extern Class ApolloClassMessageInputBar;
 extern Class ApolloClassTranslatorViewController;
 extern Class ApolloClassUIBarBadgeView;
+extern Class ApolloClassUITabButton;
 // A navigation item's button on the iOS 26/27 bars, including the Duo's vertical rail.
 extern Class ApolloClassUIButtonBarButton;
 extern Class ApolloClassUIButtonLabel;

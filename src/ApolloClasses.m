@@ -2,6 +2,8 @@
 #import <objc/runtime.h>
 #include <stdatomic.h>
 
+Class ApolloClassUIViewReservedRegionKind;
+
 Class ApolloClassASBackgroundLayoutSpec;
 Class ApolloClassASBatchContext;
 Class ApolloClassASButtonNode;
@@ -107,6 +109,7 @@ Class ApolloClassThinSeparatorCellNode;
 Class ApolloClassMessageInputBar;
 Class ApolloClassTranslatorViewController;
 Class ApolloClassUIBarBadgeView;
+Class ApolloClassUITabButton;
 Class ApolloClassUIButtonBarButton;
 Class ApolloClassUIButtonLabel;
 Class ApolloClassUIContextMenuListView;
@@ -209,6 +212,7 @@ __attribute__((constructor)) static void ApolloClassesResolve(void) {
     ApolloClassPixelPalAddedSceneElementImageView = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
     ApolloClassPixelPalOverlayViewController = objc_getClass("_TtC6Apollo29PixelPalOverlayViewController");
     ApolloClassPlayerLayerContainerView = objc_getClass("_TtC6Apollo24PlayerLayerContainerView");
+    ApolloClassUIViewReservedRegionKind = objc_getClass("UIViewReservedRegionKind");
     ApolloClassPollNode = objc_getClass("_TtC6Apollo8PollNode");
     ApolloClassPollOptionNode = objc_getClass("_TtC6Apollo14PollOptionNode");
     ApolloClassPollResultNode = objc_getClass("_TtC6Apollo14PollResultNode");
@@ -245,6 +249,7 @@ __attribute__((constructor)) static void ApolloClassesResolve(void) {
     ApolloClassMessageInputBar = objc_getClass("_TtC6Apollo15MessageInputBar");
     ApolloClassTranslatorViewController = objc_getClass("_TtC6Apollo24TranslatorViewController");
     ApolloClassUIBarBadgeView = objc_getClass("_UIBarBadgeView");
+    ApolloClassUITabButton = objc_getClass("_UITabButton");
     ApolloClassUIButtonBarButton = objc_getClass("_UIButtonBarButton");
     ApolloClassUIButtonLabel = objc_getClass("UIButtonLabel");
     ApolloClassUIContextMenuListView = objc_getClass("_UIContextMenuListView");

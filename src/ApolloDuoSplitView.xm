@@ -6,6 +6,7 @@
 #import "ApolloDuoSplitDivider.h"
 #import "ApolloDuoDividerGeometry.h"
 #import "ApolloDuoNavigationGestures.h"
+#import "ApolloFrameRate.h"
 #import "ApolloMediaHinge.h"
 #import "ApolloSearchRecents.h"
 #import "ApolloSearchVisitRecording.h"
@@ -23,6 +24,7 @@
 #import "ApolloDuoPaneDrag.h"
 #import "ApolloDuoUIKitCompatibility.h"
 #import "ApolloSearchNativeBar.h"
+#import "ApolloNavigationActions.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloFollowingSection.h"
 #import "ApolloGalleryViewController.h"
@@ -81,6 +83,18 @@ static void ApolloDuoRefreshLayoutButton(UIButton *button, UIBarButtonItem *item
 static void ApolloDuoRefreshLayoutControls(void) {
     for (id<ApolloDuoLayoutControl> control in sDuoLayoutControls.allObjects)
         [control updateFeedLayoutButton];
+}
+
+// Accent Navigation Buttons: a Duo glass control takes the theme accent while
+// the setting is on, else `neutral` (nil keeps the glass button's own color).
+static void ApolloDuoSetButtonForeground(UIButton *button, UIColor *neutral) {
+    if (!button.configuration) return;
+    UIColor *color = ApolloNavigationButtonAccentColor() ?: neutral;
+    UIColor *current = button.configuration.baseForegroundColor;
+    if (current == color || [current isEqual:color]) return;
+    UIButtonConfiguration *configuration = [button.configuration copy];
+    configuration.baseForegroundColor = color;
+    button.configuration = configuration;
 }
 
 // Each account column owns its vertical origin independently. Overview and
@@ -197,6 +211,7 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
     slide.toValue = [NSValue valueWithCATransform3D:CATransform3DMakeTranslation(to, 0, 0)];
     slide.duration = duration;
     slide.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    ApolloAnimationUsesFullFrameRate(slide);
     // Tie cleanup to this animation, not UIKit's surrounding transaction.
     // A disabled-action navigation transaction can finish before the explicit
     // slide and otherwise hide the drawer at the beginning of dismissal.
@@ -228,6 +243,7 @@ static void ApolloDuoSlideDrawer(UIView *view, CGFloat from, CGFloat to, CGFloat
     slide.damping = 2 * omega;
     slide.initialVelocity = ApolloDuoDrawerSpringInitialVelocity(from, to, velocity);
     slide.duration = slide.settlingDuration;
+    ApolloAnimationUsesFullFrameRate(slide);
     ApolloDuoSlideCompletion *delegate = [ApolloDuoSlideCompletion new];
     delegate.completion = completion;
     delegate.started = CACurrentMediaTime();
@@ -268,13 +284,7 @@ static void ApolloDuoSettleThreadDrag(UIView *view, CGFloat from, CGFloat veloci
     spring.damping = 2 * omega;
     spring.initialVelocity = ApolloDuoDrawerSpringInitialVelocity(from, 0, velocity);
     spring.duration = spring.settlingDuration;
-    // The app opts into ProMotion, but an explicit animation without a range
-    // can run at 60 Hz. Ask for the display's full rate for the settle.
-    if (@available(iOS 15.0, *)) {
-        float maximum = (float)UIScreen.mainScreen.maximumFramesPerSecond;
-        if (maximum > 60)
-            spring.preferredFrameRateRange = CAFrameRateRangeMake(MIN(80.0f, maximum), maximum, maximum);
-    }
+    ApolloAnimationUsesFullFrameRate(spring);
     [view.layer addAnimation:spring forKey:@"ApolloDuoThreadDrag"];
 }
 
@@ -560,6 +570,26 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
         [self.view addSubview:self.sidebarNavigationBar];
         if (self.profileBackButton) [self.view addSubview:self.profileBackButton];
     }
+    [self applyNavigationButtonColor];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(applyNavigationButtonColor)
+                                               name:ApolloNavigationButtonColorDidChangeNotification object:nil];
+}
+// The list, split and profile controls follow Accent Navigation Buttons like
+// Apollo's own navigation buttons.
+- (void)applyNavigationButtonColor {
+    if (self.splitButton) [self updateSplitButton];
+    ApolloDuoSetButtonForeground(self.listButton, nil);
+    ApolloDuoSetButtonForeground(self.feedLayoutButton, nil);
+    ApolloDuoSetButtonForeground(self.profileBackButton, UIColor.labelColor);
+    ApolloDuoSetButtonForeground(self.accountsButton, UIColor.labelColor);
+    ApolloDuoSetButtonForeground(self.moreButton, UIColor.labelColor);
+    UIButton *buttons[] = { self.listButton, self.splitButton, self.feedLayoutButton,
+                            self.profileBackButton, self.accountsButton, self.moreButton };
+    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) ApolloNavigationActionsAccentControl(buttons[i]);
+    for (UIBarButtonItem *item in self.listNavigationBar.topItem.leftBarButtonItems) ApolloNavigationActionsAccentItem(item);
+    UIBarButtonItem *sidebar = self.sidebarNavigationBar.topItem.rightBarButtonItem;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (sidebar && sidebar.tintColor != accent) sidebar.tintColor = accent;
 }
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
@@ -654,7 +684,7 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
     // The slashed state is a rendered template rather than an SF Symbol.
     // Give both states the navigation foreground so glass does not dim the
     // available toggle merely because its image representation changed.
-    configuration.baseForegroundColor = ApolloNavigationChromeColor();
+    configuration.baseForegroundColor = ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
     self.splitButton.configuration = configuration;
     self.splitBarItem.image = symbol;
     self.splitButton.accessibilityValue = self.postsSplitEnabled ? @"On" : @"Off";
@@ -873,6 +903,7 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
         && !([other.view isKindOfClass:UIScrollView.class] && other == ((UIScrollView *)other.view).panGestureRecognizer);
 }
 - (void)listClosePanned:(UIPanGestureRecognizer *)pan {
+    ApolloFullFrameRateFollowGesture(pan, 0.5);
     CGFloat dx = [pan translationInView:self.view].x;
     CGFloat vx = [pan velocityInView:self.view].x;
     switch (pan.state) {
@@ -1271,21 +1302,85 @@ BOOL ApolloDuoSplitIsResizing(void) {
     return sDuoSplitResizingTabs != nil;
 }
 
+// With a video pinned above Apollo on the open display, the keyboard grows
+// the window (669x565 to 669x763). Switching layouts then rebuilt the stacks
+// under the field and closed its keyboard, so while a field is edited a
+// height-only change keeps the earlier layout. A new width still applies.
+static BOOL sDuoSplitInputHold, sDuoSplitEditing, sDuoSplitKeyboardShown;
+static CGSize sDuoSplitInputHeldSize;
+static NSUInteger sDuoSplitInputReleaseGeneration;
+
+static CGSize ApolloDuoSplitLiveSize(UITabBarController *tabs) {
+    return tabs == sDuoSplitResizingTabs ? sDuoSplitTargetSize : tabs.view.bounds.size;
+}
+
+CGSize ApolloDuoLayoutSize(CGSize size) {
+    return sDuoSplitInputHold && fabs(size.width - sDuoSplitInputHeldSize.width) < 0.5 ? sDuoSplitInputHeldSize : size;
+}
+
+static CGSize ApolloDuoSplitLayoutSize(UITabBarController *tabs) {
+    return ApolloDuoLayoutSize(ApolloDuoSplitLiveSize(tabs));
+}
+
+static void ApolloDuoSplitHoldForInput(NSString *reason) {
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    if (sDuoSplitInputHold || ![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return;
+    sDuoSplitInputHold = YES;
+    sDuoSplitInputHeldSize = ApolloDuoSplitLiveSize(tabs);
+    ApolloLog(@"[DuoSplit] %@: holding the %.0fx%.0f layout", reason,
+              sDuoSplitInputHeldSize.width, sDuoSplitInputHeldSize.height);
+}
+
+static void ApolloDuoSplitReleaseInputHold(void) {
+    if (!sDuoSplitInputHold) return;
+    sDuoSplitInputHold = NO;
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    CGSize size = [tabs isKindOfClass:UITabBarController.class] ? ApolloDuoSplitLiveSize(tabs) : CGSizeZero;
+    ApolloLog(@"[DuoSplit] input ended: layout follows %.0fx%.0f again", size.width, size.height);
+    ApolloDuoSplitScheduleUpdate();
+}
+
 BOOL ApolloDuoSplitIsUnfolded(void) {
     if (!ApolloDeviceIsDuo()) return NO;
     UITabBarController *tabs = (id)ApolloMainTabBarController();
     if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone
         || ![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return NO;
     if (tabs != sDuoSplitKnownTabs && ApolloDuoCurrentMode() == ApolloDuoModePhone) return NO;
-    CGSize size = tabs == sDuoSplitResizingTabs ? sDuoSplitTargetSize : tabs.view.bounds.size;
+    CGSize size = ApolloDuoSplitLayoutSize(tabs);
     return MIN(size.width, size.height) >= 600.0;
 }
 
 BOOL ApolloDuoSplitIsUnfoldedPortrait(void) {
     if (!ApolloDuoSplitIsUnfolded()) return NO;
     UITabBarController *tabs = (id)ApolloMainTabBarController();
-    CGSize size = tabs == sDuoSplitResizingTabs ? sDuoSplitTargetSize : tabs.view.bounds.size;
+    CGSize size = ApolloDuoSplitLayoutSize(tabs);
     return size.height > size.width;
+}
+
+BOOL ApolloDuoSplitIsShortPane(void) {
+    if (!ApolloDeviceIsDuo() || !NSThread.isMainThread) return NO;
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone
+        || ![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return NO;
+    UIWindow *window = tabs.view.window;
+    UIScreen *screen = window.windowScene.screen ?: window.screen;
+    if (!window || !screen) return NO;
+    CGSize size = ApolloDuoLayoutSize(tabs == sDuoSplitResizingTabs ? sDuoSplitTargetSize : window.bounds.size);
+    CGSize screenSize = screen.bounds.size;
+    BOOL shortPane = ApolloDuoIsShortPane(size.width, size.height, screenSize.width, screenSize.height);
+    // Log each change of pose once, with the sizes that decided it.
+    static int sLastShortPane = -1;
+    if (sLastShortPane != (int)shortPane) {
+        sLastShortPane = shortPane;
+        ApolloLog(@"[DuoFeed] short pane=%d window=%@ screen=%@ safe=%@", shortPane,
+                  NSStringFromCGSize(size), NSStringFromCGSize(screenSize),
+                  NSStringFromUIEdgeInsets(window.safeAreaInsets));
+    }
+    return shortPane;
+}
+
+BOOL ApolloDuoSplitShowsFeedLayout(void) {
+    return ApolloDuoSplitIsUnfolded() || ApolloDuoSplitIsShortPane();
 }
 
 // Apollo's native navigation delegate tests a 70pt edge band in its view.
@@ -1411,7 +1506,18 @@ CGRect ApolloDuoSplitContentFrame(UIViewController *controller, UIView *coordina
     // strip. Only the leading sidebar is excluded from this alignment band.
     insets.right = 0.0;
     CGRect content = UIEdgeInsetsInsetRect(view.bounds, insets);
-    return [coordinateView convertRect:content fromView:view];
+    CGRect column = [coordinateView convertRect:content fromView:view];
+    // A page rests at its navigation view's origin, but a push parks the
+    // outgoing page at its parallax offset as soon as an interactive peek
+    // begins. Map views inside the page through the page at rest, so what
+    // lays out mid-transition moves with the page instead of across it.
+    UIViewController *page = controller == nav ? nil : controller;
+    while (page.parentViewController && page.parentViewController != nav) page = page.parentViewController;
+    UIView *pageView = page.parentViewController == nav ? page.viewIfLoaded : nil;
+    if (pageView && [coordinateView isDescendantOfView:pageView]) {
+        column.origin.x = CGRectGetMinX([coordinateView convertRect:content fromView:pageView]);
+    }
+    return column;
 }
 
 // Media covering the screen from a column's navigation view covers the whole
@@ -1556,6 +1662,11 @@ BOOL ApolloDuoSplitDismissPostsList(UINavigationController *nav) {
     return YES;
 }
 
+BOOL ApolloDuoSplitPostsListCanClose(UINavigationController *nav) {
+    ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
+    return state.split && state.feed && !state.changing && state.host.listVisible && !state.host.listPinned;
+}
+
 // A Posts-tab reselect at the feed root reveals the drawer. Other tabs and the
 // cover display keep their native behavior.
 BOOL ApolloDuoSplitRevealPostsList(UINavigationController *nav) {
@@ -1576,7 +1687,7 @@ BOOL ApolloDuoSplitShowSidebar(UINavigationController *nav) {
 // Never infer Duo merely from a landscape iPhone. Its native trailing tab bar
 // or established Duo mode must be present, and two useful columns must fit.
 static BOOL ApolloDuoSplitShouldOpen(UITabBarController *tabs) {
-    CGSize size = tabs == sDuoSplitResizingTabs ? sDuoSplitTargetSize : tabs.view.bounds.size;
+    CGSize size = ApolloDuoSplitLayoutSize(tabs);
     if (ApolloDuoRailHasVisibleSideBar() || ApolloDuoCurrentMode() == ApolloDuoModeOpen) {
         sDuoSplitKnownTabs = tabs;
     }
@@ -2271,7 +2382,7 @@ static void ApolloDuoPostsAnimateGeometry(NSArray<ApolloDuoPostsGeometry *> *geo
 static void ApolloDuoToggleVisibleFeedLayout(UIViewController *controller, BOOL enabled) {
     UIWindow *window = controller.viewIfLoaded.window;
     if (!window || !enabled || sDuoFeedLayoutChanging || ApolloDuoSplitIsResizing()
-        || !ApolloDuoSplitIsUnfolded()) return;
+        || !ApolloDuoSplitShowsFeedLayout()) return;
     [window layoutIfNeeded];
     BOOL animate = !UIAccessibilityIsReduceMotionEnabled();
     NSMutableArray<ApolloDuoLayoutTransition *> *transitions = [NSMutableArray array];
@@ -2346,7 +2457,7 @@ static void ApolloDuoToggleVisibleFeedLayout(UIViewController *controller, BOOL 
             }];
             [transition.cover removeFromSuperview];
             if (animate && CGSizeEqualToSize(transition.size, surface.bounds.size)
-                && ApolloDuoSplitIsUnfolded())
+                && ApolloDuoSplitShowsFeedLayout())
                 ApolloDuoPostsAnimateGeometry(transition.geometry, surface, surface, 0.32);
         }
         sDuoFeedLayoutChanging = NO;
@@ -2372,7 +2483,9 @@ static char kApolloDuoPageLayoutKey, kApolloDuoPageLayoutPendingKey;
 static NSMapTable<UINavigationItem *, ApolloDuoPageLayoutControl *> *sDuoPageLayoutOwners;
 
 static BOOL ApolloDuoPageShowsLayoutControl(UIViewController *controller) {
-    if (!ApolloDuoSplitIsUnfolded()) return NO;
+    // A short pane under a Picture in Picture has no columns: every feed and
+    // thread, the Posts tab's included, carries its own control there.
+    if (!ApolloDuoSplitShowsFeedLayout()) return NO;
     // Only the Posts tab's split has a feed column; its host owns the control.
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(controller.navigationController, NO);
     return !state.feed;
@@ -2380,18 +2493,36 @@ static BOOL ApolloDuoPageShowsLayoutControl(UIViewController *controller) {
 
 // NavigationActions calls this before normalizing native items, so an async
 // Apollo action refresh cannot remove the independent layout control.
+// A short pane places the control on the leading side, beside Back, as the
+// opened portrait display does beside List; elsewhere it leads the trailing
+// actions.
+static BOOL ApolloDuoPageLayoutLeads(void) {
+    return ApolloDuoSplitIsShortPane();
+}
+
+static NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItemsOnSide(ApolloDuoPageLayoutControl *control,
+                                                                  NSArray<UIBarButtonItem *> *items, BOOL leading) {
+    NSMutableArray *result = [NSMutableArray array];
+    BOOL shows = ApolloDuoPageShowsLayoutControl(control.controller) && ApolloDuoPageLayoutLeads() == leading;
+    if (shows && !leading) [result addObject:control.item];
+    for (UIBarButtonItem *candidate in items)
+        if (![candidate.accessibilityIdentifier isEqualToString:kApolloDuoPageLayoutID]) [result addObject:candidate];
+    if (shows && leading) [result addObject:control.item];
+    return result;
+}
+
 NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items) {
     ApolloDuoPageLayoutControl *control = [sDuoPageLayoutOwners objectForKey:item];
     if (!control) return items;
-    NSMutableArray *result = [NSMutableArray array];
-    if (ApolloDuoPageShowsLayoutControl(control.controller)) [result addObject:control.item];
-    for (UIBarButtonItem *candidate in items)
-        if (![candidate.accessibilityIdentifier isEqualToString:kApolloDuoPageLayoutID]) [result addObject:candidate];
-    return result;
+    return ApolloDuoPageLayoutItemsOnSide(control, items, NO);
 }
 
 @implementation ApolloDuoPageLayoutControl
 - (void)updateFeedLayoutButton { ApolloDuoRefreshLayoutButton(nil, self.item); }
+- (void)applyNavigationButtonColor {
+    UIColor *color = ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
+    if (![self.item.tintColor isEqual:color]) self.item.tintColor = color;
+}
 - (void)toggle {
     if (ApolloDuoPageShowsLayoutControl(self.controller))
         ApolloDuoToggleVisibleFeedLayout(self.controller, self.item.enabled);
@@ -2402,6 +2533,14 @@ NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItems(UINavigationItem *item, NSA
     NSArray *items = ApolloDuoPageLayoutItems(navigationItem, navigationItem.rightBarButtonItems);
     if (![(navigationItem.rightBarButtonItems ?: @[]) isEqualToArray:items])
         [navigationItem setRightBarButtonItems:items animated:NO];
+    NSArray *leading = ApolloDuoPageLayoutItemsOnSide(self, navigationItem.leftBarButtonItems, YES);
+    if (![(navigationItem.leftBarButtonItems ?: @[]) isEqualToArray:leading]) {
+        // Keep Back: the control sits beside it rather than replacing it.
+        // Pages with their own leading items keep their own Back choice.
+        if (leading.count == 1 && leading.firstObject == self.item)
+            navigationItem.leftItemsSupplementBackButton = YES;
+        [navigationItem setLeftBarButtonItems:leading animated:NO];
+    }
 }
 @end
 
@@ -2418,7 +2557,9 @@ static void ApolloDuoPageUpdateLayoutControl(UIViewController *controller) {
         control.item.title = @"Feed Layout";
         control.item.accessibilityLabel = @"Feed Layout";
         control.item.accessibilityIdentifier = kApolloDuoPageLayoutID;
-        control.item.tintColor = ApolloNavigationChromeColor();
+        [control applyNavigationButtonColor];
+        [NSNotificationCenter.defaultCenter addObserver:control selector:@selector(applyNavigationButtonColor)
+                                                   name:ApolloNavigationButtonColorDidChangeNotification object:nil];
         if (@available(iOS 26.0, *)) {
             control.item.hidesSharedBackground = NO;
             control.item.sharesBackground = NO;
@@ -3022,6 +3163,11 @@ BOOL ApolloDuoSplitBeginListDrag(UINavigationController *nav) {
     if (!state.split || !state.feed || state.changing) return NO;
     return [state.host beginListDrag:YES];
 }
+BOOL ApolloDuoSplitBeginListCloseDrag(UINavigationController *nav) {
+    ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
+    if (!state.split || !state.feed || state.changing || !state.host.listVisible) return NO;
+    return [state.host beginListDrag:NO];
+}
 CGFloat ApolloDuoSplitListDragTravel(UINavigationController *nav) {
     return [ApolloDuoSplitStateForNavigation(nav, NO).host listTravel];
 }
@@ -3044,6 +3190,15 @@ void ApolloDuoSplitEndListDrag(UINavigationController *nav, BOOL show, CGFloat v
 static __thread void *sDuoSplitReleaseGesture;
 static __thread void *sDuoSplitReleaseView;
 static __thread CGFloat sDuoSplitReleaseScale = 1.0;
+// The rail's pan swaps its axes after this hook, so its scale goes on y.
+static __thread BOOL sDuoSplitReleaseAlongY;
+
+static __weak UINavigationController *sDuoTabBarNativeNav;
+static __weak UIGestureRecognizer *sDuoTabBarNativePan;
+void ApolloDuoSplitSetTabBarNativePan(UINavigationController *nav, UIGestureRecognizer *pan) {
+    sDuoTabBarNativeNav = nav;
+    sDuoTabBarNativePan = pan;
+}
 
 static CGFloat ApolloDuoSplitNativeReleaseScale(UINavigationController *nav, UIPanGestureRecognizer *gesture) {
     if (gesture.state != UIGestureRecognizerStateEnded && gesture.state != UIGestureRecognizerStateCancelled) return 1.0;
@@ -3056,7 +3211,29 @@ static CGFloat ApolloDuoSplitNativeReleaseScale(UINavigationController *nav, UIP
     CGFloat viewWidth = CGRectGetWidth(nav.view.bounds);
     CGFloat visibleRight = MIN(CGRectGetMaxX(pane), viewWidth - nav.view.safeAreaInsets.right);
     CGFloat paneWidth = CGRectIsNull(pane) ? 0 : visibleRight - CGRectGetMinX(pane);
+    // Tab bar swipe: half the visible bar also completes (the rail is shorter than a wide pane).
+    if (gesture == sDuoTabBarNativePan) {
+        CGFloat barLength = ApolloDuoTabBarSwipeLength(gesture);
+        if (barLength > 0 && (paneWidth <= 0 || barLength < paneWidth)) paneWidth = barLength;
+    }
     return paneWidth > 0 && paneWidth < viewWidth ? viewWidth / paneWidth : 1.0;
+}
+
+// A nil view scales the translation Apollo reads in any view.
+static void ApolloDuoSplitRunScaledRelease(UIGestureRecognizer *gesture, UIView *view, CGFloat scale,
+                                           BOOL alongY, void (^handler)(void)) {
+    void *previousGesture = sDuoSplitReleaseGesture, *previousView = sDuoSplitReleaseView;
+    CGFloat previousScale = sDuoSplitReleaseScale;
+    BOOL previousAlongY = sDuoSplitReleaseAlongY;
+    sDuoSplitReleaseGesture = (__bridge void *)gesture;
+    sDuoSplitReleaseView = (__bridge void *)view;
+    sDuoSplitReleaseScale = scale;
+    sDuoSplitReleaseAlongY = alongY;
+    handler();
+    sDuoSplitReleaseGesture = previousGesture;
+    sDuoSplitReleaseView = previousView;
+    sDuoSplitReleaseScale = previousScale;
+    sDuoSplitReleaseAlongY = previousAlongY;
 }
 
 static void ApolloDuoSplitRunNativePan(UINavigationController *nav, UIPanGestureRecognizer *gesture, void (^handler)(void)) {
@@ -3065,26 +3242,43 @@ static void ApolloDuoSplitRunNativePan(UINavigationController *nav, UIPanGesture
         handler();
         return;
     }
-    void *previousGesture = sDuoSplitReleaseGesture, *previousView = sDuoSplitReleaseView;
-    CGFloat previousScale = sDuoSplitReleaseScale;
-    sDuoSplitReleaseGesture = (__bridge void *)gesture;
-    sDuoSplitReleaseView = (__bridge void *)nav.view;
-    sDuoSplitReleaseScale = scale;
-    handler();
-    sDuoSplitReleaseGesture = previousGesture;
-    sDuoSplitReleaseView = previousView;
-    sDuoSplitReleaseScale = previousScale;
+    BOOL alongY = gesture == sDuoTabBarNativePan
+        && CGRectGetHeight(gesture.view.bounds) > CGRectGetWidth(gesture.view.bounds);
+    ApolloDuoSplitRunScaledRelease(gesture, nav.view, scale, alongY, handler);
 }
 
-// Apollo's own interactive Back is following the finger (or releasing) on
-// `nav`. A pop it drives is a page pop, never one of the split's own.
-static BOOL ApolloDuoSplitNativeBackActive(UINavigationController *nav) {
-    Ivar ivar = class_getInstanceVariable(nav.class, "leftScreenEdgePanGestureRecognizer");
-    UIGestureRecognizer *pan = ivar ? object_getIvar(nav, ivar) : nil;
-    if (![pan isKindOfClass:UIGestureRecognizer.class]) return NO;
+// Without columns (the closed display) Apollo's handler runs the tab bar
+// swipe and finishes a held release at half its view's width, 233pt on the
+// cover, but the rail there is about 262pt long. Judge the release on the
+// rail instead, as the open display does.
+void ApolloDuoRunTabBarPanHandler(UINavigationController *nav, UIPanGestureRecognizer *pan, void (^handler)(void)) {
+    UIGestureRecognizerState state = pan.state;
+    CGFloat viewWidth = CGRectGetWidth(nav.viewIfLoaded.bounds);
+    CGFloat barLength = ApolloDuoTabBarSwipeLength(pan);
+    BOOL rail = CGRectGetHeight(pan.view.bounds) > CGRectGetWidth(pan.view.bounds);
+    if ((state != UIGestureRecognizerStateEnded && state != UIGestureRecognizerStateCancelled)
+        || !ApolloDeviceIsDuo() || !rail || barLength <= 0 || barLength >= viewWidth) {
+        handler();
+        return;
+    }
+    ApolloDuoSplitRunScaledRelease(pan, nil, viewWidth / barLength, YES, handler);
+}
+
+static BOOL ApolloDuoSplitGestureIsActive(UIGestureRecognizer *pan) {
     UIGestureRecognizerState state = pan.state;
     return state == UIGestureRecognizerStateBegan || state == UIGestureRecognizerStateChanged
         || state == UIGestureRecognizerStateEnded;
+}
+
+// Apollo's own interactive Back is following the finger (or releasing) on
+// `nav`, from its edge pan or the tab bar's. A pop it drives is a page pop,
+// never one of the split's own.
+static BOOL ApolloDuoSplitNativeBackActive(UINavigationController *nav) {
+    UIGestureRecognizer *tabBarPan = sDuoTabBarNativePan;
+    if (tabBarPan && nav == sDuoTabBarNativeNav && ApolloDuoSplitGestureIsActive(tabBarPan)) return YES;
+    Ivar ivar = class_getInstanceVariable(nav.class, "leftScreenEdgePanGestureRecognizer");
+    UIGestureRecognizer *pan = ivar ? object_getIvar(nav, ivar) : nil;
+    return [pan isKindOfClass:UIGestureRecognizer.class] && ApolloDuoSplitGestureIsActive(pan);
 }
 
 static UITableView *ApolloDuoSplitFindTable(UIView *view) {
@@ -3195,6 +3389,10 @@ static UIViewController *ApolloDuoSplitForwardPage(UINavigationController *nav) 
     if (![storage respondsToSelector:@selector(firstObject)]) return nil;
     id page = [storage firstObject];
     return [page isKindOfClass:UIViewController.class] ? page : nil;
+}
+
+BOOL ApolloDuoSplitHasForwardPage(UINavigationController *nav) {
+    return ApolloDuoSplitForwardPage(nav) != nil;
 }
 
 // Apollo records forward pages when its own pop override runs, and forgets
@@ -5526,6 +5724,11 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
     sDuoSplitResizingTabs = self;
     sDuoSplitTargetSize = size;
     sDuoSplitSizeCoordinator = coordinator;
+    if (sDuoSplitInputHold && fabs(size.width - sDuoSplitInputHeldSize.width) >= 0.5) sDuoSplitInputHeldSize = size;
+    if (sDuoSplitInputHold && !CGSizeEqualToSize(size, sDuoSplitInputHeldSize)) {
+        ApolloLog(@"[DuoSplit] %.0fx%.0f while editing: keeping the %.0fx%.0f layout",
+                  size.width, size.height, sDuoSplitInputHeldSize.width, sDuoSplitInputHeldSize.height);
+    }
     ApolloLog(@"[DuoSplit] preparing all tabs for %.0fx%.0f", size.width, size.height);
     [UIView performWithoutAnimation:^{ ApolloDuoSplitUpdate(); }];
     %orig(size, coordinator);
@@ -5589,8 +5792,10 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
 }
 - (CGPoint)translationInView:(UIView *)view {
     CGPoint translation = %orig(view);
-    if ((__bridge void *)self == sDuoSplitReleaseGesture && (__bridge void *)view == sDuoSplitReleaseView) {
-        translation.x *= sDuoSplitReleaseScale;
+    if ((__bridge void *)self == sDuoSplitReleaseGesture
+        && (!sDuoSplitReleaseView || (__bridge void *)view == sDuoSplitReleaseView)) {
+        if (sDuoSplitReleaseAlongY) translation.y *= sDuoSplitReleaseScale;
+        else translation.x *= sDuoSplitReleaseScale;
     }
     return translation;
 }
@@ -5888,6 +6093,49 @@ static void ApolloDuoSlideFitDisplay(id builder) {
         object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
             ApolloDuoRefreshLayoutControls();
         }];
+    // Editing, or a keyboard with a frame (web inputs post no editing
+    // notices), starts a hold; iOS sends a zero-height keyboard notice on
+    // return to the foreground, which holds nothing. The hold ends once
+    // editing has ended and the keyboard has hidden.
+    for (NSNotificationName name in @[UITextFieldTextDidBeginEditingNotification, UITextViewTextDidBeginEditingNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name
+            object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
+                sDuoSplitEditing = YES;
+                ApolloDuoSplitHoldForInput(@"editing began");
+            }];
+    }
+    for (NSNotificationName name in @[UITextFieldTextDidEndEditingNotification, UITextViewTextDidEndEditingNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name
+            object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
+                sDuoSplitEditing = NO;
+                if (!sDuoSplitKeyboardShown) {
+                    ApolloDuoSplitReleaseInputHold();
+                    return;
+                }
+                // The fallback covers a hide notice that never comes.
+                NSUInteger generation = ++sDuoSplitInputReleaseGeneration;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (generation == sDuoSplitInputReleaseGeneration && !sDuoSplitEditing) ApolloDuoSplitReleaseInputHold();
+                });
+            }];
+    }
+    [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillShowNotification
+        object:nil queue:nil usingBlock:^(NSNotification *note) {
+            CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+            if (![note.userInfo[UIKeyboardIsLocalUserInfoKey] boolValue] || CGRectIsEmpty(end)) return;
+            sDuoSplitKeyboardShown = YES;
+            ApolloDuoSplitHoldForInput(@"keyboard showing");
+        }];
+    for (NSNotificationName name in @[UIKeyboardDidHideNotification, UIApplicationDidEnterBackgroundNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name
+            object:nil queue:nil usingBlock:^(NSNotification *note) {
+                if ([note.name isEqualToString:UIKeyboardDidHideNotification]
+                    && ![note.userInfo[UIKeyboardIsLocalUserInfoKey] boolValue]) return;
+                sDuoSplitKeyboardShown = NO;
+                sDuoSplitInputReleaseGeneration++;
+                if (!sDuoSplitEditing) ApolloDuoSplitReleaseInputHold();
+            }];
+    }
     // A closed thread outlives only a short trip to the background.
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
         object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
