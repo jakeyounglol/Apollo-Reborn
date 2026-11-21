@@ -1,5 +1,4 @@
 #import "ApolloMarkdownToolbarGif.h"
-#import "ApolloComposerGlassToolbar.h"
 #import "ApolloCommon.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloGiphyClient.h"
@@ -136,8 +135,6 @@ static void ApolloMarkdownGifCollectToolbarViewsInView(UIView *root, NSMutableAr
         (*budget)--;
         if (view.hidden || view.alpha < 0.01) continue;
         if ([view.accessibilityIdentifier isEqualToString:kApolloMarkdownGifButtonIdentifier]) continue;
-        // The Liquid Glass strip mirrors these controls; only Apollo's own count.
-        if ([view.accessibilityIdentifier isEqualToString:ApolloComposerGlassToolbarIdentifier]) continue;
         // A message thread's reply bar never carries the markdown toolbar. On
         // iPad it sits in the app window, where a window-wide scan would pair
         // its photo button with unrelated labels and anchor to the wrong view.
@@ -1244,7 +1241,6 @@ static void ApolloMarkdownGifApplyGatingStates(UIControl *imageControl,
             objc_setAssociatedObject(overlay, &kApolloMarkdownGifGateSubredditKey, subreddit, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
-    ApolloComposerGlassToolbarSetNeedsSync(gifButton ?: imageControl);
 }
 
 static void ApolloMarkdownGifApplyMediaGating(UIViewController *composeController) {
